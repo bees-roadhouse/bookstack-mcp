@@ -79,24 +79,24 @@ Breaking changes are orthogonal to type — prefix the **PR title** with `BREAKI
 1. git checkout development && git pull
 2. git checkout -b improvement/my-change      # or feature/, refactor/, bug/
 3. ... commit work (signed via SSH; see Commit Signing below) ...
-4. scripts/publish-pr-image.sh                # build + push multi-arch images to GHCR
-5. git push -u origin improvement/my-change
-6. Open PR against development; apply the matching type: + category: labels
-7. CI verifies your images and regenerates SBOM/STRUCTURE (see CI/CD below)
-8. Squash-merge PR into development; delete the work branch
+4. git push -u origin improvement/my-change
+5. Open PR against development; apply the matching type: + category: labels
+6. CI runs verify-pr.yml (cargo test + clippy) and generate-artifacts.yml (SBOM/STRUCTURE auto-commit)
+7. Squash-merge PR into development; delete the work branch
+8. build-development.yml builds + pushes the :dev family of image tags
 9. When ready to ship: open PR from development -> release
 ```
 
-All changes go through a PR — direct pushes are blocked by the org ruleset (returns `GH013`). For CI emergencies (workflow-bootstrap gap, broken build), use `workflow_dispatch` on `direct-push.yml` rather than bypassing the ruleset. Org admins can `gh pr merge --admin` for bootstrap PRs and small docs touchups, but `--admin` still routes through the PR machinery (CI runs, audit trail preserved) — it is not a direct push.
+All changes go through a PR — direct pushes are blocked by the org ruleset (returns `GH013`). For CI emergencies (workflow-bootstrap gap, broken build), use `workflow_dispatch` on `build-development.yml` rather than bypassing the ruleset. Org admins can `gh pr merge --admin` for bootstrap PRs and small docs touchups, but `--admin` still routes through the PR machinery (CI runs, audit trail preserved) — it is not a direct push.
 
 ## CI/CD
 
-The org-canonical PR-builds + post-merge-retag pattern. Reference docs:
+Build-on-merge pattern. Reference docs:
 
 - BR DevOps [Docker Image Build Workflows (1905)](https://kb.beesroadhouse.com/books/developer-operations-devops/page/docker-image-build-workflows) — canonical trigger / tag / cache shape.
 - BR DevOps [Branching Strategy (1860)](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) — branch model and direct-push authorization.
 
-**CI builds. Squash-merge retags.** Heavy multi-arch Docker builds run in CI on every push to a PR. The PR's image is published under a single rolling tag `{version}-{slug}` that moves with each push. After squash-merge, a separate workflow retags that PR-head image as the stream tags via `docker buildx imagetools create` — pure manifest operation, no rebuild. The squash-merge commit's source tree is bit-identical to the PR head, so the image is the right artifact. Commit-level pinning during PR review is via `image@sha256:digest` from `docker buildx imagetools inspect`, not a per-commit tag (see *Tag conventions on GHCR* below for why).
+**PR-time gating is fast (cargo test + clippy). Images build on merge.** PRs trigger `verify-pr.yml` — `cargo check`, `cargo clippy`, `cargo test --workspace` — on `ubuntu-latest`. No image build on PRs. After squash-merge, `build-development.yml` (push to `development`) or `release.yml` (push to `release` / `v*` tag) builds + pushes the appropriate multi-arch image set. All builds run on GitHub-hosted `ubuntu-latest` — no self-hosted dependency.
 
 ### Contributor flow (per PR)
 
@@ -104,28 +104,12 @@ The org-canonical PR-builds + post-merge-retag pattern. Reference docs:
 1. git checkout -b improvement/my-change
 2. ... commit work, sign each commit ...
 3. git push -u origin improvement/my-change
-4. Open PR; build-server / build-embedder / build-worker run on every PR push
+4. Open PR; verify-pr.yml runs cargo test + clippy
 5. Squash-merge into development; delete the work branch
-6. promote-on-merge.yml retags the PR head image as :dev / :{version}-dev
+6. build-development.yml builds + pushes :dev / :{version}-dev family of tags
 ```
 
-No local image build needed. `scripts/publish-pr-image.sh` is still in the repo as an out-of-band escape hatch for emergency hotfixes when CI is unavailable, but it's not part of the normal flow.
-
-### Path-aware fast path (CI)
-
-`build-pr.yml` uses [`dorny/paths-filter@v3`](https://github.com/dorny/paths-filter) to detect which binaries' build deps were touched by the PR. When nothing relevant changed for a given binary, the job retags `:dev` (the latest published stream image) as the per-PR tags instead of doing the 15-min cross-arch build. ~2s vs ~15min.
-
-Falls back to a full build automatically when `:dev` doesn't exist (cold start or pre-first-release).
-
-What counts as "changed paths" per binary:
-
-| Binary | Paths that trigger a rebuild |
-|---|---|
-| `bsmcp-server` | `crates/bsmcp-server/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.server`, `entrypoint.sh` |
-| `bsmcp-embedder` | `crates/bsmcp-embedder/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.embedder`, `entrypoint.sh` |
-| `bsmcp-worker` | `crates/bsmcp-worker/`, `crates/bsmcp-common/`, `crates/bsmcp-db-sqlite/`, `crates/bsmcp-db-postgres/`, `Cargo.toml`, `Cargo.lock`, `docker/Dockerfile.worker`, `entrypoint.sh` |
-
-The same path-set is mirrored in `scripts/publish-pr-image.sh` (`SERVER_PATHS` / `EMBEDDER_PATHS` / `WORKER_PATHS`). Keep them in sync — the script is a manual fallback for the same logic.
+No local image build needed. `scripts/publish-pr-image.sh` is still in the repo as an out-of-band escape hatch when CI is unavailable, but it's not part of the normal flow.
 
 ### Cargo target / registry caching
 
@@ -140,41 +124,36 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 | Event | Workflow | What happens |
 |-------|----------|-------------|
 | Push to a work branch with **no open PR** | nothing | test locally |
-| `pull_request: opened/synchronize/reopened` against `development` or `release` | `build-pr.yml` (`build-server`, `build-embedder`, `build-worker`) | path-aware multi-arch build per image; tag `{version}-{slug}` (rolling per-PR) |
-| Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch (re-fire loop broken by `paths-ignore`, not `[skip ci]`, so squash-merge bodies stay clean) |
-| `pull_request: closed` (merged: true) on `development` or `release` | `promote-on-merge.yml` | retags the PR head image as the appropriate stream tags via `imagetools create`. No rebuild. |
-| `push` to `development` that is **not** a PR-merge commit | `direct-push.yml` (`workflow_dispatch` only) | manual recovery — full multi-arch build + stream tags. The ruleset blocks ad-hoc direct pushes; this workflow runs on demand for CI emergencies (e.g. workflow-bootstrap gap). |
-| `workflow_dispatch` on `direct-push.yml` | `direct-push.yml` | manual recovery for the development stream — bypasses the PR-merge guard and rebuilds the four `:dev*` tags at the current `development` HEAD. Use after a workflow-bootstrap gap (workflow file introduced by the very PR whose merge would have run it). |
-| `push` to `release` (always a PR-merge from development) | `release.yml` (`github-release-on-merge` + `release-binaries-on-merge`) | creates the `v{version}` git tag (if missing) and the GitHub Release entry; builds `bsmcp-server` native binaries for 5 targets and attaches them. Image version tags were already moved by `promote-on-merge.yml` when the PR closed. |
-| `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images directly in CI, creates the Release, attaches the server binaries. Use only when the normal PR flow isn't available. |
+| `pull_request: opened/synchronize/reopened` against `development` or `release` | `verify-pr.yml` | `cargo check` + `cargo clippy -- -D warnings` + `cargo test --workspace` on `ubuntu-latest`. Fast, image-free. |
+| Same trigger | `generate-artifacts.yml` | regenerates `SBOM.md` + `STRUCTURE.md`, commits to PR source branch (re-fire loop broken by `paths-ignore`). SBOM/STRUCTURE conflicts on rebase resolve via `merge=ours` in `.gitattributes`. |
+| `push` to `development` (PR-merge commit or otherwise) | `build-development.yml` | multi-arch build + push of all three images on `ubuntu-latest`. Tags: `:dev`, `:dev-{sha}`, `:{version}-dev`, `:{version}-dev-{sha}`. |
+| `workflow_dispatch` on `build-development.yml` | `build-development.yml` | manual rebuild at the current `development` HEAD. Same tag set as the push trigger. |
+| `push` to `release` (always a PR-merge from development) | `release.yml` (`build-release-images` + `github-release-on-merge` + `release-binaries-on-merge`) | builds + pushes `:{version}` / `:{version}-{sha}` / `:release` / `:latest` on `ubuntu-latest`; creates the `v{version}` git tag and GitHub Release entry; builds `bsmcp-server` native binaries for 5 targets and attaches them. |
+| `v*` tag push (emergency hotfix only) | `release.yml` (`tag-release` + `github-release-on-tag` + `release-binaries-on-tag`) | builds & pushes semver-tagged images on `ubuntu-latest`, creates the Release, attaches the server binaries. Use only when the normal PR flow isn't available. |
 | `workflow_dispatch` on `release.yml` | `release.yml` | manual recovery path for the release stream |
 
 ### Why this shape
 
-- **CI builds, not contributor.** Build work runs in CI on every PR push. Engineers don't need a local multi-arch builder or a GHCR PAT to get their PR through review. Cost: ~15 min of CI minutes per PR push (mitigated by the path-aware fast path for docs/config-only PRs, which retag in ~2s).
-- **Squash-merge retags, doesn't rebuild.** The squash-merge commit's source tree is bit-identical to the PR head, so the PR head image is the right artifact. `promote-on-merge.yml` moves the rolling tags atomically; the registry handles the cleanup of the old manifest.
-- **`direct-push.yml` is the CI-emergency escape hatch, not an authorized push path.** Page 1860 (BR Branching Strategy) blocks ad-hoc direct pushes via the org ruleset. `direct-push.yml` runs on `workflow_dispatch` for manual recovery (workflow-bootstrap gap, broken CI) and is gated to skip PR-merge commits so `promote-on-merge.yml` owns those.
+- **Build on merge, not on PR.** PR-time gating is fast (`cargo test` + `clippy`); image builds run once per merge. Removes the failure mode where a PR-time build has to complete for a downstream retag step to find an artifact — there is no downstream retag step.
+- **Pinned to `ubuntu-latest`.** GitHub-hosted runners are always available. Self-hosted runners can return as a per-job opt-in once a runner pool is reliable; for now no `[self-hosted, ...]` label appears in any workflow.
 - **Native binaries: server only.** `bsmcp-server` is pure Rust + bundled SQLite and cross-compiles cleanly. `bsmcp-embedder` depends on `fastembed` → ONNX Runtime → a per-platform C++ shared library; bare binaries would need ONNX Runtime installed on the host. Container is the only supported distribution for the embedder.
-- **External fork PRs are skipped.** Forks cannot push to `ghcr.io/bees-roadhouse/*`. `build-pr.yml`, `promote-on-merge.yml`, and `generate-artifacts.yml` all gate on `head.repo.full_name == github.repository`.
+- **External fork PRs are skipped.** Forks can't push to `ghcr.io/bees-roadhouse/*`. `verify-pr.yml` and `generate-artifacts.yml` gate on `head.repo.full_name == github.repository`.
 
 ### Tag conventions on GHCR
 
-Per-PR (pushed by `build-pr.yml` on every PR commit):
-- `{version}-{branch-slug}` — rolling, moves with each PR push
+No per-PR image tag. PRs don't build images. Commit-level pinning during review is unnecessary — the PR's source tree IS the artifact to review; reviewers can `cargo build` locally if they want to test.
 
-No per-commit immutable tag. Commit-level pinning is via `image@sha256:digest` from `docker buildx imagetools inspect`. Two reasons: (1) digest pinning is a strict superset of tag pinning, and (2) `generate-artifacts.yml` lands an SBOM/STRUCTURE auto-commit AFTER `build-pr.yml` runs — PR head moves to a SHA the gating build never built, so a per-PR `{sha}` immutable tag would be a footgun for `promote-on-merge.yml` (it'd look for a tag that doesn't exist). The rolling tag captures the most recent successful build regardless of head drift.
-
-Development stream (set by `promote-on-merge.yml` on PR close, or `direct-push.yml` via `workflow_dispatch`):
+Development stream (pushed by `build-development.yml` on push to `development`):
 - `dev` — rolling, latest dev build
-- `dev-{merge_sha}` — immutable per-merge / per-push
+- `dev-{sha}` — immutable per-commit
 - `{version}-dev` — version-level dev rolling
-- `{version}-dev-{merge_sha}` — version-level dev immutable
+- `{version}-dev-{sha}` — version-level dev immutable
 
-Release stream (set by `promote-on-merge.yml` on `development → release` PR close):
+Release stream (pushed by `release.yml`'s `build-release-images` on push to `release`):
 - `latest` — rolling, latest release
 - `release` — alias for `latest`
-- `{version}` — pinned semver (e.g., `0.10.0`)
-- `{version}-{merge_sha}` — immutable per-release-merge
+- `{version}` — pinned semver (e.g., `0.11.0`)
+- `{version}-{sha}` — immutable per-release-merge
 
 Tag-push hotfix (`v*` tag → `release.yml` `tag-release`):
 - `{version}`, `{major}.{minor}`, `{major}` — full semver hierarchy
@@ -204,7 +183,7 @@ Protection lives at the **organization level** via two GitHub Rulesets that appl
 
 Both rulesets enforce on every ref update on the targeted branches — direct pushes are rejected with `GH013`. CI runs on every PR push, so regressions are caught before merge. The `OrganizationAdmin` bypass uses `bypass_mode: pull_request` (skip review on a PR via `gh pr merge --admin`), not `repository` (which would allow direct push) — direct push is intentionally not configured.
 
-Required status checks for `build-server` / `build-embedder` / `build-worker` are **not** wired up yet. After this CI rework lands and the new check names stabilize, a follow-up will add them to both rulesets.
+Required status check for `verify-pr / verify` (cargo test + clippy on PR) is **not** wired up yet. After this CI rework lands and the check name stabilizes, a follow-up will add it to both rulesets.
 
 ### Commit signing
 
@@ -221,7 +200,7 @@ Default semver bump per branch prefix (override with `BREAKING:` in the PR title
 - `refactor/*` — patch (minor if external behavior changes)
 - `bug/*` — patch
 
-Release: open PR from development -> release. The release-merge promote job retags with the current `{version}` and creates the GitHub Release.
+Release: open PR from development -> release. The release-merge fires `build-release-images` (builds + pushes `:{version}` / `:release` / `:latest`) and `github-release-on-merge` (creates the GitHub Release with native binaries).
 
 ## Testing
 
