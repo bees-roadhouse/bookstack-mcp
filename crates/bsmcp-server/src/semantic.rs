@@ -674,7 +674,7 @@ impl SemanticState {
                 .filter(|pid| !blanket_cache.contains_key(pid))
                 .collect();
             if !missing.is_empty() {
-                let extras: Vec<(i64, MarkovBlanket)> = stream::iter(missing.into_iter())
+                let extras: Vec<(i64, MarkovBlanket)> = stream::iter(missing)
                     .map(|pid| async move {
                         self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
                     })
@@ -957,7 +957,7 @@ impl SemanticState {
         let mut blanket_cache: HashMap<i64, MarkovBlanket> = HashMap::new();
         if verbose {
             let final_pids: Vec<i64> = ranked.iter().map(|(pid, _)| *pid).collect();
-            let extras: Vec<(i64, MarkovBlanket)> = stream::iter(final_pids.into_iter())
+            let extras: Vec<(i64, MarkovBlanket)> = stream::iter(final_pids)
                 .map(|pid| async move {
                     self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
                 })
