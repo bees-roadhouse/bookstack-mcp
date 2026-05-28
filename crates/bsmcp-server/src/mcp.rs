@@ -1369,13 +1369,13 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
     if semantic_enabled {
         instructions.push_str(
             "\n\nSemantic vector search is available and should be your PRIMARY search method. \
-             Prefer 'semantic_search' over 'search_content' for most queries — it finds \
-             conceptually related content by meaning, not just keyword matches, and returns \
-             richer context including a Markov blanket of related pages (linked_from, links_to, \
-             co_linked, siblings). Only fall back to 'search_content' when you need exact \
-             keyword/tag matches or when semantic_search returns no results. \
-             Use 'reembed' to re-index content after bulk changes and 'embedding_status' \
-             to check indexing progress.",
+             Prefer `semantic_search` with `mode: \"precision\"` over `search_content` for most queries — \
+             precision picks the most-relevant page ~1s faster and more accurately than keyword search \
+             or the standard mode. Drop to `mode: \"standard\"` only when you need a broader sweep \
+             (more results, blanket-adjacent pages via Markov-blanket boost). Fall back to \
+             `search_content` only for exact keyword/tag matches or when semantic_search returns \
+             nothing. Use `reembed` to re-index after bulk changes and `embedding_status` to check \
+             progress.",
         );
     }
 
@@ -1476,12 +1476,10 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             })),
 
         // Shelves
-        tool("list_shelves", "List all shelves. Shelves are the top-level organizational unit.",
-            paginated_schema()),
+        tool("list_shelves", "List all shelves.", paginated_schema()),
         tool("get_shelf", "Get a shelf by ID, including its books.",
             id_schema("shelf_id")),
-        tool("create_shelf", "Create a new shelf. Description is REQUIRED — it tells future Claude clients what belongs here.",
-            name_desc_schema()),
+        tool("create_shelf", "Create a new shelf.", name_desc_schema()),
         tool("update_shelf", "Update a shelf's name, description, or set which books it contains via the 'books' array (replaces all existing book assignments on this shelf).", json!({
             "type": "object",
             "properties": {
@@ -1499,8 +1497,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_books", "List all books.", paginated_schema()),
         tool("get_book", "Get a book by ID, including its chapters and pages.",
             id_schema("book_id")),
-        tool("create_book", "Create a new book. Description is REQUIRED — it tells future Claude clients what belongs here.",
-            name_desc_schema()),
+        tool("create_book", "Create a new book.", name_desc_schema()),
         tool("update_book", "Update a book.",
             update_schema("book_id", &["name", "description"])),
         tool("delete_book", "Delete a book and all its chapters/pages.",
@@ -1510,14 +1507,14 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_chapters", "List all chapters across all books.", paginated_schema()),
         tool("get_chapter", "Get a chapter by ID, including its pages.",
             id_schema("chapter_id")),
-        tool("create_chapter", "Create a new chapter within a book. Description is REQUIRED — it tells future Claude clients what belongs here.", json!({
+        tool("create_chapter", "Create a new chapter within a book.", json!({
             "type": "object",
             "properties": {
                 "book_id": { "type": "integer", "description": "Book ID to create chapter in" },
                 "name": { "type": "string", "description": "Chapter name" },
                 "description": {
                     "type": "string",
-                    "description": "REQUIRED. A 1-2 sentence description of what content lives in this chapter and what it's for. Surfaced to every Claude client that connects, so it shapes future routing decisions. Do not use placeholders like 'TODO' or 'description'."
+                    "description": "REQUIRED. 1-2 sentences on what this chapter is for. No placeholders."
                 }
             },
             "required": ["book_id", "name", "description"]
@@ -1537,9 +1534,9 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
         // Pages
         tool("list_pages", "List all pages across all books.", paginated_schema()),
-        tool("get_page", "Get a page by ID, including full content. Response includes 'editor' field ('markdown' or 'wysiwyg'), 'markdown' field (source for markdown pages, empty for WYSIWYG), and 'html' field (rendered content). Use the editor field to determine which content field to reference for edit_page calls.",
+        tool("get_page", "Get a page by ID with full content. Response carries `editor` ('markdown'|'wysiwyg'), `markdown` source (empty for WYSIWYG pages), and rendered `html`.",
             id_schema("page_id")),
-        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Provide content as markdown (preferred, creates a markdown-editor page) or html (creates a WYSIWYG page). Content is sent directly to BookStack. IMPORTANT: Do NOT include the page title as a heading in the content — BookStack displays the 'name' as an H1 automatically. Start with body text or ## sub-headings.", json!({
+        tool("create_page", "Create a new page. Must provide either book_id or chapter_id. Pass content via `markdown` (creates a markdown-editor page) or `html` (creates a WYSIWYG page).", json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Page name" },
@@ -1550,7 +1547,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["name"]
         })),
-        tool("update_page", "Update a page's name, content, or move it to a different chapter (chapter_id) or book (book_id). Full rewrite — provide content as markdown or html sent directly to BookStack. Use markdown for markdown-editor pages, html for WYSIWYG pages. Do NOT include the page title as a heading — BookStack renders the name as H1 automatically. Prefer edit_page, replace_section, or append_to_page for partial edits.", json!({
+        tool("update_page", "Replace a page's name and/or content, or move it to a different chapter/book. Full rewrite — for surgical edits prefer edit_page, replace_section, append_to_page, or insert_after.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -1562,7 +1559,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id"]
         })),
-        tool("edit_page", "Performs exact string replacements in a page's native content. For markdown pages, matches against the 'markdown' field. For WYSIWYG pages, matches against the 'html' field. Check the page's 'editor' field from get_page to know which format to use for old_text/new_text. Fails if old_text is not found or is ambiguous (found multiple times without replace_all).", json!({
+        tool("edit_page", "Exact-string replace in a page's native content. old_text/new_text must match the page's native format: `markdown` for markdown-editor pages, `html` for WYSIWYG (check `editor` via get_page). Fails if old_text is not found or is ambiguous (multiple matches without replace_all).", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -1572,7 +1569,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id", "old_text", "new_text"]
         })),
-        tool("append_to_page", "Append markdown content to the end of a page. Works on ALL pages including WYSIWYG. No need to read the page first.", json!({
+        tool("append_to_page", "Append markdown content to the end of a page. Works on markdown and WYSIWYG pages. No need to read the page first.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -1580,7 +1577,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id", "markdown"]
         })),
-        tool("replace_section", "Replace all content under a heading (up to the next heading of same or higher level). Works on ALL pages including WYSIWYG. Useful for updating a specific section without touching the rest. No need to read the page first.", json!({
+        tool("replace_section", "Replace all content under a heading (up to the next heading of same or higher level). Works on markdown and WYSIWYG pages. No need to read the page first.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -1589,7 +1586,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["page_id", "heading", "markdown"]
         })),
-        tool("insert_after", "Insert markdown content after a specific line in a page. Works on ALL pages including WYSIWYG. The anchor is matched by exact line content (trimmed). No need to read the page first.", json!({
+        tool("insert_after", "Insert markdown content after a specific line in a page. Anchor matches exact line content (trimmed). Works on markdown and WYSIWYG pages. No need to read the page first.", json!({
             "type": "object",
             "properties": {
                 "page_id": { "type": "integer", "description": "The page_id" },
@@ -1777,7 +1774,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
             },
             "required": ["name", "uploaded_to"]
         })),
-        tool("prepare_upload", "Create a staging slot for uploading a local file. Returns a staging_id and upload_url. Step 1: call prepare_upload. Step 2: POST the file to upload_url as multipart/form-data with a 'file' field (no auth header needed): curl -X POST -F 'file=@/path/to/file' <upload_url>. Step 3: call upload_image or upload_attachment with the staging_id.", json!({
+        tool("prepare_upload", "Create a staging slot for a local-file upload. Returns `staging_id` + `upload_url`. POST the file as multipart/form-data with field name `file` to upload_url, then pass `staging_id` to upload_image or upload_attachment.", json!({
             "type": "object",
             "properties": {}
         })),
@@ -1812,12 +1809,15 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
-            "Hybrid search combining vector embeddings with keyword matching. Finds pages by meaning AND exact terms. IMPORTANT: Include related terms, synonyms, and domain-specific vocabulary in your query for better recall. For example, instead of 'office gets hacked', search 'security breach incident response ransomware compromise recovery'. \
-             \n\nMode controls the ranking strategy: \
-             'standard' (default) = vector + keyword + Markov-blanket boost + blended sort, no cross-encoder. Free, known-good baseline. \
-             'rerank' = same candidate selection as standard, but the final top-N is re-ordered by a cross-encoder rerank pass. Cheap refinement (~10-30ms for top-10 against a local cross-encoder); requires BSMCP_RERANK_PROVIDER on the embedder. \
-             'precision' = cross-encoder is the ranker of record. Wider initial vector pass (5x limit), no keyword/blanket blend, /rerank scores each candidate directly. More expensive, can rescue hits the blend would miss; also requires BSMCP_RERANK_PROVIDER. \
-             \n\nAll three modes return the same JSON shape so you can A/B by swapping the mode value on the same query.",
+            "Semantic search with cross-encoder relevance ranking. \
+             **Default to `mode: \"precision\"`** — it's faster (~1s less than standard on typical queries), picks better hits, and surfaces the most-relevant pages first. \
+             Use `mode: \"standard\"` only when you need a broader sweep (more results, blanket-adjacent pages) — standard keeps pages that precision's strict cross-encoder ordering drops. Both modes return the same JSON shape, so A/B is just a `mode` swap. \
+             \n\nMode reference: \
+             `precision` (recommended) — wider vector pass (5× limit), cross-encoder ranks. Best for \"find the right page.\" \
+             `standard` — vector + keyword + Markov-blanket boost + blended sort. Best for \"find everything relevant.\" \
+             `rerank` — standard's candidate selection, then cross-encoder reorders the top-N. Middle ground; rarely the right pick over precision. \
+             \n\n`precision` and `rerank` need `BSMCP_RERANK_PROVIDER` configured on the embedder. If you get \"Reranker is disabled,\" retry with `mode: \"standard\"`. \
+             \n\nInclude synonyms and domain vocabulary in your query for better recall (e.g., \"security breach incident response ransomware\" beats \"office got hacked\").",
             json!({
                 "type": "object",
                 "properties": {
@@ -1826,7 +1826,7 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                     "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Default: 0.45 for hybrid, 0.50 for pure vector.", "default": 0.45 },
                     "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Forced to false when mode='precision'.", "default": true },
                     "verbose": { "type": "boolean", "description": "Include full Markov blanket data in results. Default false returns slim results (scores, chunks, scoring breakdown). Set true for full graph context.", "default": false },
-                    "mode": { "type": "string", "description": "Ranking strategy. 'standard' (default), 'rerank' (refinement), or 'precision' (cascade). Both rerank and precision require BSMCP_RERANK_PROVIDER configured on the embedder.", "enum": ["standard", "rerank", "precision"], "default": "standard" }
+                    "mode": { "type": "string", "description": "Ranking strategy. **`precision` recommended** (faster, more accurate). `standard` for wider sweep. `rerank` is the middle ground. Schema default stays `standard` for instances without rerank configured.", "enum": ["standard", "rerank", "precision"], "default": "standard" }
                 },
                 "required": ["query"]
             })));
@@ -1884,7 +1884,7 @@ fn name_desc_schema() -> Value {
             "name": { "type": "string", "description": "Name" },
             "description": {
                 "type": "string",
-                "description": "REQUIRED. A 1-2 sentence description of what content lives here and what it's for. Surfaced to every Claude client that connects, so it shapes future routing decisions. Do not use placeholders like 'TODO' or 'description'."
+                "description": "REQUIRED. 1-2 sentences on what lives here and what it's for. No placeholders ('TODO', 'description', 'n/a')."
             }
         },
         "required": ["name", "description"]

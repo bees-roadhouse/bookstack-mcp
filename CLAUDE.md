@@ -67,7 +67,7 @@ crates/
 
 **Semantic search flow:**
 
-`semantic_search` accepts `mode: "standard" | "rerank" | "precision"` (default `"standard"`). All three return the same JSON shape so a caller can A/B by swapping the mode value on the same query.
+`semantic_search` accepts `mode: "standard" | "rerank" | "precision"`. Schema default is `"standard"` for backward compat (instances without `BSMCP_RERANK_PROVIDER` configured fall through cleanly), but **the tool description and initialize-instructions blurb both push callers toward `mode: "precision"`** — it runs ~1s faster than standard on typical queries and the cross-encoder picks better hits than the heuristic blend. Standard is positioned as the "wider sweep" option (more results, blanket-adjacent pages). All three modes return the same JSON shape so a caller can A/B by swapping the mode value on the same query.
 
 1. Server receives `semantic_search` tool call.
 2. Server POSTs query text to embedder's `/embed` endpoint → query embedding.

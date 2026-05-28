@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::SemanticDb;
+use bsmcp_common::db::{IndexDb, SemanticDb};
 use bsmcp_common::types::MarkovBlanket;
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
@@ -100,6 +100,12 @@ struct CachedAccess {
 
 pub struct SemanticState {
     db: Arc<dyn SemanticDb>,
+    /// Structural index — consulted by the webhook handler to scope shelf/
+    /// chapter_move re-embeds to the actually-affected books instead of
+    /// falling back to `scope=all`. Same backend instance as `db` for both
+    /// SQLite and Postgres deployments; threaded through as a trait object
+    /// so the semantic module doesn't depend on the concrete backend type.
+    index_db: Arc<dyn IndexDb>,
     embedder_url: String,
     webhook_secret: String,
     http_client: reqwest::Client,
@@ -110,6 +116,7 @@ pub struct SemanticState {
 impl SemanticState {
     pub fn new(
         db: Arc<dyn SemanticDb>,
+        index_db: Arc<dyn IndexDb>,
         embedder_url: String,
         webhook_secret: String,
     ) -> Self {
@@ -120,6 +127,7 @@ impl SemanticState {
             .expect("Failed to build embedder HTTP client");
         Self {
             db,
+            index_db,
             embedder_url: embedder_url.trim_end_matches('/').to_string(),
             webhook_secret,
             http_client,
@@ -666,7 +674,7 @@ impl SemanticState {
                 .filter(|pid| !blanket_cache.contains_key(pid))
                 .collect();
             if !missing.is_empty() {
-                let extras: Vec<(i64, MarkovBlanket)> = stream::iter(missing.into_iter())
+                let extras: Vec<(i64, MarkovBlanket)> = stream::iter(missing)
                     .map(|pid| async move {
                         self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
                     })
@@ -949,7 +957,7 @@ impl SemanticState {
         let mut blanket_cache: HashMap<i64, MarkovBlanket> = HashMap::new();
         if verbose {
             let final_pids: Vec<i64> = ranked.iter().map(|(pid, _)| *pid).collect();
-            let extras: Vec<(i64, MarkovBlanket)> = stream::iter(final_pids.into_iter())
+            let extras: Vec<(i64, MarkovBlanket)> = stream::iter(final_pids)
                 .map(|pid| async move {
                     self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
                 })
@@ -1099,7 +1107,15 @@ impl SemanticState {
     /// Strategy:
     /// - Page events → re-embed that specific page
     /// - Chapter/book events → re-embed the affected book (all pages get fresh context)
-    /// - Shelf events → full re-embed (can't determine affected books from webhook payload)
+    /// - Shelf events → enqueue one `book:{id}` job per indexed book on the
+    ///   shelf, sourced from `IndexDb::list_indexed_books_by_shelf`. Falls back
+    ///   to `scope=all` only when the index has no record of the shelf (e.g.,
+    ///   `bookshelf_delete` fired before the worker reconciled it).
+    /// - `chapter_move` → enqueue both source and destination book. The
+    ///   destination's `book_id` comes from the webhook payload; the source's
+    ///   from `IndexDb::get_indexed_chapter` (the index still reflects the
+    ///   pre-move `book_id` until the next reconcile, which is exactly the
+    ///   value we need).
     pub async fn handle_webhook(&self, payload: &Value) -> Result<(), String> {
         let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
         let related = payload.get("related_item").unwrap_or(&json!(null));
@@ -1147,18 +1163,51 @@ impl SemanticState {
             }
             "chapter_move" => {
                 // Pages moved between books — re-embed both source and destination.
-                // BookStack webhook gives us the chapter's new book_id.
-                // We can't easily get the old book_id, so re-embed the new book
-                // and queue a full re-embed to catch the orphaned old book.
-                let book_id = related.get("book_id").and_then(|v| v.as_i64());
-                if let Some(bid) = book_id {
+                // Destination: webhook payload's `related_item.book_id`.
+                // Source: the indexed chapter's `book_id` still reflects the
+                // pre-move parent until the next worker reconcile, which is
+                // exactly the value we need. If the index has no record of
+                // this chapter (race against initial walk, or a chapter that
+                // predates the index), fall back to `scope=all` so we still
+                // self-heal.
+                let new_book_id = related.get("book_id").and_then(|v| v.as_i64());
+
+                if let Some(bid) = new_book_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: chapter_move — queued book:{bid} embed job {job_id} (new={is_new})");
+                    eprintln!("Semantic: chapter_move — queued book:{bid} (dest) embed job {job_id} (new={is_new})");
                 }
-                // Also queue full re-embed to catch the source book
-                let (job_id, is_new) = self.db.create_embed_job("all").await?;
-                eprintln!("Semantic: chapter_move — queued full re-embed job {job_id} (new={is_new})");
+
+                if let Some(cid) = item_id {
+                    let prev_book_id = match self.index_db.get_indexed_chapter(cid).await {
+                        Ok(Some(ch)) => Some(ch.book_id),
+                        Ok(None) => None,
+                        Err(e) => {
+                            eprintln!("Semantic: chapter_move — index lookup failed for chapter {cid}: {e}");
+                            None
+                        }
+                    };
+                    match prev_book_id {
+                        Some(pbid) if Some(pbid) != new_book_id => {
+                            let scope = format!("book:{pbid}");
+                            let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                            eprintln!("Semantic: chapter_move — queued book:{pbid} (prev source) embed job {job_id} (new={is_new})");
+                        }
+                        Some(_) => {
+                            // Index already reflects new book_id (e.g., the
+                            // worker walked between move and webhook). No
+                            // source book to recover — the new-book job above
+                            // covers everything.
+                        }
+                        None => {
+                            // Index doesn't know this chapter — preserve the
+                            // pre-fix behavior so we don't silently miss the
+                            // source book.
+                            let (job_id, is_new) = self.db.create_embed_job("all").await?;
+                            eprintln!("Semantic: chapter_move — chapter {cid} not in index, fell back to scope=all embed job {job_id} (new={is_new})");
+                        }
+                    }
+                }
             }
 
             // --- Book events (re-embed the book) ---
@@ -1178,15 +1227,47 @@ impl SemanticState {
                 eprintln!("Semantic: book_delete (id={item_id:?}) — page deletions handled by page_delete events");
             }
 
-            // --- Shelf events (full re-embed) ---
-            // Shelf changes affect the context prefix for all pages on that shelf.
-            // We can't efficiently determine which books belong to a shelf from
-            // the webhook payload, so trigger a full re-embed. The re-embed
-            // pipeline restamps page_view_acl as a side-effect, so shelf-level
-            // permission changes propagate naturally.
+            // --- Shelf events (scope to the affected books) ---
+            // Shelf changes affect the context prefix for every page on that
+            // shelf. Resolve the affected books from the structural index
+            // (worker keeps `bookstack_books.shelf_id` up to date) and enqueue
+            // one `book:{id}` job per book. Falls back to `scope=all` when the
+            // shelf has no indexed books — e.g., `bookshelf_delete` fired
+            // before the worker reconciled the shelf, or the shelf was
+            // empty/unclassified. The re-embed pipeline restamps
+            // `page_view_acl` as a side-effect, so shelf-level permission
+            // changes propagate either way.
             "bookshelf_create_from_book" | "bookshelf_update" | "bookshelf_delete" => {
-                let (job_id, is_new) = self.db.create_embed_job("all").await?;
-                eprintln!("Semantic: {event} — queued full re-embed job {job_id} (new={is_new})");
+                let shelf_id = item_id;
+                let books = if let Some(sid) = shelf_id {
+                    match self.index_db.list_indexed_books_by_shelf(sid).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("Semantic: {event} — index lookup failed for shelf {sid}: {e}");
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                if books.is_empty() {
+                    let (job_id, is_new) = self.db.create_embed_job("all").await?;
+                    eprintln!("Semantic: {event} — shelf {shelf_id:?} has no indexed books, fell back to scope=all embed job {job_id} (new={is_new})");
+                } else {
+                    for book in &books {
+                        let scope = format!("book:{}", book.book_id);
+                        let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
+                        eprintln!(
+                            "Semantic: {event} — queued book:{} embed job {job_id} (new={is_new})",
+                            book.book_id
+                        );
+                    }
+                    eprintln!(
+                        "Semantic: {event} — enqueued {} scoped book jobs for shelf {shelf_id:?}",
+                        books.len()
+                    );
+                }
             }
 
             // --- Role events (ACL-only reconciliation) ---
