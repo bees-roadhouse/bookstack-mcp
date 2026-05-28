@@ -373,7 +373,11 @@ pub fn classify_page(
         }
         Some(ChapterKind::JournalArchive) => {
             if let Some(date) = match_iso_date(trimmed) {
-                return (PageKind::JournalEntry, Some(date), parent_chapter_archive_year);
+                return (
+                    PageKind::JournalEntry,
+                    Some(date),
+                    parent_chapter_archive_year,
+                );
             }
             return (PageKind::Unclassified, None, None);
         }
@@ -426,7 +430,10 @@ fn parse_archive_year(name: &str) -> Option<i32> {
     if year_str.len() != 4 {
         return None;
     }
-    year_str.parse::<i32>().ok().filter(|y| (1900..=9999).contains(y))
+    year_str
+        .parse::<i32>()
+        .ok()
+        .filter(|y| (1900..=9999).contains(y))
 }
 
 /// Match `YYYY-MM-DD`. Returns the canonicalized date string if valid.
@@ -456,8 +463,14 @@ mod tests {
     #[test]
     fn shelf_classification() {
         assert_eq!(classify_shelf(927, Some(927), Some(2023)), ShelfKind::Hive);
-        assert_eq!(classify_shelf(2023, Some(927), Some(2023)), ShelfKind::UserJournals);
-        assert_eq!(classify_shelf(99, Some(927), Some(2023)), ShelfKind::Unclassified);
+        assert_eq!(
+            classify_shelf(2023, Some(927), Some(2023)),
+            ShelfKind::UserJournals
+        );
+        assert_eq!(
+            classify_shelf(99, Some(927), Some(2023)),
+            ShelfKind::Unclassified
+        );
         assert_eq!(classify_shelf(927, None, None), ShelfKind::Unclassified);
     }
 
@@ -468,7 +481,10 @@ mod tests {
         assert_eq!(classify_book("Apis's Identity", h), BookKind::Identity);
         assert_eq!(classify_book("  Pia Identity  ", h), BookKind::Identity); // trims
         assert_eq!(classify_book("Pia's Collage", h), BookKind::Collage);
-        assert_eq!(classify_book("Cross-Identity Collage", h), BookKind::SharedCollage);
+        assert_eq!(
+            classify_book("Cross-Identity Collage", h),
+            BookKind::SharedCollage
+        );
         assert_eq!(classify_book("Some Random Book", h), BookKind::Unclassified);
     }
 
@@ -492,7 +508,10 @@ mod tests {
     fn book_classification_on_unclassified_shelf_is_always_unclassified() {
         let s = ShelfKind::Unclassified;
         assert_eq!(classify_book("Pia Identity", s), BookKind::Unclassified);
-        assert_eq!(classify_book("Cross-Identity Collage", s), BookKind::Unclassified);
+        assert_eq!(
+            classify_book("Cross-Identity Collage", s),
+            BookKind::Unclassified
+        );
     }
 
     #[test]
@@ -601,23 +620,13 @@ mod tests {
         // Anything else at the identity book root is unclassified — it's
         // probably a stray page outside the agents chapter (the migration
         // tool will move it).
-        let (k, _, _) = classify_page(
-            "Some Stray Page",
-            BookKind::Identity,
-            None,
-            None,
-        );
+        let (k, _, _) = classify_page("Some Stray Page", BookKind::Identity, None, None);
         assert_eq!(k, PageKind::Unclassified);
     }
 
     #[test]
     fn page_classification_in_collage_book() {
-        let (k, key, _) = classify_page(
-            "The Practice",
-            BookKind::Collage,
-            None,
-            None,
-        );
+        let (k, key, _) = classify_page("The Practice", BookKind::Collage, None, None);
         assert_eq!(k, PageKind::CollageTopic);
         assert_eq!(key.as_deref(), Some("The Practice"));
     }
@@ -625,12 +634,7 @@ mod tests {
     #[test]
     fn page_classification_legacy_user_journal_at_book_root() {
         // Pre-v1.0.0 shape: journal entries at the user-journal book root.
-        let (k, key, _) = classify_page(
-            "2026-04-27",
-            BookKind::UserJournal,
-            None,
-            None,
-        );
+        let (k, key, _) = classify_page("2026-04-27", BookKind::UserJournal, None, None);
         assert_eq!(k, PageKind::JournalEntry);
         assert_eq!(key.as_deref(), Some("2026-04-27"));
     }
@@ -656,7 +660,11 @@ mod tests {
 
     #[test]
     fn kind_str_roundtrip() {
-        for k in [ShelfKind::Hive, ShelfKind::UserJournals, ShelfKind::Unclassified] {
+        for k in [
+            ShelfKind::Hive,
+            ShelfKind::UserJournals,
+            ShelfKind::Unclassified,
+        ] {
             assert_eq!(ShelfKind::from_str(k.as_str()), Ok(k));
         }
         for k in [

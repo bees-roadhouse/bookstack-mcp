@@ -98,10 +98,10 @@ mod tests {
     fn test_search_ordering_and_threshold() {
         let query = vec![1.0, 0.0, 0.0];
         let chunks = vec![
-            (1, 10, embedding_to_blob(&[1.0, 0.0, 0.0])),  // score ~1.0
-            (2, 20, embedding_to_blob(&[0.5, 0.5, 0.0])),  // score ~0.707
-            (3, 30, embedding_to_blob(&[0.0, 1.0, 0.0])),  // score ~0.0
-            (4, 40, embedding_to_blob(&[0.9, 0.1, 0.0])),  // score ~0.994
+            (1, 10, embedding_to_blob(&[1.0, 0.0, 0.0])), // score ~1.0
+            (2, 20, embedding_to_blob(&[0.5, 0.5, 0.0])), // score ~0.707
+            (3, 30, embedding_to_blob(&[0.0, 1.0, 0.0])), // score ~0.0
+            (4, 40, embedding_to_blob(&[0.9, 0.1, 0.0])), // score ~0.994
         ];
         let results = search_embeddings(&query, &chunks, 10, 0.5);
         assert_eq!(results.len(), 3); // chunk 3 below threshold

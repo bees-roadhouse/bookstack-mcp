@@ -5,15 +5,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use reqwest::Client;
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
-use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
@@ -186,7 +186,10 @@ impl AppState {
         let db = self.db.clone();
         let backup_path = self.backup_path.clone();
         let interval = Duration::from_secs(interval_hours * 3600);
-        eprintln!("Backup: enabled every {interval_hours}h to {}", backup_path.display());
+        eprintln!(
+            "Backup: enabled every {interval_hours}h to {}",
+            backup_path.display()
+        );
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
@@ -216,9 +219,8 @@ fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Respo
     let base = crate::oauth::derive_base_url(headers, known_urls);
     let body = serde_json::json!({"error": "unauthorized", "hint": hint});
     let mut resp = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
-    let www_auth = format!(
-        "Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\""
-    );
+    let www_auth =
+        format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
     resp.headers_mut()
         .insert("WWW-Authenticate", www_auth.parse().unwrap());
     resp
@@ -260,20 +262,27 @@ pub async fn resolve_credentials(
     }
 
     eprintln!("Auth: token not recognized");
-    Err(unauthorized("Invalid or expired token", headers, known_urls))
+    Err(unauthorized(
+        "Invalid or expired token",
+        headers,
+        known_urls,
+    ))
 }
 
-pub async fn handle_sse(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
     eprintln!("GET /mcp/sse — SSE connection attempt");
-    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-        Ok(creds) => creds,
-        Err(resp) => return resp,
-    };
+    let (token_id, token_secret) =
+        match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+            Ok(creds) => creds,
+            Err(resp) => return resp,
+        };
 
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
+    let client = BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
 
     if let Err(e) = client.validate().await {
         eprintln!("Credential validation failed: {e}");
@@ -345,10 +354,11 @@ pub async fn handle_message(
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/messages/ — message request");
-    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-        Ok(creds) => creds,
-        Err(resp) => return resp,
-    };
+    let (token_id, token_secret) =
+        match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+            Ok(creds) => creds,
+            Err(resp) => return resp,
+        };
 
     let session_id = match params.get("sessionId") {
         Some(id) => id,
@@ -374,7 +384,9 @@ pub async fn handle_message(
             }
         };
 
-        if !constant_time_eq(&session.token_id, &token_id) || !constant_time_eq(&session.token_secret, &token_secret) {
+        if !constant_time_eq(&session.token_id, &token_id)
+            || !constant_time_eq(&session.token_secret, &token_secret)
+        {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "token does not match session"})),
@@ -390,7 +402,11 @@ pub async fn handle_message(
                 .into_response();
         }
 
-        (session.tx.clone(), session.client.clone(), session.rate_limit.clone())
+        (
+            session.tx.clone(),
+            session.client.clone(),
+            session.rate_limit.clone(),
+        )
     };
 
     {
@@ -434,10 +450,11 @@ pub async fn handle_streamable(
     body: String,
 ) -> Response {
     eprintln!("POST /mcp/sse — Streamable HTTP request");
-    let (token_id, token_secret) = match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-        Ok(creds) => creds,
-        Err(resp) => return resp,
-    };
+    let (token_id, token_secret) =
+        match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
+            Ok(creds) => creds,
+            Err(resp) => return resp,
+        };
 
     {
         let rate_limits = state.streamable_rate_limits.read().await;
@@ -461,7 +478,12 @@ pub async fn handle_streamable(
         }
     }
 
-    let client = BookStackClient::new(&state.bookstack_url, &token_id, &token_secret, state.http_client.clone());
+    let client = BookStackClient::new(
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
+    );
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -516,17 +538,15 @@ pub async fn handle_streamable(
                     let mut ss = state.streamable_sessions.write().await;
                     ss.insert(new_session_id.clone(), Instant::now());
                 }
-                http_resp.headers_mut().insert(
-                    "Mcp-Session-Id",
-                    new_session_id.parse().unwrap(),
-                );
+                http_resp
+                    .headers_mut()
+                    .insert("Mcp-Session-Id", new_session_id.parse().unwrap());
             } else if let Some(ref sid) = incoming_session_id {
                 let ss = state.streamable_sessions.read().await;
                 if ss.contains_key(sid) {
-                    http_resp.headers_mut().insert(
-                        "Mcp-Session-Id",
-                        sid.parse().unwrap(),
-                    );
+                    http_resp
+                        .headers_mut()
+                        .insert("Mcp-Session-Id", sid.parse().unwrap());
                 }
             }
 

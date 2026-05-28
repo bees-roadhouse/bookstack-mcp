@@ -2,7 +2,7 @@
 //! Splits page HTML into chunks by heading tags, with merge/split post-processing.
 //! v2: tighter chunks (1200 chars) with paragraph overlap for better embedding precision.
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// Chunk format version. Increment when chunking logic changes to trigger re-indexing.
 /// v5: added shelf to context prefix (Shelf > Book > Chapter > Page)
@@ -64,10 +64,7 @@ pub fn chunk_html_with_name(html: &str, page_name: Option<&str>) -> Vec<Chunk> {
             }
 
             // Check for heading close tags
-            let is_closing_heading = matches!(
-                tag.as_str(),
-                "/h1" | "/h2" | "/h3"
-            );
+            let is_closing_heading = matches!(tag.as_str(), "/h1" | "/h2" | "/h3");
             if is_closing_heading {
                 if let Some(level) = collecting_heading.take() {
                     let text = heading_text.trim().to_string();
@@ -303,12 +300,18 @@ mod tests {
         let html = "<h1>My Page Title</h1><p>Introduction text that is long enough to form a real chunk on its own.</p><h2>Section A</h2><p>Content for section A with enough text to be a real chunk.</p>";
         // Without page name: h1 appears in heading_path
         let chunks = chunk_html(html);
-        assert!(chunks.iter().any(|c| c.heading_path.contains("My Page Title")));
+        assert!(chunks
+            .iter()
+            .any(|c| c.heading_path.contains("My Page Title")));
 
         // With matching page name: h1 is skipped
         let chunks = chunk_html_with_name(html, Some("My Page Title"));
-        assert!(!chunks.iter().any(|c| c.heading_path.contains("My Page Title")),
-            "Page title should be stripped from heading_path when it matches page name");
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.heading_path.contains("My Page Title")),
+            "Page title should be stripped from heading_path when it matches page name"
+        );
         assert!(!chunks.is_empty());
         // Section A should still appear
         assert!(chunks.iter().any(|c| c.heading_path.contains("Section A")));
@@ -379,11 +382,20 @@ mod tests {
 </tbody>
 </table>"#;
         let chunks = chunk_html(html);
-        assert!(!chunks.is_empty(), "Table-heavy HTML must produce at least one chunk");
+        assert!(
+            !chunks.is_empty(),
+            "Table-heavy HTML must produce at least one chunk"
+        );
         // Verify table content was extracted
         let all_content: String = chunks.iter().map(|c| c.content.clone()).collect();
-        assert!(all_content.contains("PowerShell"), "Table cell content should be extracted");
-        assert!(all_content.contains("Active Directory"), "Table cell content should be extracted");
+        assert!(
+            all_content.contains("PowerShell"),
+            "Table cell content should be extracted"
+        );
+        assert!(
+            all_content.contains("Active Directory"),
+            "Table cell content should be extracted"
+        );
     }
 
     #[test]
@@ -391,7 +403,10 @@ mod tests {
         // Page with no headings at all — all content should go into one chunk
         let html = "<p>This is a page with no headings but enough content to be meaningful. It should produce at least one chunk even without any heading tags.</p>";
         let chunks = chunk_html(html);
-        assert!(!chunks.is_empty(), "Content without headings must produce chunks");
+        assert!(
+            !chunks.is_empty(),
+            "Content without headings must produce chunks"
+        );
     }
 
     #[test]

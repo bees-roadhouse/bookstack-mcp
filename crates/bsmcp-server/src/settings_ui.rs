@@ -106,10 +106,7 @@ async fn resolve_session(
     Some((session.token_id.clone(), session.token_secret.clone()))
 }
 
-pub async fn has_valid_session(
-    headers: &HeaderMap,
-    store: &SettingsSessionStore,
-) -> bool {
+pub async fn has_valid_session(headers: &HeaderMap, store: &SettingsSessionStore) -> bool {
     resolve_session(headers, store).await.is_some()
 }
 
@@ -123,11 +120,11 @@ fn html_escape(s: &str) -> String {
 
 // --- Handlers ---
 
-pub async fn handle_settings_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    if resolve_session(&headers, &state.settings_sessions).await.is_none() {
+pub async fn handle_settings_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if resolve_session(&headers, &state.settings_sessions)
+        .await
+        .is_none()
+    {
         return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response();
     }
     let globals = state.db.get_global_settings().await.unwrap_or_default();
@@ -166,7 +163,11 @@ pub async fn handle_settings_post(
         let mut globals = state.db.get_global_settings().await.unwrap_or_default();
         globals.hive_shelf_id = parse_optional_i64(&form.hive_shelf_id);
         globals.user_journals_shelf_id = parse_optional_i64(&form.user_journals_shelf_id);
-        if let Err(e) = state.db.save_global_settings(&globals, &token_id_hash).await {
+        if let Err(e) = state
+            .db
+            .save_global_settings(&globals, &token_id_hash)
+            .await
+        {
             return error_response(format!("Failed to save global settings: {e}"));
         }
     }
@@ -180,7 +181,10 @@ pub async fn handle_settings_probe_get(
     State(_state): State<AppState>,
     _headers: HeaderMap,
 ) -> Response {
-    (StatusCode::GONE, Html("<p>Probe disabled. Use <a href=\"/settings\">/settings</a> directly.</p>"))
+    (
+        StatusCode::GONE,
+        Html("<p>Probe disabled. Use <a href=\"/settings\">/settings</a> directly.</p>"),
+    )
         .into_response()
 }
 
@@ -194,7 +198,10 @@ pub async fn handle_settings_probe_post(
 // --- Form parsing helpers ---
 
 fn parse_optional_i64(v: &Option<String>) -> Option<i64> {
-    v.as_deref().map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
+    v.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
 }
 
 fn error_response(msg: String) -> Response {
@@ -236,6 +243,9 @@ button {{ margin-top: 1.5em; padding: 0.6em 1.2em; font-size: 1em; cursor: point
 </body>
 </html>"#,
         hive_shelf_id = g.hive_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
-        user_journals_shelf_id = g.user_journals_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
+        user_journals_shelf_id = g
+            .user_journals_shelf_id
+            .map(|i| i.to_string())
+            .unwrap_or_default(),
     )
 }

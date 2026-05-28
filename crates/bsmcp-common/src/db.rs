@@ -20,7 +20,8 @@ pub trait DbBackend: Send + Sync + 'static {
     async fn cleanup_expired_tokens(&self) -> Result<(), String>;
 
     /// Store a refresh token mapped to encrypted BookStack credentials.
-    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String>;
+    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str)
+        -> Result<(), String>;
 
     /// Retrieve and decrypt a refresh token's BookStack credentials.
     /// Returns None if the token doesn't exist or has expired.
@@ -66,7 +67,11 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     // --- Relationships ---
 
-    async fn replace_relationships(&self, source: i64, targets: &[(i64, String)]) -> Result<(), String>;
+    async fn replace_relationships(
+        &self,
+        source: i64,
+        targets: &[(i64, String)],
+    ) -> Result<(), String>;
     async fn get_markov_blanket(&self, page_id: i64) -> Result<MarkovBlanket, String>;
 
     // --- Job queue ---
@@ -141,8 +146,7 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// Archiver input: ids of succeeded/cancelled jobs whose
     /// `resolved_at` is older than `older_than_secs` and which haven't
     /// already been closed.
-    async fn list_archivable_embed_jobs(&self, older_than_secs: i64)
-        -> Result<Vec<i64>, String>;
+    async fn list_archivable_embed_jobs(&self, older_than_secs: i64) -> Result<Vec<i64>, String>;
 
     /// List currently-running jobs whose `started_at` is older than
     /// `started_before_secs` (unix epoch). Background timeout watcher
@@ -248,10 +252,7 @@ pub trait IndexDb: Send + Sync + 'static {
     // --- Chapters ---
 
     async fn upsert_indexed_chapter(&self, chapter: &IndexedChapter) -> Result<(), String>;
-    async fn get_indexed_chapter(
-        &self,
-        chapter_id: i64,
-    ) -> Result<Option<IndexedChapter>, String>;
+    async fn get_indexed_chapter(&self, chapter_id: i64) -> Result<Option<IndexedChapter>, String>;
     async fn list_indexed_chapters_by_book(
         &self,
         book_id: i64,
@@ -317,11 +318,7 @@ pub trait IndexDb: Send + Sync + 'static {
         progress: i64,
         total: i64,
     ) -> Result<(), String>;
-    async fn complete_index_job(
-        &self,
-        job_id: i64,
-        error: Option<&str>,
-    ) -> Result<(), String>;
+    async fn complete_index_job(&self, job_id: i64, error: Option<&str>) -> Result<(), String>;
     async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String>;
     async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String>;
 

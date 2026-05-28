@@ -200,7 +200,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation linker (Linux aarch64 only)
+      - name: Install cross-compilation toolchain (Linux aarch64 only)
         if: matrix.cross == true
         run: |
           sudo apt-get update
@@ -210,6 +210,16 @@ jobs:
           [target.aarch64-unknown-linux-gnu]
           linker = "aarch64-linux-gnu-gcc"
           EOF
+          # openssl-src (vendored) and cc-rs need to know which compiler/archiver
+          # to use for the target arch. Without this, openssl-src builds host-arch
+          # binaries that link-error against the aarch64 linker output. The
+          # `_aarch64_unknown_linux_gnu` suffix matches cargo's TARGET triple
+          # underscore form (per cc-rs env var convention).
+          {
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
 
       - name: Build server binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p bsmcp-server
@@ -381,7 +391,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation linker (Linux aarch64 only)
+      - name: Install cross-compilation toolchain (Linux aarch64 only)
         if: matrix.cross == true
         run: |
           sudo apt-get update
@@ -391,6 +401,16 @@ jobs:
           [target.aarch64-unknown-linux-gnu]
           linker = "aarch64-linux-gnu-gcc"
           EOF
+          # openssl-src (vendored) and cc-rs need to know which compiler/archiver
+          # to use for the target arch. Without this, openssl-src builds host-arch
+          # binaries that link-error against the aarch64 linker output. The
+          # `_aarch64_unknown_linux_gnu` suffix matches cargo's TARGET triple
+          # underscore form (per cc-rs env var convention).
+          {
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
 
       - name: Build server binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p bsmcp-server

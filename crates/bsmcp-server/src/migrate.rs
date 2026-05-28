@@ -147,7 +147,9 @@ async fn ensure_schema(pool: &PgPool) -> Result<(), String> {
 
     // Create indexes (ignore errors if they exist)
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_tokens_created ON access_tokens(created_at)")
-        .execute(pool).await.ok();
+        .execute(pool)
+        .await
+        .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops)")
         .execute(pool).await.ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_embed_jobs_pending ON embed_jobs(status) WHERE status = 'pending'")
@@ -197,7 +199,16 @@ async fn migrate_pages(conn: &Connection, pool: &PgPool) -> Result<usize, String
         .prepare("SELECT page_id, book_id, chapter_id, name, slug, content_hash, embedded_at, updated_at FROM pages")
         .map_err(|e| format!("Failed to query pages: {e}"))?;
 
-    let rows: Vec<(i64, i64, Option<i64>, String, String, String, i64, Option<String>)> = stmt
+    let rows: Vec<(
+        i64,
+        i64,
+        Option<i64>,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+    )> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -347,7 +358,15 @@ async fn migrate_embed_jobs(conn: &Connection, pool: &PgPool) -> Result<usize, S
         )
         .map_err(|e| format!("Failed to query embed_jobs: {e}"))?;
 
-    let rows: Vec<(String, String, i64, i64, Option<i64>, Option<i64>, Option<String>)> = stmt
+    let rows: Vec<(
+        String,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    )> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -392,7 +411,9 @@ async fn fix_sequences(pool: &PgPool) -> Result<(), String> {
         ("embed_jobs_id_seq", "embed_jobs", "id"),
     ];
     for (seq, table, col) in sequences {
-        let sql = format!("SELECT setval('{seq}', COALESCE((SELECT MAX({col}) FROM {table}), 0) + 1, false)");
+        let sql = format!(
+            "SELECT setval('{seq}', COALESCE((SELECT MAX({col}) FROM {table}), 0) + 1, false)"
+        );
         sqlx::query(&sql)
             .execute(pool)
             .await
@@ -406,7 +427,13 @@ async fn validate(conn: &Connection, pool: &PgPool) -> Result<(), String> {
     eprintln!("\nValidation:");
     let mut ok = true;
 
-    let tables = ["access_tokens", "pages", "chunks", "relationships", "embed_jobs"];
+    let tables = [
+        "access_tokens",
+        "pages",
+        "chunks",
+        "relationships",
+        "embed_jobs",
+    ];
     for table in tables {
         if !table_exists(conn, table) {
             eprintln!("  {table}: not in SQLite, skipped");
@@ -414,7 +441,9 @@ async fn validate(conn: &Connection, pool: &PgPool) -> Result<(), String> {
         }
 
         let sqlite_count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap_or(-1);
 
         let pg_row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
@@ -422,11 +451,18 @@ async fn validate(conn: &Connection, pool: &PgPool) -> Result<(), String> {
             .await
             .unwrap_or((-1,));
 
-        let status = if sqlite_count == pg_row.0 { "OK" } else { "MISMATCH" };
+        let status = if sqlite_count == pg_row.0 {
+            "OK"
+        } else {
+            "MISMATCH"
+        };
         if sqlite_count != pg_row.0 {
             ok = false;
         }
-        eprintln!("  {table}: SQLite={sqlite_count} PostgreSQL={} [{status}]", pg_row.0);
+        eprintln!(
+            "  {table}: SQLite={sqlite_count} PostgreSQL={} [{status}]",
+            pg_row.0
+        );
     }
 
     if ok {

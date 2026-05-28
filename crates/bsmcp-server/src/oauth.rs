@@ -130,7 +130,8 @@ pub fn derive_base_url(headers: &HeaderMap, known_urls: &[String]) -> String {
 }
 
 fn extract_host_from_url(url: &str) -> Option<&str> {
-    let after_scheme = url.strip_prefix("https://")
+    let after_scheme = url
+        .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     Some(after_scheme.split('/').next().unwrap_or(after_scheme))
 }
@@ -148,11 +149,7 @@ fn is_safe_internal_path(s: &str) -> bool {
     s.starts_with('/') && !s.starts_with("//") && !s.contains(':')
 }
 
-fn render_login_form(
-    params: &AuthorizeParams,
-    bookstack_url: &str,
-    error: Option<&str>,
-) -> String {
+fn render_login_form(params: &AuthorizeParams, bookstack_url: &str, error: Option<&str>) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let title = if instance_name.is_empty() {
         "BookStack MCP".to_string()
@@ -255,10 +252,7 @@ button:hover {{ background: #3498db; }}
     )
 }
 
-pub async fn handle_metadata(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Json<Value> {
+pub async fn handle_metadata(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let base = derive_base_url(&headers, &state.known_urls);
     Json(json!({
         "issuer": base,
@@ -345,7 +339,12 @@ pub async fn handle_authorize_submit(
         );
     }
 
-    let bs_client = BookStackClient::new(&state.bookstack_url, &form.token_id, &form.token_secret, state.http_client.clone());
+    let bs_client = BookStackClient::new(
+        &state.bookstack_url,
+        &form.token_id,
+        &form.token_secret,
+        state.http_client.clone(),
+    );
     if let Err(e) = bs_client.validate().await {
         eprintln!("OAuth: credential validation failed: {e}");
         let params = AuthorizeParams {
@@ -510,10 +509,7 @@ async fn handle_token_authorization_code(
             }
         };
 
-        let method = auth_code
-            .code_challenge_method
-            .as_deref()
-            .unwrap_or("S256");
+        let method = auth_code.code_challenge_method.as_deref().unwrap_or("S256");
         if method != "S256" {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -556,8 +552,12 @@ async fn handle_token_authorization_code(
             );
         }
 
-        let bs_client =
-            BookStackClient::new(&state.bookstack_url, &client_id, &client_secret, state.http_client.clone());
+        let bs_client = BookStackClient::new(
+            &state.bookstack_url,
+            &client_id,
+            &client_secret,
+            state.http_client.clone(),
+        );
         if let Err(e) = bs_client.validate().await {
             eprintln!("OAuth: BookStack credential validation failed: {e}");
             return oauth_error(
@@ -608,7 +608,10 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
 
     // Validate the stored BookStack credentials are still valid
     let bs_client = BookStackClient::new(
-        &state.bookstack_url, &token_id, &token_secret, state.http_client.clone(),
+        &state.bookstack_url,
+        &token_id,
+        &token_secret,
+        state.http_client.clone(),
     );
     if let Err(e) = bs_client.validate().await {
         eprintln!("OAuth: stored BookStack credentials no longer valid: {e}");
@@ -636,7 +639,11 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
     let refresh_token = uuid::Uuid::new_v4().to_string();
     let expires_in = access_token_ttl().as_secs();
 
-    if let Err(e) = state.db.insert_access_token(&access_token, token_id, token_secret).await {
+    if let Err(e) = state
+        .db
+        .insert_access_token(&access_token, token_id, token_secret)
+        .await
+    {
         eprintln!("OAuth: failed to persist access token: {e}");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -645,7 +652,11 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
         );
     }
 
-    if let Err(e) = state.db.insert_refresh_token(&refresh_token, token_id, token_secret).await {
+    if let Err(e) = state
+        .db
+        .insert_refresh_token(&refresh_token, token_id, token_secret)
+        .await
+    {
         eprintln!("OAuth: failed to persist refresh token: {e}");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -673,10 +684,7 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
         .into_response()
 }
 
-fn extract_client_credentials(
-    headers: &HeaderMap,
-    form: &TokenForm,
-) -> Option<(String, String)> {
+fn extract_client_credentials(headers: &HeaderMap, form: &TokenForm) -> Option<(String, String)> {
     if let (Some(id), Some(secret)) = (&form.client_id, &form.client_secret) {
         if !id.is_empty() && !secret.is_empty() {
             return Some((id.clone(), secret.clone()));
@@ -685,9 +693,7 @@ fn extract_client_credentials(
 
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
         if let Some(basic) = auth.strip_prefix("Basic ") {
-            if let Ok(decoded) =
-                base64::engine::general_purpose::STANDARD.decode(basic.trim())
-            {
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(basic.trim()) {
                 if let Ok(decoded_str) = String::from_utf8(decoded) {
                     if let Some((id, secret)) = decoded_str.split_once(':') {
                         return Some((id.to_string(), secret.to_string()));
@@ -729,7 +735,10 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
         }
     };
 
-    let client_name = request.get("client_name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+    let client_name = request
+        .get("client_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed>");
     eprintln!("OAuth: registration request from client: {client_name}");
 
     let client_id = uuid::Uuid::new_v4().to_string();
