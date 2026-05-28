@@ -171,6 +171,7 @@ async fn main() {
                     eprintln!("Semantic: enabled (embedder_url={embedder_url})");
                     let state = Arc::new(semantic::SemanticState::new(
                         sdb.clone(),
+                        index_db.clone(),
                         embedder_url,
                         webhook_secret,
                     ));

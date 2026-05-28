@@ -6,8 +6,12 @@ name: Generate Repo Artifacts
 # That way the regenerated artifacts are part of the PR being reviewed/merged
 # — not retroactively dropped onto development after the fact.
 #
-# The auto-commit uses `[skip ci]` to avoid a trigger loop. It will not
-# re-fire either this workflow or `release.yml`.
+# The re-fire loop is broken by `paths-ignore: [SBOM.md, STRUCTURE.md]` on
+# the `pull_request` trigger below — the auto-commit only touches those two
+# files, so the trigger doesn't fire again. No `[skip ci]` keyword in the
+# commit message: it inherits through squash-merge bodies into the release-
+# branch push event and can suppress `release.yml`'s github-release-on-merge
+# job (issue #73).
 #
 # For external fork PRs, GITHUB_TOKEN cannot push back to the fork; the
 # job is skipped in that case (the contributor regenerates locally).
@@ -97,7 +101,7 @@ jobs:
       - name: Commit artifacts if changed
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: regenerate SBOM and STRUCTURE [skip ci]"
+          commit_message: "chore: regenerate SBOM and STRUCTURE"
           file_pattern: "SBOM.md STRUCTURE.md"
           commit_user_name: "github-actions[bot]"
           commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"

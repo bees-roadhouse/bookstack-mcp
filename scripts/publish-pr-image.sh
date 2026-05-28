@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# Optional. CI now builds images on every PR push (.github/workflows/
-# build-pr.yml). Use this script when you need to publish out-of-band:
-#   - Emergency hotfixes when CI is unavailable.
-#   - Local pre-PR experimentation against a non-PR branch.
-#   - Reproducing a specific PR head image locally for debugging.
+# Optional, vestigial. CI builds images on push to development / release
+# via build-development.yml / release.yml — there is no PR-time image
+# build and no per-PR tag in the current model. This script tags images
+# with `{version}-{slug}` / `{version}-{slug}-{sha}` for local
+# experimentation only; nothing in the normal flow consumes those tags.
 #
-# For the normal PR flow, just push your branch — build-pr.yml takes
-# over from there. See DEVELOPMENT.md for the canonical CI/CD shape.
+# Use only for:
+#   - Local pre-PR experimentation against a non-PR branch.
+#   - Reproducing a specific tree's image locally for debugging.
+#
+# For "emergency rebuild when CI is broken" use `workflow_dispatch` on
+# build-development.yml instead — it produces the canonical :dev tags.
 #
 # Path-aware fast path: when the branch's diff against `origin/development`
 # (or `origin/release` when targeting that) doesn't touch any file that
 # affects a given binary, we skip the rebuild and instead retag the
-# latest published `:dev` image as the per-PR tags. Mirrors the same
-# logic build-pr.yml runs in CI via dorny/paths-filter@v3 — keep the
-# SERVER_PATHS / EMBEDDER_PATHS / WORKER_PATHS arrays here in sync with
-# the filter blocks in build-pr.yml. Tag-only ops are free; full builds
-# on linux/arm64 take 15+ minutes.
+# latest published `:dev` image as the per-PR tags. Tag-only ops are
+# free; full builds on linux/arm64 take 15+ minutes.
 #
 # Prerequisites:
 #   - docker + docker buildx with a multi-platform builder configured
