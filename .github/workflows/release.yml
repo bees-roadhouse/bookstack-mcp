@@ -2,12 +2,11 @@ name: Release
 
 # Release-stream concerns. Triggers:
 #
-#   1. push: release          → after promote-on-merge.yml has retagged
-#                               the version tags, this workflow creates
-#                               the GitHub Release entry and attaches
-#                               native bsmcp-server binaries for 5
-#                               targets. No image rebuild — the version
-#                               tags already point at the right manifest.
+#   1. push: release          → build and push the release-stream images
+#                               (`:{version}`, `:{version}-{sha}`, `:release`,
+#                               `:latest`), create the v{version} GitHub
+#                               Release entry, attach native bsmcp-server
+#                               binaries for 5 targets.
 #
 #   2. push: tag v*           → emergency hotfix path. Builds and pushes
 #                               semver-tagged images directly, then
@@ -19,8 +18,10 @@ name: Release
 #
 #   3. workflow_dispatch       → manual recovery path.
 #
-# build-pr.yml is the gating workflow for PRs. promote-on-merge.yml
-# moves the rolling tags. This workflow only handles the release stream.
+# verify-pr.yml is the PR-time gating workflow (cargo test/clippy).
+# build-development.yml is the development-stream image builder. This
+# workflow owns the release stream end-to-end (build + release entry +
+# native binaries).
 #
 # Canonical references:
 #   https://kb.beesroadhouse.com/books/developer-operations-devops/page/docker-image-build-workflows (1905)
@@ -37,8 +38,70 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # GitHub Release on push: release. Runs after promote-on-merge.yml
-  # has already retagged the version tags. Creates the v{version} git
+  # Image build on push: release. Builds + pushes the release-stream
+  # tags (:{version}, :{version}-{sha}, :release, :latest). Pinned to
+  # ubuntu-latest; no self-hosted dependency.
+  build-release-images:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: bsmcp-server
+            dockerfile: docker/Dockerfile.server
+            scope: server
+          - image: bsmcp-embedder
+            dockerfile: docker/Dockerfile.embedder
+            scope: embedder
+          - image: bsmcp-worker
+            dockerfile: docker/Dockerfile.worker
+            scope: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version + sha
+        id: vars
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:${{ steps.vars.outputs.version }}
+            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short_sha }}
+            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:release
+            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/bees-roadhouse/bookstack-mcp
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+
+  # GitHub Release entry on push: release. Runs in parallel with
+  # build-release-images (the Release body references tags by name, which
+  # resolve to manifests when users pull). Creates the v{version} git
   # tag (if missing) and the GitHub Release entry; release-binaries-on-
   # merge attaches native binaries.
   github-release-on-merge:
@@ -180,11 +243,11 @@ jobs:
           files: ${{ env.ARCHIVE }}
 
   # Emergency hotfix path: a `v*` tag was pushed directly. Build the
-  # semver-tagged images and create the GitHub Release. This is the
-  # only path in this workflow that builds images.
+  # semver-tagged images and create the GitHub Release. Pinned to
+  # ubuntu-latest; no self-hosted dependency.
   tag-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, linux, x64, nate-wsl]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write

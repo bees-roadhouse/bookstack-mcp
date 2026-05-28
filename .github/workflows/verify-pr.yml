@@ -1,0 +1,54 @@
+name: Verify PR
+
+# PR-time gating signal: cargo check + cargo clippy + cargo test on
+# ubuntu-latest. Image builds run out-of-band on push to development /
+# release (build-development.yml / release.yml). This workflow is the
+# "does it compile, lint, test" gate — not "does the image build."
+#
+# Pinned to GitHub-hosted runners. No self-hosted dependency.
+
+on:
+  pull_request:
+    branches: [development, release]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: verify-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # External fork PRs aren't gated on org infrastructure — they can't
+    # push images anyway, and a maintainer rebases them in once approved.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
