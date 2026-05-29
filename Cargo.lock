@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-common"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-db-postgres"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-db-sqlite"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-embedder"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "bsmcp-server"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
