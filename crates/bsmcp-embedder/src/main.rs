@@ -1,6 +1,7 @@
 mod embed;
 mod pipeline;
 mod rerank;
+mod worker;
 
 use std::env;
 use std::fs;
@@ -18,7 +19,7 @@ use uuid::Uuid;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::config::DbBackendType;
-use bsmcp_common::db::SemanticDb;
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 
 use embed::Embedder;
 use rerank::Reranker;
@@ -31,6 +32,41 @@ const DEFAULT_VOYAGE_MODEL: &str = "voyage-3-lite";
 const DEFAULT_LOCAL_RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
 const DEFAULT_VOYAGE_RERANK_MODEL: &str = "rerank-2";
 
+/// What slice of the job pipeline this process owns.
+///
+/// `Embedder` (default) — runs the embed job queue, the `/embed` +
+///   `/rerank` HTTP endpoints, and (when enabled) the cross-encoder.
+///   Does NOT spawn `IndexWorker`; operators running embedder-only get
+///   no automatic index retry-chain reconciliation.
+///
+/// `Worker` — runs `IndexWorker`: owns the `index_jobs` queue, the
+///   initial full walk, the periodic delta walk, the lifecycle
+///   housekeeper (timeout watcher + archiver + retry-chain reconciler)
+///   across BOTH `index_jobs` and `embed_jobs`. No HTTP listener, no
+///   embed model loaded.
+///
+/// `Both` — runs everything in one process. Useful for single-host
+///   deployments (the SQLite path is the canonical case). Worker
+///   housekeeper and embedder's job_queue_worker run side-by-side; the
+///   per-worker UUID claim on each queue keeps them from stepping on
+///   each other.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Role {
+    Embedder,
+    Worker,
+    Both,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedder => "embedder",
+            Self::Worker => "worker",
+            Self::Both => "both",
+        }
+    }
+}
+
 struct AppState {
     embedder: Arc<dyn Embedder>,
     model_name: String,
@@ -39,6 +75,10 @@ struct AppState {
     /// Reranker is optional — `BSMCP_RERANK_PROVIDER=none` (the default) leaves
     /// it unconfigured and `/rerank` returns 503.
     reranker: Option<Arc<dyn Reranker>>,
+    /// The role this process is running as. Surfaced on `/health` so
+    /// operators can curl two compose services and verify the role flag
+    /// actually took effect.
+    role: Role,
 }
 
 /// Load or generate a persistent worker UUID from a file in the data directory.
@@ -71,10 +111,68 @@ struct RerankRequest {
     top_k: Option<usize>,
 }
 
+/// Resolve the runtime role for this process.
+///
+/// Precedence:
+///   1. `--role=<value>` or `--role <value>` CLI flag (primary).
+///   2. `BSMCP_ROLE` env var (fallback for orchestrators that only set env).
+///   3. Default `Role::Embedder` (matches v0.12.x behavior — the embedder
+///      image without a flag keeps working).
+///
+/// Unparseable values panic at startup rather than silently degrading to
+/// the default, so a typo in compose doesn't quietly send the worker
+/// container into embedder mode and contend with the real embedder for jobs.
+fn resolve_role() -> Role {
+    fn parse(s: &str) -> Option<Role> {
+        match s.trim().to_lowercase().as_str() {
+            "embedder" => Some(Role::Embedder),
+            "worker" => Some(Role::Worker),
+            "both" => Some(Role::Both),
+            _ => None,
+        }
+    }
+
+    // CLI flag: --role=<value> or --role <value>. Skip argv[0] (binary name).
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(value) = arg.strip_prefix("--role=") {
+            match parse(value) {
+                Some(r) => return r,
+                None => panic!("invalid --role value: {value:?} (expected: embedder|worker|both)"),
+            }
+        }
+        if arg == "--role" {
+            let value = args.get(i + 1).expect("--role requires a value");
+            match parse(value) {
+                Some(r) => return r,
+                None => panic!("invalid --role value: {value:?} (expected: embedder|worker|both)"),
+            }
+        }
+        i += 1;
+    }
+
+    if let Ok(raw) = env::var("BSMCP_ROLE") {
+        if !raw.trim().is_empty() {
+            return parse(&raw).unwrap_or_else(|| {
+                panic!("invalid BSMCP_ROLE: {raw:?} (expected: embedder|worker|both)")
+            });
+        }
+    }
+
+    Role::Embedder
+}
+
 #[tokio::main]
 async fn main() {
     bsmcp_common::logging::init("bsmcp-embedder");
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "embedder_starting");
+    let role = resolve_role();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        role = role.as_str(),
+        "embedder_starting"
+    );
 
     let encryption_key =
         env::var("BSMCP_ENCRYPTION_KEY").expect("BSMCP_ENCRYPTION_KEY is required");
@@ -82,31 +180,154 @@ async fn main() {
         panic!("BSMCP_ENCRYPTION_KEY must be at least 32 characters");
     }
 
-    // Select database backend
+    // Select database backend — all three roles need this.
     let backend_type = DbBackendType::from_env();
-    let db: Arc<dyn SemanticDb> = match backend_type {
-        DbBackendType::Sqlite => {
-            let db_path = env::var("BSMCP_DB_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent).ok();
+    let (db, index_db, semantic_db): (Arc<dyn DbBackend>, Arc<dyn IndexDb>, Arc<dyn SemanticDb>) =
+        match backend_type {
+            DbBackendType::Sqlite => {
+                let db_path = env::var("BSMCP_DB_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
+                if let Some(parent) = db_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                tracing::info!(
+                    backend = "sqlite",
+                    path = %db_path.display(),
+                    "database_selected"
+                );
+                let raw = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
+                (
+                    raw.clone() as Arc<dyn DbBackend>,
+                    raw.clone() as Arc<dyn IndexDb>,
+                    raw as Arc<dyn SemanticDb>,
+                )
             }
-            tracing::info!(backend = "sqlite", path = %db_path.display(), "database_selected");
-            Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key))
-        }
-        DbBackendType::Postgres => {
-            let database_url = env::var("BSMCP_DATABASE_URL")
-                .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
-            tracing::info!(backend = "postgres", "database_selected");
-            Arc::new(
-                bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
-                    .await
-                    .expect("Failed to connect to PostgreSQL"),
-            )
-        }
-    };
+            DbBackendType::Postgres => {
+                let database_url = env::var("BSMCP_DATABASE_URL")
+                    .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
+                tracing::info!(backend = "postgres", "database_selected");
+                let raw = Arc::new(
+                    bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
+                        .await
+                        .expect("Failed to connect to PostgreSQL"),
+                );
+                (
+                    raw.clone() as Arc<dyn DbBackend>,
+                    raw.clone() as Arc<dyn IndexDb>,
+                    raw as Arc<dyn SemanticDb>,
+                )
+            }
+        };
 
+    // Strict env hygiene for worker role — warn (don't fail) when the
+    // operator forgot to scrub embedder envs from the worker service
+    // block. These vars are silently ignored under role=worker, so
+    // surfacing it as a startup warning is the only way an operator
+    // notices the misconfig before it becomes a confusing support thread.
+    if role == Role::Worker {
+        for var in [
+            "BSMCP_EMBED_PROVIDER",
+            "BSMCP_RERANK_PROVIDER",
+            "BSMCP_EMBED_API_KEY",
+            "BSMCP_EMBED_API_URL",
+            "BSMCP_EMBED_MODEL",
+            "BSMCP_EMBED_DIMS",
+        ] {
+            if env::var(var).is_ok_and(|v| !v.trim().is_empty()) {
+                tracing::warn!(
+                    env = var,
+                    role = "worker",
+                    "worker_role_ignoring_embedder_env"
+                );
+            }
+        }
+    }
+
+    match role {
+        Role::Embedder => run_embedder(db, semantic_db, role).await,
+        Role::Worker => run_worker(db, index_db, semantic_db).await,
+        Role::Both => {
+            // Spawn the worker side as a tokio task and run the embedder
+            // inline. The embedder owns the main task because it blocks
+            // on axum::serve(); we surface a worker crash by aborting the
+            // process.
+            let worker_db = db.clone();
+            let worker_index_db = index_db.clone();
+            let worker_semantic_db = semantic_db.clone();
+            let worker_handle = tokio::spawn(async move {
+                run_worker(worker_db, worker_index_db, worker_semantic_db).await;
+            });
+            run_embedder(db, semantic_db, role).await;
+            if let Err(e) = worker_handle.await {
+                tracing::error!(error = %e, "worker_task_exited_unexpectedly");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Worker role body — lifts `bsmcp-worker/src/main.rs` lines 41-119
+/// minus the duplicated DB/encryption_key bootstrap (the role dispatcher
+/// in `main` already opened the DB).
+///
+/// Token precedence preserved from the standalone binary:
+///   1. `BSMCP_INDEX_TOKEN_ID` / `BSMCP_INDEX_TOKEN_SECRET` (primary)
+///   2. `BSMCP_EMBED_TOKEN_ID` / `BSMCP_EMBED_TOKEN_SECRET` (fallback)
+///
+/// Single-token deployments don't have to duplicate credentials.
+async fn run_worker(
+    db: Arc<dyn DbBackend>,
+    index_db: Arc<dyn IndexDb>,
+    semantic_db: Arc<dyn SemanticDb>,
+) {
+    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
+
+    // BookStack admin token — try BSMCP_INDEX_TOKEN_* first, fall back to
+    // BSMCP_EMBED_TOKEN_*. The two-token-name pattern matches what the
+    // standalone bsmcp-worker binary used so existing deployments work
+    // without renaming.
+    let token_id = env::var("BSMCP_INDEX_TOKEN_ID")
+        .or_else(|_| env::var("BSMCP_EMBED_TOKEN_ID"))
+        .expect(
+            "BSMCP_INDEX_TOKEN_ID (or BSMCP_EMBED_TOKEN_ID) is required (role=worker) — admin BookStack API token id",
+        );
+    let token_secret = env::var("BSMCP_INDEX_TOKEN_SECRET")
+        .or_else(|_| env::var("BSMCP_EMBED_TOKEN_SECRET"))
+        .expect(
+            "BSMCP_INDEX_TOKEN_SECRET (or BSMCP_EMBED_TOKEN_SECRET) is required (role=worker) — admin BookStack API token secret",
+        );
+
+    let bs_client = BookStackClient::new(
+        &bookstack_url,
+        &token_id,
+        &token_secret,
+        reqwest::Client::new(),
+    );
+
+    let delta_interval: u64 = env::var("BSMCP_INDEX_DELTA_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    tracing::info!(delta_interval_s = delta_interval, "worker_delta_interval");
+
+    let worker = worker::IndexWorker::new(bs_client, db, index_db);
+    let handle = worker.spawn(delta_interval, Some(semantic_db));
+
+    // Block on the worker indefinitely. Crashes inside the spawned task
+    // surface as a JoinError here so the container exits and the
+    // orchestrator can restart us.
+    if let Err(e) = handle.await {
+        tracing::error!(error = %e, "worker_task_exited_unexpectedly");
+        std::process::exit(1);
+    }
+}
+
+/// Embedder role body — provider selection, optional reranker, HTTP
+/// listener on `/embed` + `/rerank` + `/health`, plus the embed job
+/// queue worker. This is the v0.12.x main-body, refactored only to
+/// accept the pre-opened `db` and the `role` so `/health` can surface it.
+async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Role) {
     // Initialize semantic tables
     db.init_semantic_tables()
         .await
@@ -119,8 +340,9 @@ async fn main() {
 
     let (embedder, model_name, dims): (Arc<dyn Embedder>, String, usize) = match provider.as_str() {
         "openai" => {
-            let api_key = env::var("BSMCP_EMBED_API_KEY")
-                .expect("BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=openai");
+            let api_key = env::var("BSMCP_EMBED_API_KEY").expect(
+                "BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=openai (role=embedder)",
+            );
             let model =
                 env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
             let base_url = env::var("BSMCP_EMBED_API_URL")
@@ -156,8 +378,9 @@ async fn main() {
             (Arc::new(e), model, dims)
         }
         "voyage" => {
-            let api_key = env::var("BSMCP_EMBED_API_KEY")
-                .expect("BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=voyage");
+            let api_key = env::var("BSMCP_EMBED_API_KEY").expect(
+                "BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=voyage (role=embedder)",
+            );
             let model =
                 env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_VOYAGE_MODEL.into());
             let base_url = env::var("BSMCP_EMBED_API_URL")
@@ -276,6 +499,7 @@ async fn main() {
         provider_name: provider.clone(),
         db: db.clone(),
         reranker: reranker.clone(),
+        role,
     });
 
     let app = Router::new()
@@ -361,6 +585,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     });
     Json(json!({
         "status": "ok",
+        "role": state.role.as_str(),
         "provider": state.provider_name,
         "model": state.model_name,
         "dimensions": dims,
@@ -603,9 +828,9 @@ async fn job_queue_worker(
 
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
     let embed_token_id =
-        env::var("BSMCP_EMBED_TOKEN_ID").expect("BSMCP_EMBED_TOKEN_ID is required");
-    let embed_token_secret =
-        env::var("BSMCP_EMBED_TOKEN_SECRET").expect("BSMCP_EMBED_TOKEN_SECRET is required");
+        env::var("BSMCP_EMBED_TOKEN_ID").expect("BSMCP_EMBED_TOKEN_ID is required (role=embedder)");
+    let embed_token_secret = env::var("BSMCP_EMBED_TOKEN_SECRET")
+        .expect("BSMCP_EMBED_TOKEN_SECRET is required (role=embedder)");
 
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -861,5 +1086,20 @@ async fn trigger_clean_reindex(db: &Arc<dyn SemanticDb>, dims: usize) {
         Ok((job_id, true)) => tracing::info!(job_id, "embedder_auto_queued_full_job"),
         Ok((_, false)) => tracing::info!("embedder_reindex_job_already_active"),
         Err(e) => tracing::error!(error = %e, "embedder_reindex_queue_failed"),
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    /// `Role::as_str` round-trips to the string an operator typed.
+    /// Surfaced on `/health.role` so curl-based deploy verification can
+    /// confirm the role flag actually took effect.
+    #[test]
+    fn role_as_str_round_trip() {
+        assert_eq!(Role::Embedder.as_str(), "embedder");
+        assert_eq!(Role::Worker.as_str(), "worker");
+        assert_eq!(Role::Both.as_str(), "both");
     }
 }

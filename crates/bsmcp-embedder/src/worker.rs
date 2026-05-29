@@ -1,10 +1,15 @@
-//! v1.0.0 reconciliation worker.
+//! v1.0.0 reconciliation worker (folded into bsmcp-embedder in v0.13.0).
 //!
 //! Background tokio task that keeps `bookstack_*` index tables and
 //! `page_cache` in sync with the live BookStack instance. Phase 4b ships
 //! the worker scaffolding + the initial full walk + a single-page
 //! reconcile helper (the building block that webhook + delta walk in
 //! Phase 4c will reuse).
+//!
+//! As of v0.13.0 this lives inside the `bsmcp-embedder` crate — the
+//! standalone `bsmcp-worker` binary was folded in (closes #56). The
+//! embedder's `--role={embedder|worker|both}` flag selects which loops
+//! run; the worker code itself is unchanged from the standalone binary.
 //!
 //! Triggers (this phase):
 //!   - On startup: enqueue an `all` job if `index_meta.last_full_walk_at`
@@ -52,14 +57,14 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// the worker task.
 const YIELD_EVERY: usize = 25;
 
-pub struct IndexWorker {
+pub(crate) struct IndexWorker {
     bs_client: BookStackClient,
     db: Arc<dyn DbBackend>,
     index_db: Arc<dyn IndexDb>,
 }
 
 impl IndexWorker {
-    pub fn new(
+    pub(crate) fn new(
         bs_client: BookStackClient,
         db: Arc<dyn DbBackend>,
         index_db: Arc<dyn IndexDb>,
@@ -79,7 +84,7 @@ impl IndexWorker {
     /// `delta_interval_secs` controls the periodic delta-walk cadence
     /// (0 disables it). Webhook-triggered jobs still arrive in real time;
     /// the periodic walk is a safety net for missed webhooks.
-    pub fn spawn(
+    pub(crate) fn spawn(
         self,
         delta_interval_secs: u64,
         semantic_db: Option<Arc<dyn SemanticDb>>,
@@ -1007,7 +1012,7 @@ impl IndexWorker {
 
 // --- Job lifecycle reconciler (issue #54) ---
 
-pub async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize) {
+pub(crate) async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize) {
     let jobs = match db.list_failed_open_index_jobs().await {
         Ok(j) => j,
         Err(e) => {
@@ -1079,7 +1084,7 @@ pub async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize
     }
 }
 
-pub async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: usize) {
+pub(crate) async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: usize) {
     let jobs = match db.list_failed_open_embed_jobs().await {
         Ok(j) => j,
         Err(e) => {

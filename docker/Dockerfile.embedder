@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1.7
 #
-# bsmcp-embedder — built-in ONNX/Ollama/OpenAI embedding worker.
+# bsmcp-embedder — built-in ONNX/Ollama/OpenAI embedding worker AND
+# reconciliation worker (folded in v0.13.0; closes #56). Role-selected
+# at run-time via `--role={embedder|worker|both}` (CLI flag, primary)
+# or `BSMCP_ROLE` (env fallback). Default `embedder` preserves v0.12.x
+# behavior — the image without a flag keeps working.
 #
 # OPT-IN deployment: required only when running the bundled embedder
-# provider. Deployments configured for external embedders (Ollama on a
-# separate host, OpenAI API, etc.) don't need this image at all — they
-# only need bsmcp-server, which talks to the external endpoint.
+# provider OR the reconciliation worker. Deployments configured for
+# external embedders (Ollama on a separate host, OpenAI API, etc.) still
+# need this image when the reconciliation worker is desired — start it
+# with `--role=worker` and only the worker loops run. The role=worker
+# path doesn't load the ONNX model; size cost is disk-only.
 #
 # Build performance: this image links ONNX Runtime via fastembed, which
 # means a cold build is dominated by compiling fastembed/ort (especially

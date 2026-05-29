@@ -207,10 +207,12 @@ async fn main() {
         None
     };
 
-    // v1.1.0+: reconciliation worker runs in its own binary (`bsmcp-worker`).
-    // The server's webhook handler still enqueues into `index_jobs`; the
-    // worker process polls + executes those jobs against the same DB.
-    // See crates/bsmcp-worker.
+    // v1.1.0+: reconciliation worker runs out-of-process. v0.13.0+: the
+    // worker lives inside the bsmcp-embedder binary, selected via
+    // --role=worker (or --role=both). The server's webhook handler
+    // still enqueues into `index_jobs`; the worker role polls +
+    // executes those jobs against the same DB. See
+    // crates/bsmcp-embedder/src/worker.rs.
 
     // Resolve the default timezone once at startup (issue #67):
     // `BSMCP_DEFAULT_TIMEZONE` → `TZ` → UTC. Surfaced via `_meta.time` on

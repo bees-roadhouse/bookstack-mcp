@@ -25,12 +25,15 @@
 #     `echo $GHCR_PAT | docker login ghcr.io -u <gh-user> --password-stdin`
 #
 # Usage:
-#   scripts/publish-pr-image.sh                # all three images, path-aware
+#   scripts/publish-pr-image.sh                # all images, path-aware
 #   scripts/publish-pr-image.sh server         # only bsmcp-server, path-aware
 #   scripts/publish-pr-image.sh embedder       # only bsmcp-embedder, path-aware
-#   scripts/publish-pr-image.sh worker         # only bsmcp-worker, path-aware
-#   scripts/publish-pr-image.sh both --force   # legacy alias: all three, force
+#   scripts/publish-pr-image.sh both --force   # legacy alias: all images, force
 #   scripts/publish-pr-image.sh server --force # force rebuild server only
+#
+# v0.13.0: bsmcp-worker was folded into bsmcp-embedder (--role flag).
+# The standalone `worker` target is gone; use `embedder` to build the
+# image that hosts both roles.
 
 set -euo pipefail
 
@@ -94,8 +97,9 @@ SERVER_PATHS=(
 )
 
 # Files that, when changed, mean we must rebuild the EMBEDDER binary.
-# Embedder shares all the same library crates as the server (none of
-# them are server-specific), but doesn't depend on bsmcp-server itself.
+# As of v0.13.0 the embedder also hosts the worker role (--role flag),
+# so worker-side code lives under crates/bsmcp-embedder/src/worker.rs
+# — covered by the bsmcp-embedder path prefix below.
 EMBEDDER_PATHS=(
   "crates/bsmcp-embedder"
   "crates/bsmcp-common"
@@ -104,20 +108,6 @@ EMBEDDER_PATHS=(
   "Cargo.toml"
   "Cargo.lock"
   "docker/Dockerfile.embedder"
-  "entrypoint.sh"
-)
-
-# Files that, when changed, mean we must rebuild the WORKER binary.
-# Worker depends on bsmcp-common + both DB backends but not bsmcp-server
-# or bsmcp-embedder.
-WORKER_PATHS=(
-  "crates/bsmcp-worker"
-  "crates/bsmcp-common"
-  "crates/bsmcp-db-sqlite"
-  "crates/bsmcp-db-postgres"
-  "Cargo.toml"
-  "Cargo.lock"
-  "docker/Dockerfile.worker"
   "entrypoint.sh"
 )
 
@@ -196,11 +186,15 @@ target="all"
 FORCE_REBUILD=0
 for arg in "$@"; do
   case "$arg" in
-    server|embedder|worker|all) target="$arg" ;;
-    both)                       target="all" ;; # legacy alias from when there were only two images
-    --force)                    FORCE_REBUILD=1 ;;
+    server|embedder|all)  target="$arg" ;;
+    both)                 target="all" ;; # legacy alias
+    worker)
+      echo "note: 'worker' target was folded into 'embedder' in v0.13.0; building embedder" >&2
+      target="embedder"
+      ;;
+    --force)              FORCE_REBUILD=1 ;;
     *)
-      echo "usage: $0 [server|embedder|worker|all] [--force]" >&2
+      echo "usage: $0 [server|embedder|all] [--force]" >&2
       exit 2
       ;;
   esac
@@ -228,11 +222,9 @@ esac
 case "$target" in
   server)   publish bsmcp-server   docker/Dockerfile.server   SERVER_PATHS ;;
   embedder) publish bsmcp-embedder docker/Dockerfile.embedder EMBEDDER_PATHS ;;
-  worker)   publish bsmcp-worker   docker/Dockerfile.worker   WORKER_PATHS ;;
   all)
     publish bsmcp-server   docker/Dockerfile.server   SERVER_PATHS
     publish bsmcp-embedder docker/Dockerfile.embedder EMBEDDER_PATHS
-    publish bsmcp-worker   docker/Dockerfile.worker   WORKER_PATHS
     ;;
 esac
 

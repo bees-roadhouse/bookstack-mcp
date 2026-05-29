@@ -30,18 +30,18 @@ crates/
   bsmcp-db-sqlite/    SQLite backend (rusqlite, bundled)
   bsmcp-db-postgres/  PostgreSQL + pgvector backend (sqlx)
   bsmcp-server/       MCP server binary (axum, no ONNX dependency)
-  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI / Voyage, job queue worker + HTTP /embed + optional /rerank)
-  bsmcp-worker/       Reconciliation worker (initial walk + webhook/cron-driven delta walk; same DB as the server)
+  bsmcp-embedder/     Embedder + reconciliation worker (single binary, role-selected via --role flag)
+                      — local ONNX / Ollama / OpenAI / Voyage embedding, job queue worker, HTTP /embed + optional /rerank
+                      — reconciliation worker: initial walk + webhook/cron delta walk on the index_jobs queue
 
 docker/
   Dockerfile.server       Lightweight server image (~35MB)
-  Dockerfile.embedder     Embedder image with ONNX Runtime (~45MB)
-  Dockerfile.worker       Reconciliation worker image
+  Dockerfile.embedder     Embedder + worker image with ONNX Runtime (~45MB)
   docker-compose.yml      PostgreSQL deployment (production)
   docker-compose.sqlite.yml  SQLite deployment (simple)
 ```
 
-The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding (and `/rerank` when a reranker provider is configured). The embedder supports four embedding backends: local ONNX models (fastembed), Ollama, OpenAI-compatible APIs, and Voyage. The worker owns the `index_jobs` queue — runs the initial full walk on cold start, then consumes webhook + cron jobs and the periodic delta walk.
+The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding (and `/rerank` when a reranker provider is configured). The embedder supports four embedding backends: local ONNX models (fastembed), Ollama, OpenAI-compatible APIs, and Voyage. The reconciliation worker (same binary, run with `--role=worker`) owns the `index_jobs` queue — runs the initial full walk on cold start, then consumes webhook + cron jobs and the periodic delta walk. Run as two compose services (separate embedder + worker) or as one with `--role=both`.
 
 ## Available Tools (59 BookStack + 3 semantic = 62)
 
@@ -90,8 +90,8 @@ docker compose -f docker/docker-compose.yml up -d
 This starts four containers:
 - **bsmcp-postgres** — PostgreSQL 17 with pgvector extension
 - **bsmcp-server** — MCP server (port 8080)
-- **bsmcp-embedder** — Background embedding service (also serves `/rerank` when a reranker is configured)
-- **bsmcp-worker** — Reconciliation worker: initial walk on cold start, webhook + cron job consumption, periodic delta walk
+- **bsmcp-embedder** — Background embedding service (`--role=embedder`, default); also serves `/rerank` when a reranker is configured
+- **bsmcp-worker** — Reconciliation worker (same image as the embedder, started with `--role=worker`): initial walk on cold start, webhook + cron job consumption, periodic delta walk
 
 ### Quick Start (SQLite — simple)
 
@@ -171,9 +171,21 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_RERANK_API_KEY` | If voyage/openai | - | API key for external rerank provider. |
 | `BSMCP_RERANK_API_URL` | If openai | (per provider) | Base URL. Voyage defaults to `https://api.voyageai.com`; openai requires explicit URL. |
 
+#### Role Selector
+
+The embedder image hosts both the embedder loop and the reconciliation worker loop. Select which runs per container via `--role` (CLI flag, primary) or `BSMCP_ROLE` (env fallback). Default is `embedder`.
+
+| Variable / flag | Default | Description |
+|---|---|---|
+| `--role=embedder` / `BSMCP_ROLE=embedder` | (default) | Runs the embed job queue, the `/embed` + `/rerank` HTTP endpoints, and the cross-encoder when configured. Does NOT spawn the reconciliation worker — operators running embedder-only get no automatic index retry-chain reconciliation. |
+| `--role=worker` / `BSMCP_ROLE=worker` | - | Runs the reconciliation worker only: initial full walk, periodic delta walk, lifecycle housekeeper across `index_jobs` + `embed_jobs`. No HTTP listener, no ONNX model loaded. |
+| `--role=both` / `BSMCP_ROLE=both` | - | Runs both loops in one process. Useful for single-host SQLite deployments. |
+
+The CLI flag wins over the env. Setting both (compose `command:` + `BSMCP_ROLE`) is belt-and-suspenders — recommended for clarity in compose files.
+
 #### Worker Variables
 
-Read by `bsmcp-worker` (the reconciliation worker container). The worker shares the same database as the server and owns the `index_jobs` queue.
+Read when the embedder is running with `--role=worker` or `--role=both`. The worker shares the same database as the server and owns the `index_jobs` queue.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -190,7 +202,7 @@ Read by `bsmcp-worker` (the reconciliation worker container). The worker shares 
 
 #### Job Lifecycle Variables
 
-Read by `bsmcp-worker`'s lifecycle housekeeper. Apply to both `embed_jobs` and `index_jobs`.
+Read by the worker role's lifecycle housekeeper. Apply to both `embed_jobs` and `index_jobs`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -312,9 +324,51 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 added the optional cross-encoder reranker. v0.12.x (current) is CI/build only — no user-facing behavior change (v0.12.0 = CI rework + semantic refinements; v0.12.1 = fixes the aarch64-linux release binary, adds the cargo fmt gate). Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
+> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 added the optional cross-encoder reranker; v0.12.x was CI/build only; v0.13.0 folds `bsmcp-worker` into `bsmcp-embedder` (single image, role-selected). Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
-### From v0.11.0 to v0.12.x (current)
+### From v0.12.x to v0.13.0
+
+#### What changed
+
+- **`bsmcp-worker` and `bsmcp-embedder` are now one binary, one image.** The embedder image (`ghcr.io/bees-roadhouse/bsmcp-embedder:0.13.0`) runs in either role depending on `--role=embedder|worker|both` (CLI flag, primary) or `BSMCP_ROLE=embedder|worker|both` (env var, fallback). Default with no flag is `embedder` — preserves v0.12.x behavior for unmigrated compose files that hit the embedder service.
+- **`bsmcp-worker` Docker image is now an alias of `bsmcp-embedder`.** Pulls of `ghcr.io/bees-roadhouse/bsmcp-worker:0.13.0` resolve to the same manifest. **This alias is one-release-only and will be removed in v0.14.0.** Update your compose now.
+- **CI matrix drops the `bsmcp-worker` entry.** Release builds are now two images: `bsmcp-server` + `bsmcp-embedder`.
+- **`/health` carries a new `role` field** (`"embedder"`, `"worker"`, or `"both"`) so operators can curl two compose services and verify the role flag actually took effect.
+
+#### What's automatic
+
+- No DB schema changes. No env-var renames. Existing `BSMCP_INDEX_TOKEN_*` / `BSMCP_EMBED_TOKEN_*` precedence is preserved (index tokens primary, embed tokens fallback).
+- Existing semantics (FOR UPDATE SKIP LOCKED, retry chains, supersedence, lifecycle housekeeper) unchanged.
+
+#### What you must do
+
+In your compose file, find the `bsmcp-worker` service and change two lines:
+
+```diff
+   bsmcp-worker:
+-    image: ghcr.io/bees-roadhouse/bsmcp-worker:0.12.x
++    image: ghcr.io/bees-roadhouse/bsmcp-embedder:0.13.0
++    command: ["bsmcp-embedder", "--role=worker"]
+     environment:
++      BSMCP_ROLE: worker
+       BSMCP_DB_BACKEND: postgres
+```
+
+If you don't set `--role=worker` (or `BSMCP_ROLE=worker`), the container will boot in default embedder mode and contend with your real embedder for jobs. Setting both is belt-and-suspenders.
+
+The `bsmcp-server` and `bsmcp-embedder` services only need the version bump to `:0.13.0`.
+
+If you want to collapse to a single container, set `--role=both` on the embedder service and delete the worker service entirely.
+
+#### Strict env hygiene
+
+When the embedder boots with `--role=worker`, it emits a `WARN worker_role_ignoring_embedder_env env=BSMCP_EMBED_PROVIDER` line for each embedder-only env it finds set. Surfaces stale config you might have copied from the old worker service block. Not fatal — these envs are silently ignored under role=worker.
+
+#### Footprint note
+
+The `bsmcp-worker` role now ships ONNX Runtime (~150 MB on-disk; runtime memory unaffected because the worker role does not load the ONNX model). One-time disk cost per host; the image cache makes subsequent pulls free.
+
+### From v0.11.0 to v0.12.x
 
 #### What's automatic
 - No schema, env-var, or API surface changes. Pull new images, restart.
