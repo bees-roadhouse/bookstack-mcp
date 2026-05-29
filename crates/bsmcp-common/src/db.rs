@@ -160,15 +160,21 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.
     ///
-    /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
-    /// parent page lives in one of those books. When `None` or an empty slice,
-    /// search across the entire embedded corpus.
+    /// `scope`: when `Some(&filter)` with at least one non-empty ID list,
+    /// restrict candidates to chunks whose parent page matches the union of
+    /// the supplied book/chapter/page ID lists. When `None` or an
+    /// all-empty filter, search across the entire embedded corpus.
+    ///
+    /// Shelf-level filtering is **not** evaluated here — the embedding
+    /// `pages` table doesn't carry `shelf_id`. The caller is responsible for
+    /// expanding `shelf_ids` to the matching `book_ids` (via the structural
+    /// index) before invoking `vector_search`.
     async fn vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
-        book_ids: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
     ) -> Result<Vec<SearchHit>, String>;
 
     /// Look up the `book_id` for each requested page in one roundtrip.

@@ -81,7 +81,12 @@ impl PostgresDb {
                 hive_shelf_id BIGINT,
                 user_journals_shelf_id BIGINT,
                 set_by_token_hash TEXT,
-                updated_at BIGINT NOT NULL DEFAULT 0
+                updated_at BIGINT NOT NULL DEFAULT 0,
+                /* Issue #80 — named scope cuts (HashMap<String, ScopeDef>)
+                   and the precision-cascade pool multipliers, persisted as
+                   JSON blobs. Empty/NULL means: use defaults. */
+                kb_scopes_json TEXT,
+                cascade_multipliers_json TEXT
             )",
         )
         .execute(&pool)
@@ -111,6 +116,10 @@ impl PostgresDb {
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_page_id",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_name",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_ouid",
+            // Issue #80 — additive JSON columns for kb_scopes + cascade
+            // multipliers. IF NOT EXISTS keeps the migration idempotent.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS kb_scopes_json TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS cascade_multipliers_json TEXT",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
@@ -446,7 +455,8 @@ impl DbBackend for PostgresDb {
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
             "SELECT hive_shelf_id, user_journals_shelf_id,
-                    set_by_token_hash, updated_at
+                    set_by_token_hash, updated_at,
+                    kb_scopes_json, cascade_multipliers_json
              FROM global_settings WHERE id = 1",
         )
         .fetch_optional(&self.pool)
@@ -454,11 +464,25 @@ impl DbBackend for PostgresDb {
         .map_err(|e| format!("get_global_settings: {e}"))?;
 
         Ok(row
-            .map(|r| GlobalSettings {
-                hive_shelf_id: r.get("hive_shelf_id"),
-                user_journals_shelf_id: r.get("user_journals_shelf_id"),
-                set_by_token_hash: r.get("set_by_token_hash"),
-                updated_at: r.get("updated_at"),
+            .map(|r| {
+                let kb_scopes_json: Option<String> = r.get("kb_scopes_json");
+                let cascade_json: Option<String> = r.get("cascade_multipliers_json");
+                let kb_scopes = kb_scopes_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                let cascade_multipliers = cascade_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                GlobalSettings {
+                    hive_shelf_id: r.get("hive_shelf_id"),
+                    user_journals_shelf_id: r.get("user_journals_shelf_id"),
+                    set_by_token_hash: r.get("set_by_token_hash"),
+                    updated_at: r.get("updated_at"),
+                    kb_scopes,
+                    cascade_multipliers,
+                }
             })
             .unwrap_or_default())
     }
@@ -477,18 +501,35 @@ impl DbBackend for PostgresDb {
         .flatten();
         let final_setter = existing_setter.unwrap_or_else(|| set_by_token_hash.to_string());
 
+        let kb_scopes_json = if settings.kb_scopes.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&settings.kb_scopes)
+                    .map_err(|e| format!("save_global_settings: serialize kb_scopes: {e}"))?,
+            )
+        };
+        let cascade_multipliers_json = Some(
+            serde_json::to_string(&settings.cascade_multipliers)
+                .map_err(|e| format!("save_global_settings: serialize cascade_multipliers: {e}"))?,
+        );
+
         sqlx::query(
             "UPDATE global_settings
              SET hive_shelf_id = $1,
                  user_journals_shelf_id = $2,
                  set_by_token_hash = $3,
-                 updated_at = $4
+                 updated_at = $4,
+                 kb_scopes_json = $5,
+                 cascade_multipliers_json = $6
              WHERE id = 1",
         )
         .bind(settings.hive_shelf_id)
         .bind(settings.user_journals_shelf_id)
         .bind(&final_setter)
         .bind(Self::now_secs())
+        .bind(&kb_scopes_json)
+        .bind(&cascade_multipliers_json)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;
@@ -1304,7 +1345,7 @@ impl SemanticDb for PostgresDb {
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
-        book_ids: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
     ) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1327,45 +1368,95 @@ impl SemanticDb for PostgresDb {
             .await
             .ok();
 
-        // Optional book scope. When set, restrict candidates to chunks whose
-        // page lives in one of the requested books. Empty slice = full corpus.
-        let book_filter: Option<Vec<i64>> = match book_ids {
-            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
-            _ => None,
-        };
+        // Optional scope filter. Union semantics: a chunk qualifies if its
+        // parent page matches any of the supplied book/chapter/page lists.
+        // Shelf-level IDs are not evaluated here — the caller must resolve
+        // shelves → books before invoking the search.
+        let scope_owned: Option<ScopeFilter> = scope.filter(|s| !s.is_empty()).map(|s| {
+            let mut f = s.clone();
+            f.dedup();
+            f
+        });
 
-        let rows =
-            match book_filter {
-                Some(books) => sqlx::query(
+        let rows = match scope_owned {
+            Some(f) => {
+                // Build a union of `p.<col> = ANY(...)` clauses for the
+                // non-empty ID lists. Bind each list as its own $N to keep
+                // sqlx's parameter typing happy.
+                let mut clauses: Vec<String> = Vec::new();
+                let mut next_param: usize = 4; // $1=vec, $2=threshold, $3=limit
+                let book_param = if !f.book_ids.is_empty() {
+                    let p = next_param;
+                    next_param += 1;
+                    clauses.push(format!("p.book_id = ANY(${p})"));
+                    Some(p)
+                } else {
+                    None
+                };
+                let chapter_param = if !f.chapter_ids.is_empty() {
+                    let p = next_param;
+                    next_param += 1;
+                    clauses.push(format!("p.chapter_id = ANY(${p})"));
+                    Some(p)
+                } else {
+                    None
+                };
+                let page_param = if !f.page_ids.is_empty() {
+                    let p = next_param;
+                    clauses.push(format!("p.page_id = ANY(${p})"));
+                    Some(p)
+                } else {
+                    None
+                };
+
+                if clauses.is_empty() {
+                    // shelf-only filter that the caller didn't expand —
+                    // return zero rows rather than silently widening.
+                    tx.commit().await.ok();
+                    return Ok(Vec::new());
+                }
+
+                let scope_clause = clauses.join(" OR ");
+                let sql = format!(
                     "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
-                 FROM chunks c
-                 JOIN pages p ON c.page_id = p.page_id
-                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
-                   AND p.book_id = ANY($4)
-                 ORDER BY c.embedding <=> $1::vector
+                     FROM chunks c
+                     JOIN pages p ON c.page_id = p.page_id
+                     WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
+                       AND ({scope_clause})
+                     ORDER BY c.embedding <=> $1::vector
+                     LIMIT $3"
+                );
+
+                let mut q = sqlx::query(&sql)
+                    .bind(&vec)
+                    .bind(threshold)
+                    .bind(limit as i64);
+                if book_param.is_some() {
+                    q = q.bind(&f.book_ids);
+                }
+                if chapter_param.is_some() {
+                    q = q.bind(&f.chapter_ids);
+                }
+                if page_param.is_some() {
+                    q = q.bind(&f.page_ids);
+                }
+                q.fetch_all(&mut *tx).await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks
+                 WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
+                 ORDER BY embedding <=> $1::vector
                  LIMIT $3",
                 )
                 .bind(&vec)
                 .bind(threshold)
                 .bind(limit as i64)
-                .bind(&books)
                 .fetch_all(&mut *tx)
-                .await,
-                None => {
-                    sqlx::query(
-                        "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
-                 FROM chunks
-                 WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
-                 ORDER BY embedding <=> $1::vector
-                 LIMIT $3",
-                    )
-                    .bind(&vec)
-                    .bind(threshold)
-                    .bind(limit as i64)
-                    .fetch_all(&mut *tx)
-                    .await
-                }
-            };
+                .await
+            }
+        };
         let rows = rows.map_err(|e| format!("vector_search failed: {e}"))?;
 
         tx.commit().await.ok();

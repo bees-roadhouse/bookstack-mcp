@@ -11,6 +11,7 @@ use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use bsmcp_common::db::IndexDb;
 use bsmcp_common::index::{DirectoryNode, DirectoryNodeKind, DirectoryScope};
 use bsmcp_common::time::TimezoneConfig;
+use bsmcp_common::types::ScopeFilter;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -148,7 +149,9 @@ async fn execute_tool(
         "semantic_search" => {
             let sem = semantic.ok_or("Semantic search is not enabled")?;
             let query = arg_str(args, "query")?;
-            let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
+            // Issue #80 — limit cap raised from 50 to 100. Defaults stay
+            // at 10 so today's callers see no change.
+            let limit = arg_i64(args, "limit", 10).clamp(1, 100) as usize;
             let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args
@@ -159,20 +162,64 @@ async fn execute_tool(
                 .get("verbose")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Issue #80 — `default` (issue spec) is now the documented
+            // schema default; `standard` / `rerank` still parse for
+            // backward compat. Schema default unchanged (`default` mirrors
+            // pre-#80 `standard` behavior, so existing callers see no
+            // regression).
             let mode_str = args
                 .get("mode")
                 .and_then(|v| v.as_str())
-                .unwrap_or("standard");
+                .unwrap_or("default");
             let mode = SearchMode::parse(mode_str).ok_or_else(|| {
-                format!("invalid mode '{mode_str}' (expected: standard, rerank, precision)")
+                format!(
+                    "invalid mode '{mode_str}' \
+                     (expected: default, standard, rerank, precision)"
+                )
             })?;
+
+            // Issue #80 — scope params. Explicit ID lists union with named
+            // scopes resolved from `global_settings.kb_scopes`. Empty/no
+            // scope = full corpus (current behavior).
+            let mut scope = ScopeFilter {
+                shelf_ids: arg_i64_array(args, "shelf_ids"),
+                book_ids: arg_i64_array(args, "book_ids"),
+                chapter_ids: arg_i64_array(args, "chapter_ids"),
+                page_ids: arg_i64_array(args, "page_ids"),
+            };
+            let named_scopes: Vec<String> = args
+                .get("scopes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut unknown_scopes: Vec<String> = Vec::new();
+            if !named_scopes.is_empty() {
+                let (resolved, unknown) = sem.resolve_named_scopes(&named_scopes).await;
+                scope.merge(&resolved);
+                unknown_scopes = unknown;
+            }
+            scope.dedup();
+            let scope_arg = if scope.is_empty() { None } else { Some(&scope) };
+
             // The HTTP `filter_by_permission` fallback inside `sem.search`
             // enforces per-page access control via BookStack's API.
             let mut result = sem
                 .search(
-                    &query, limit, threshold, hybrid, verbose, client, None, mode,
+                    &query, limit, threshold, hybrid, verbose, client, scope_arg, mode,
                 )
                 .await?;
+            if !unknown_scopes.is_empty() {
+                // Surface unknown named scopes inline so the caller can
+                // notice (a typo, a deleted scope) without a hard error
+                // killing the search.
+                if let Some(stats) = result.get_mut("stats").and_then(|v| v.as_object_mut()) {
+                    stats.insert("unknown_scopes".to_string(), json!(unknown_scopes));
+                }
+            }
             trim_semantic_search_payload(&mut result);
             format_json(&result)
         }
@@ -1038,6 +1085,17 @@ fn arg_offset(args: &Value) -> i64 {
 
 fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
     arg_i64_opt(args, key).ok_or_else(|| format!("Missing required argument: {key}"))
+}
+
+/// Parse a JSON array of integers at `args[key]`. Missing, non-array, or
+/// empty values yield an empty `Vec`. Non-integer entries are silently
+/// skipped — callers don't need to surface that, since downstream layers
+/// validate the resulting IDs against the embedding store anyway.
+fn arg_i64_array(args: &Value, key: &str) -> Vec<i64> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default()
 }
 
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
@@ -2333,24 +2391,68 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
-            "Semantic search with cross-encoder relevance ranking. \
-             **Default to `mode: \"precision\"`** — it's faster (~1s less than standard on typical queries), picks better hits, and surfaces the most-relevant pages first. \
-             Use `mode: \"standard\"` only when you need a broader sweep (more results, blanket-adjacent pages) — standard keeps pages that precision's strict cross-encoder ordering drops. Both modes return the same JSON shape, so A/B is just a `mode` swap. \
+            "Semantic search with cross-encoder relevance ranking and optional scope cuts. \
+             **Default to `mode: \"precision\"`** — it runs the issue-#80 four-stage cascade \
+             (semantic → keyword → Markov-blanket → cross-encoder) and picks better hits than the \
+             default heuristic blend. Use `mode: \"default\"` for a wider sweep (more results, \
+             blanket-adjacent pages); both modes return the same JSON shape so A/B is a single \
+             `mode` swap. \
              \n\nMode reference: \
-             `precision` (recommended) — wider vector pass (5× limit), cross-encoder ranks. Best for \"find the right page.\" \
-             `standard` — vector + keyword + Markov-blanket boost + blended sort. Best for \"find everything relevant.\" \
-             `rerank` — standard's candidate selection, then cross-encoder reorders the top-N. Middle ground; rarely the right pick over precision. \
-             \n\n`precision` and `rerank` need `BSMCP_RERANK_PROVIDER` configured on the embedder. If you get \"Reranker is disabled,\" retry with `mode: \"standard\"`. \
-             \n\nInclude synonyms and domain vocabulary in your query for better recall (e.g., \"security breach incident response ransomware\" beats \"office got hacked\").",
+             `precision` (recommended) — N×4 → N×3 → N×2 → N cascade. Final ordering = \
+             cross-encoder. Best for \"find the right page.\" \
+             `default` — vector + keyword + Markov-blanket boost + blended sort. Best for \
+             \"find everything relevant.\" \
+             `rerank` — `default`'s candidate selection, then cross-encoder reorders the \
+             top-N. Middle ground; rarely the right pick over precision. \
+             `standard` is an alias for `default` (backward compat). \
+             \n\n`precision` and `rerank` need `BSMCP_RERANK_PROVIDER` configured on the embedder. \
+             If you get \"Reranker is disabled,\" retry with `mode: \"default\"`. \
+             \n\n**Scope params (optional)** restrict the search to a subset of the KB. Explicit \
+             `shelf_ids` / `book_ids` / `chapter_ids` / `page_ids` are unioned; `scopes` is a \
+             list of named scope keys resolved from `global_settings.kb_scopes` (set via the \
+             `/settings` UI). Mixing explicit IDs and named scopes is also a union. No scope = \
+             full corpus (unchanged behavior). \
+             \n\nInclude synonyms and domain vocabulary in your query for better recall (e.g., \
+             \"security breach incident response ransomware\" beats \"office got hacked\").",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query. Include synonyms and related terms for better results." },
-                    "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
+                    "limit": { "type": "integer", "description": "Max number of page results to return (capped at 100). Issue #80 raised the cap from 50 to 100 for precision-mode cascade callers.", "default": 10 },
                     "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Default: 0.45 for hybrid, 0.50 for pure vector.", "default": 0.45 },
-                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Forced to false when mode='precision'.", "default": true },
+                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Ignored in `precision` mode (cascade has its own keyword stage).", "default": true },
                     "verbose": { "type": "boolean", "description": "Include full Markov blanket data in results. Default false returns slim results (scores, chunks, scoring breakdown). Set true for full graph context.", "default": false },
-                    "mode": { "type": "string", "description": "Ranking strategy. **`precision` recommended** (faster, more accurate). `standard` for wider sweep. `rerank` is the middle ground. Schema default stays `standard` for instances without rerank configured.", "enum": ["standard", "rerank", "precision"], "default": "standard" }
+                    "mode": {
+                        "type": "string",
+                        "description": "Ranking strategy. **`precision` recommended** (issue-#80 4-stage cascade, more accurate). `default` for wider sweep. `rerank` is the middle ground. `standard` is an alias for `default` (backward compat).",
+                        "enum": ["default", "standard", "rerank", "precision"],
+                        "default": "default"
+                    },
+                    "shelf_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks under one of these shelves. Resolved via the structural index to the matching books. Union semantics with other scope fields."
+                    },
+                    "book_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks in one of these books. Union semantics with other scope fields."
+                    },
+                    "chapter_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks in one of these chapters. Union semantics with other scope fields."
+                    },
+                    "page_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks belonging to one of these pages. Union semantics with other scope fields."
+                    },
+                    "scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Named scopes from `global_settings.kb_scopes` (e.g., 'policies', 'sops'). Unknown names are surfaced as `stats.unknown_scopes` in the response."
+                    }
                 },
                 "required": ["query"]
             })));
@@ -2790,5 +2892,144 @@ mod tests {
         collect_page_ids(&tree, &mut ids);
         ids.sort_unstable();
         assert_eq!(ids, vec![10, 20]);
+    }
+
+    // --- Issue #80 — semantic_search scope param parsing ---
+
+    #[test]
+    fn arg_i64_array_parses_explicit_ids() {
+        let args = json!({
+            "shelf_ids": [1, 2, 3],
+            "book_ids": [10, 20],
+            "chapter_ids": [],
+            "page_ids": [99]
+        });
+        assert_eq!(arg_i64_array(&args, "shelf_ids"), vec![1, 2, 3]);
+        assert_eq!(arg_i64_array(&args, "book_ids"), vec![10, 20]);
+        assert_eq!(arg_i64_array(&args, "chapter_ids"), Vec::<i64>::new());
+        assert_eq!(arg_i64_array(&args, "page_ids"), vec![99]);
+        // Missing key → empty vec.
+        assert_eq!(arg_i64_array(&args, "missing"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn arg_i64_array_skips_non_integer_entries() {
+        let args = json!({
+            "book_ids": [1, "not-a-number", 2, null, 3]
+        });
+        assert_eq!(arg_i64_array(&args, "book_ids"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn arg_i64_array_handles_non_array() {
+        let args = json!({ "book_ids": "not-an-array" });
+        assert_eq!(arg_i64_array(&args, "book_ids"), Vec::<i64>::new());
+    }
+
+    /// Building a ScopeFilter from the parsed arrays matches the issue-#80
+    /// union semantics: the explicit lists carry through unchanged.
+    #[test]
+    fn scope_filter_assembly_from_explicit_args_unions() {
+        let args = json!({
+            "shelf_ids": [1],
+            "book_ids": [10, 20],
+            "chapter_ids": [100],
+            "page_ids": [1000, 2000]
+        });
+        let scope = ScopeFilter {
+            shelf_ids: arg_i64_array(&args, "shelf_ids"),
+            book_ids: arg_i64_array(&args, "book_ids"),
+            chapter_ids: arg_i64_array(&args, "chapter_ids"),
+            page_ids: arg_i64_array(&args, "page_ids"),
+        };
+        assert_eq!(scope.shelf_ids, vec![1]);
+        assert_eq!(scope.book_ids, vec![10, 20]);
+        assert_eq!(scope.chapter_ids, vec![100]);
+        assert_eq!(scope.page_ids, vec![1000, 2000]);
+        assert!(!scope.is_empty());
+    }
+
+    /// No scope params → ScopeFilter::is_empty() is true and the cascade
+    /// caller passes `None` (full-corpus search). Regression test for the
+    /// zero-regression acceptance criterion.
+    #[test]
+    fn scope_filter_is_empty_when_no_scope_args() {
+        let args = json!({ "query": "anything" });
+        let scope = ScopeFilter {
+            shelf_ids: arg_i64_array(&args, "shelf_ids"),
+            book_ids: arg_i64_array(&args, "book_ids"),
+            chapter_ids: arg_i64_array(&args, "chapter_ids"),
+            page_ids: arg_i64_array(&args, "page_ids"),
+        };
+        assert!(scope.is_empty());
+    }
+
+    /// Merging an explicit-ID scope with a named-scope result is union
+    /// semantics. Dedup collapses overlaps. Mirrors the `mcp.rs` flow.
+    #[test]
+    fn scope_filter_merge_then_dedup_unions_and_dedupes() {
+        let mut scope = ScopeFilter {
+            book_ids: vec![10, 20],
+            ..Default::default()
+        };
+        scope.merge(&ScopeFilter {
+            book_ids: vec![20, 30],
+            chapter_ids: vec![100],
+            ..Default::default()
+        });
+        scope.dedup();
+        assert_eq!(scope.book_ids, vec![10, 20, 30]);
+        assert_eq!(scope.chapter_ids, vec![100]);
+        assert!(scope.shelf_ids.is_empty());
+        assert!(scope.page_ids.is_empty());
+    }
+
+    /// `mode` defaults — the schema default is `"default"` per issue #80
+    /// but pre-#80 callers passing `"standard"` still parse to the same
+    /// SearchMode variant (Standard). Locks the zero-regression contract.
+    #[test]
+    fn search_mode_default_and_standard_both_parse_to_standard() {
+        assert_eq!(SearchMode::parse("default"), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse("standard"), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse(""), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse("precision"), Some(SearchMode::Precision));
+        assert_eq!(SearchMode::parse("rerank"), Some(SearchMode::Rerank));
+        assert_eq!(SearchMode::parse("nonsense"), None);
+    }
+
+    /// Schema sanity for the new tool surface — semantic_search now accepts
+    /// the scope params. Locks that they're advertised correctly.
+    #[test]
+    fn semantic_search_schema_advertises_scope_params() {
+        let tools = tool_definitions(true);
+        let sem = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("semantic_search"))
+            .expect("semantic_search tool present");
+        let props = sem
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("semantic_search schema has properties");
+        for field in ["shelf_ids", "book_ids", "chapter_ids", "page_ids", "scopes"] {
+            assert!(
+                props.contains_key(field),
+                "semantic_search schema missing '{field}' property"
+            );
+        }
+        // Mode enum surfaces both `default` and `precision` per issue #80.
+        let mode_enum = props
+            .get("mode")
+            .and_then(|m| m.get("enum"))
+            .and_then(|e| e.as_array())
+            .expect("mode schema has enum");
+        let modes: Vec<String> = mode_enum
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(modes.contains(&"default".to_string()));
+        assert!(modes.contains(&"precision".to_string()));
+        assert!(modes.contains(&"standard".to_string()));
+        assert!(modes.contains(&"rerank".to_string()));
     }
 }
