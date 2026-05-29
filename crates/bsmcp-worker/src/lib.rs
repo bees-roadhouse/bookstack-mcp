@@ -64,7 +64,11 @@ impl IndexWorker {
         db: Arc<dyn DbBackend>,
         index_db: Arc<dyn IndexDb>,
     ) -> Self {
-        Self { bs_client, db, index_db }
+        Self {
+            bs_client,
+            db,
+            index_db,
+        }
     }
 
     /// Spawn the worker as a background tokio task. Returns the JoinHandle
@@ -91,16 +95,20 @@ impl IndexWorker {
         // index_jobs (always) and embed_jobs (when semantic_db is wired).
         tokio::spawn(async move {
             let timeout_secs: i64 = env::var("BSMCP_JOB_TIMEOUT_SECS")
-                .ok().and_then(|v| v.parse().ok())
+                .ok()
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_TIMEOUT_SECS);
             let reconcile_secs: u64 = env::var("BSMCP_JOB_RECONCILE_SECS")
-                .ok().and_then(|v| v.parse().ok())
+                .ok()
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_RECONCILE_SECS);
             let max_chain: usize = env::var("BSMCP_JOB_MAX_RETRY_CHAIN")
-                .ok().and_then(|v| v.parse().ok())
+                .ok()
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_MAX_RETRY_CHAIN);
             let close_grace: i64 = env::var("BSMCP_JOB_CLOSE_GRACE_SECS")
-                .ok().and_then(|v| v.parse().ok())
+                .ok()
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_CLOSE_GRACE_SECS);
 
             eprintln!(
@@ -117,12 +125,21 @@ impl IndexWorker {
 
                 // Timeout watcher — fail any running job whose started_at is
                 // older than BSMCP_JOB_TIMEOUT_SECS.
-                if let Ok(jobs) = worker_for_lifecycle.index_db
-                    .list_running_index_jobs_started_before(cutoff).await
+                if let Ok(jobs) = worker_for_lifecycle
+                    .index_db
+                    .list_running_index_jobs_started_before(cutoff)
+                    .await
                 {
                     for j in jobs {
-                        eprintln!("IndexWorker: timing out index job {} (started_at={:?})", j.id, j.started_at);
-                        if let Err(e) = worker_for_lifecycle.index_db.fail_index_job(j.id, "timeout").await {
+                        eprintln!(
+                            "IndexWorker: timing out index job {} (started_at={:?})",
+                            j.id, j.started_at
+                        );
+                        if let Err(e) = worker_for_lifecycle
+                            .index_db
+                            .fail_index_job(j.id, "timeout")
+                            .await
+                        {
                             eprintln!("IndexWorker: fail_index_job({}) failed: {e}", j.id);
                         }
                     }
@@ -130,7 +147,10 @@ impl IndexWorker {
                 if let Some(sdb) = semantic_for_lifecycle.as_ref() {
                     if let Ok(jobs) = sdb.list_running_embed_jobs_started_before(cutoff).await {
                         for j in jobs {
-                            eprintln!("IndexWorker: timing out embed job {} (started_at={:?})", j.id, j.started_at);
+                            eprintln!(
+                                "IndexWorker: timing out embed job {} (started_at={:?})",
+                                j.id, j.started_at
+                            );
                             if let Err(e) = sdb.fail_embed_job(j.id, "timeout").await {
                                 eprintln!("IndexWorker: fail_embed_job({}) failed: {e}", j.id);
                             }
@@ -140,9 +160,17 @@ impl IndexWorker {
 
                 // Archiver — close succeeded/cancelled jobs older than the
                 // grace window so the status page doesn't grow unbounded.
-                if let Ok(ids) = worker_for_lifecycle.index_db.list_archivable_index_jobs(close_grace).await {
+                if let Ok(ids) = worker_for_lifecycle
+                    .index_db
+                    .list_archivable_index_jobs(close_grace)
+                    .await
+                {
                     for id in ids {
-                        if let Err(e) = worker_for_lifecycle.index_db.close_index_job(id, None).await {
+                        if let Err(e) = worker_for_lifecycle
+                            .index_db
+                            .close_index_job(id, None)
+                            .await
+                        {
                             eprintln!("IndexWorker: close_index_job({id}) failed: {e}");
                         }
                     }
@@ -166,7 +194,10 @@ impl IndexWorker {
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(ARCHIVER_TICK_SECS.min(TIMEOUT_TICK_SECS))).await;
+                tokio::time::sleep(Duration::from_secs(
+                    ARCHIVER_TICK_SECS.min(TIMEOUT_TICK_SECS),
+                ))
+                .await;
             }
         });
 
@@ -177,9 +208,7 @@ impl IndexWorker {
         if delta_interval_secs > 0 {
             tokio::spawn(async move {
                 let interval = Duration::from_secs(delta_interval_secs);
-                eprintln!(
-                    "IndexWorker: delta walk cron active — every {delta_interval_secs}s"
-                );
+                eprintln!("IndexWorker: delta walk cron active — every {delta_interval_secs}s");
                 // Stagger the first delta so it doesn't race the initial
                 // full walk.
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -218,7 +247,12 @@ impl IndexWorker {
 
     /// On first start, queue a full walk if it's never been done.
     async fn maybe_enqueue_initial_walk(&self) -> Result<(), String> {
-        if self.index_db.get_index_meta("last_full_walk_at").await?.is_some() {
+        if self
+            .index_db
+            .get_index_meta("last_full_walk_at")
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
         let (id, is_new) = self
@@ -252,7 +286,8 @@ impl IndexWorker {
         let result = self.process_job(&job).await;
         // If the job was cancelled mid-walk, the cancel endpoint already
         // wrote the resolved state — don't overwrite it via complete_index_job.
-        let stopped_externally = matches!(self.index_db.should_stop_index_job(job.id).await, Ok(true));
+        let stopped_externally =
+            matches!(self.index_db.should_stop_index_job(job.id).await, Ok(true));
         let outcome = if stopped_externally {
             Ok(())
         } else {
@@ -347,9 +382,7 @@ impl IndexWorker {
             None => match self.index_db.get_index_meta("last_full_walk_at").await? {
                 Some(v) => unix_to_iso(&v),
                 None => {
-                    eprintln!(
-                        "IndexWorker: walk_delta — no last_full_walk_at; full walk first"
-                    );
+                    eprintln!("IndexWorker: walk_delta — no last_full_walk_at; full walk first");
                     return Ok(());
                 }
             },
@@ -407,7 +440,12 @@ impl IndexWorker {
         Ok(())
     }
 
-    async fn walk_shelf(&self, shelf_id: i64, globals: &GlobalSettings, job_id: i64) -> Result<usize, String> {
+    async fn walk_shelf(
+        &self,
+        shelf_id: i64,
+        globals: &GlobalSettings,
+        job_id: i64,
+    ) -> Result<usize, String> {
         let shelf = self.bs_client.get_shelf(shelf_id).await?;
         let name = string_field(&shelf, "name");
         let slug = string_field(&shelf, "slug");
@@ -441,11 +479,12 @@ impl IndexWorker {
                 eprintln!("IndexWorker: job {job_id} stopped — bailing out of walk_shelf");
                 return Ok(count);
             }
-            match self.walk_book(book_id, Some(shelf_id), shelf_kind, job_id).await {
+            match self
+                .walk_book(book_id, Some(shelf_id), shelf_kind, job_id)
+                .await
+            {
                 Ok(n) => count += n,
-                Err(e) => eprintln!(
-                    "IndexWorker: walk_book({book_id}) failed (non-fatal): {e}"
-                ),
+                Err(e) => eprintln!("IndexWorker: walk_book({book_id}) failed (non-fatal): {e}"),
             }
         }
         Ok(count)
@@ -501,7 +540,13 @@ impl IndexWorker {
                 Some("chapter") => {
                     if let Some(chapter_id) = item.get("id").and_then(|v| v.as_i64()) {
                         match self
-                            .walk_chapter(chapter_id, book_id, book_kind, identity_ouid.as_deref(), job_id)
+                            .walk_chapter(
+                                chapter_id,
+                                book_id,
+                                book_kind,
+                                identity_ouid.as_deref(),
+                                job_id,
+                            )
                             .await
                         {
                             Ok(n) => count += n,
@@ -592,9 +637,7 @@ impl IndexWorker {
                     )
                     .await
                 {
-                    eprintln!(
-                        "IndexWorker: reconcile_page({page_id}) failed (non-fatal): {e}"
-                    );
+                    eprintln!("IndexWorker: reconcile_page({page_id}) failed (non-fatal): {e}");
                 }
                 count += 1;
             }
@@ -721,11 +764,10 @@ impl IndexWorker {
         // empty), the book is reconciled with shelf_id=None — the same
         // shape `walk_book` uses when it can't classify a parent.
         let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let candidate_shelves: Vec<i64> =
-            [globals.hive_shelf_id, globals.user_journals_shelf_id]
-                .into_iter()
-                .flatten()
-                .collect();
+        let candidate_shelves: Vec<i64> = [globals.hive_shelf_id, globals.user_journals_shelf_id]
+            .into_iter()
+            .flatten()
+            .collect();
         let mut shelf_id: Option<i64> = None;
         for sid in &candidate_shelves {
             let shelf = match self.bs_client.get_shelf(*sid).await {
@@ -867,7 +909,10 @@ impl IndexWorker {
         // didn't surface one (defensive — usually identical).
         let archive_year = archive_year_from_page.or(parent_chapter_archive_year);
         let now = current_unix();
-        let raw_md = page.get("markdown").and_then(|v| v.as_str()).map(String::from);
+        let raw_md = page
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let html = page.get("html").and_then(|v| v.as_str()).map(String::from);
         let page_updated_at = page
             .get("updated_at")
@@ -902,7 +947,9 @@ impl IndexWorker {
             cached_at: now,
             page_updated_at,
         };
-        self.index_db.upsert_indexed_page(&indexed, Some(&cache)).await
+        self.index_db
+            .upsert_indexed_page(&indexed, Some(&cache))
+            .await
     }
 
     /// For an Identity / UserIdentity book, find the manifest page (loose
@@ -915,11 +962,7 @@ impl IndexWorker {
         let contents = book.get("contents").and_then(|v| v.as_array())?;
         let manifest = contents.iter().find(|item| {
             item.get("type").and_then(|v| v.as_str()) == Some("page")
-                && item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| n.trim())
-                    == Some("Identity")
+                && item.get("name").and_then(|v| v.as_str()).map(|n| n.trim()) == Some("Identity")
         })?;
         let manifest_id = manifest.get("id").and_then(|v| v.as_i64())?;
         let page = self.bs_client.get_page(manifest_id).await.ok()?;
@@ -942,7 +985,10 @@ pub async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize
         match db.has_successor_index_job(&j.scope, j.id).await {
             Ok(true) => {
                 if let Err(e) = db.close_index_job(j.id, Some("superseded")).await {
-                    eprintln!("IndexWorker: close_index_job({}) superseded failed: {e}", j.id);
+                    eprintln!(
+                        "IndexWorker: close_index_job({}) superseded failed: {e}",
+                        j.id
+                    );
                 }
                 continue;
             }
@@ -965,7 +1011,10 @@ pub async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize
         }
         match db.create_retry_index_job(&j.scope, &j.kind, j.id).await {
             Ok(new_id) => {
-                eprintln!("IndexWorker: queued retry index job {new_id} for {} (chain={chain_len})", j.id);
+                eprintln!(
+                    "IndexWorker: queued retry index job {new_id} for {} (chain={chain_len})",
+                    j.id
+                );
                 if let Err(e) = db.close_index_job(j.id, Some("retried")).await {
                     eprintln!("IndexWorker: close_index_job({}) retried failed: {e}", j.id);
                 }
@@ -987,7 +1036,10 @@ pub async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: us
         match db.has_successor_embed_job(&j.scope, j.id).await {
             Ok(true) => {
                 if let Err(e) = db.close_embed_job(j.id, Some("superseded")).await {
-                    eprintln!("IndexWorker: close_embed_job({}) superseded failed: {e}", j.id);
+                    eprintln!(
+                        "IndexWorker: close_embed_job({}) superseded failed: {e}",
+                        j.id
+                    );
                 }
                 continue;
             }
@@ -1010,7 +1062,10 @@ pub async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: us
         }
         match db.create_retry_embed_job(&j.scope, j.id).await {
             Ok(new_id) => {
-                eprintln!("IndexWorker: queued retry embed job {new_id} for {} (chain={chain_len})", j.id);
+                eprintln!(
+                    "IndexWorker: queued retry embed job {new_id} for {} (chain={chain_len})",
+                    j.id
+                );
                 if let Err(e) = db.close_embed_job(j.id, Some("retried")).await {
                     eprintln!("IndexWorker: close_embed_job({}) retried failed: {e}", j.id);
                 }
@@ -1175,7 +1230,8 @@ mod tests {
 
     #[test]
     fn extract_ouid_present() {
-        let md = "---\nai_identity_ouid: 019dc66e4dc27d329e4a4abd1bec0c80\nname: Pia\n---\n\n# Pia\n";
+        let md =
+            "---\nai_identity_ouid: 019dc66e4dc27d329e4a4abd1bec0c80\nname: Pia\n---\n\n# Pia\n";
         assert_eq!(
             extract_ouid_from_frontmatter(md).as_deref(),
             Some("019dc66e4dc27d329e4a4abd1bec0c80")
@@ -1196,7 +1252,10 @@ mod tests {
     #[test]
     fn extract_ouid_quoted() {
         let md = "---\nouid: \"abc-123\"\n---\nbody";
-        assert_eq!(extract_ouid_from_frontmatter(md).as_deref(), Some("abc-123"));
+        assert_eq!(
+            extract_ouid_from_frontmatter(md).as_deref(),
+            Some("abc-123")
+        );
     }
 
     #[test]
@@ -1229,7 +1288,10 @@ mod reconcile_tests {
                 .as_nanos()
         );
         let path = dir.join(unique);
-        Arc::new(SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long")) as Arc<dyn IndexDb>
+        Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        )) as Arc<dyn IndexDb>
     }
 
     #[tokio::test]
@@ -1247,10 +1309,10 @@ mod reconcile_tests {
         db.close_index_job(b, Some("retried")).await.unwrap();
         let (c, _) = db.create_index_job("page:1", "both", "test").await.unwrap();
         let _ = c; // c is the successor for both a and b.
-        // Re-open a's failed-open marker by manually flipping b. Simpler:
-        // start fresh, this exercises has_successor on a's behalf.
-        // Reset a back to failed-open status via fail_index_job (which is
-        // a no-op once status is closed). Simpler approach: use a fresh db.
+                   // Re-open a's failed-open marker by manually flipping b. Simpler:
+                   // start fresh, this exercises has_successor on a's behalf.
+                   // Reset a back to failed-open status via fail_index_job (which is
+                   // a no-op once status is closed). Simpler approach: use a fresh db.
         let db = temp_db();
         let (j1, _) = db.create_index_job("page:1", "both", "test").await.unwrap();
         db.fail_index_job(j1, "boom").await.unwrap();
@@ -1271,12 +1333,18 @@ mod reconcile_tests {
         let db = temp_db();
         let (j1, _) = db.create_index_job("page:1", "both", "test").await.unwrap();
         db.fail_index_job(j1, "boom").await.unwrap();
-        let _j2 = db.create_retry_index_job("page:1", "both", j1).await.unwrap();
+        let _j2 = db
+            .create_retry_index_job("page:1", "both", j1)
+            .await
+            .unwrap();
         // Now j2 is pending+same scope+ id > j1. Reconciler should see j1 as superseded.
         reconcile_failed_index_jobs(&db, 5).await;
         // Verify j1 closed with resolved_status='superseded'.
         let after = db.list_failed_open_index_jobs().await.unwrap();
-        assert!(after.iter().all(|j| j.id != j1), "j1 should no longer be failed-open");
+        assert!(
+            after.iter().all(|j| j.id != j1),
+            "j1 should no longer be failed-open"
+        );
     }
 
     #[tokio::test]
@@ -1291,7 +1359,10 @@ mod reconcile_tests {
         let original = listed.iter().find(|j| j.id == j1).unwrap();
         assert_eq!(original.status, "closed");
         assert_eq!(original.resolved_status.as_deref(), Some("retried"));
-        let retry = listed.iter().find(|j| j.retry_of == Some(j1)).expect("retry exists");
+        let retry = listed
+            .iter()
+            .find(|j| j.retry_of == Some(j1))
+            .expect("retry exists");
         assert_eq!(retry.status, "pending");
         assert_eq!(retry.scope, "page:9");
     }
@@ -1301,7 +1372,10 @@ mod reconcile_tests {
         let db = temp_db();
         let (j1, _) = db.create_index_job("page:7", "both", "test").await.unwrap();
         db.fail_index_job(j1, "1").await.unwrap();
-        let j2 = db.create_retry_index_job("page:7", "both", j1).await.unwrap();
+        let j2 = db
+            .create_retry_index_job("page:7", "both", j1)
+            .await
+            .unwrap();
         db.close_index_job(j1, Some("retried")).await.unwrap();
         db.fail_index_job(j2, "2").await.unwrap();
         // chain length at j2 is 2; with max=2 we should give up.

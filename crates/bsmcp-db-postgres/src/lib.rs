@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, AeadCore};
+use aes_gcm::{AeadCore, Aes256Gcm};
 use async_trait::async_trait;
 use base64::Engine;
 use pgvector::Vector;
@@ -45,7 +45,7 @@ impl PostgresDb {
                 token_id TEXT NOT NULL,
                 token_secret TEXT NOT NULL,
                 created_at BIGINT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await
@@ -62,16 +62,18 @@ impl PostgresDb {
                 token_id TEXT NOT NULL,
                 token_secret TEXT NOT NULL,
                 created_at BIGINT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await
         .map_err(|e| format!("Failed to create refresh_tokens table: {e}"))?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at)")
-            .execute(&pool)
-            .await
-            .ok();
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at)",
+        )
+        .execute(&pool)
+        .await
+        .ok();
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
@@ -80,7 +82,7 @@ impl PostgresDb {
                 user_journals_shelf_id BIGINT,
                 set_by_token_hash TEXT,
                 updated_at BIGINT NOT NULL DEFAULT 0
-            )"
+            )",
         )
         .execute(&pool)
         .await
@@ -231,7 +233,10 @@ impl PostgresDb {
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash);
 
-        Ok(Self { pool, encryption_key: key })
+        Ok(Self {
+            pool,
+            encryption_key: key,
+        })
     }
 
     /// SHA-256 hash a bearer token before storing as primary key.
@@ -292,7 +297,7 @@ impl DbBackend for PostgresDb {
         sqlx::query(
             "INSERT INTO access_tokens (token, token_id, token_secret, created_at)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4"
+             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4",
         )
         .bind(&token_hash)
         .bind(&enc_id)
@@ -310,7 +315,7 @@ impl DbBackend for PostgresDb {
 
         // Try hashed token first, then fall back to raw token (pre-hash migration)
         let row = sqlx::query(
-            "SELECT token_id, token_secret FROM access_tokens WHERE token = $1 AND created_at > $2"
+            "SELECT token_id, token_secret FROM access_tokens WHERE token = $1 AND created_at > $2",
         )
         .bind(&token_hash)
         .bind(cutoff)
@@ -373,14 +378,19 @@ impl DbBackend for PostgresDb {
         Ok(())
     }
 
-    async fn insert_refresh_token(&self, token: &str, id: &str, secret: &str) -> Result<(), String> {
+    async fn insert_refresh_token(
+        &self,
+        token: &str,
+        id: &str,
+        secret: &str,
+    ) -> Result<(), String> {
         let token_hash = Self::hash_token(token);
         let enc_id = self.encrypt(id);
         let enc_secret = self.encrypt(secret);
         sqlx::query(
             "INSERT INTO refresh_tokens (token, token_id, token_secret, created_at)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4"
+             ON CONFLICT (token) DO UPDATE SET token_id = $2, token_secret = $3, created_at = $4",
         )
         .bind(&token_hash)
         .bind(&enc_id)
@@ -437,18 +447,20 @@ impl DbBackend for PostgresDb {
         let row = sqlx::query(
             "SELECT hive_shelf_id, user_journals_shelf_id,
                     set_by_token_hash, updated_at
-             FROM global_settings WHERE id = 1"
+             FROM global_settings WHERE id = 1",
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_global_settings: {e}"))?;
 
-        Ok(row.map(|r| GlobalSettings {
-            hive_shelf_id: r.get("hive_shelf_id"),
-            user_journals_shelf_id: r.get("user_journals_shelf_id"),
-            set_by_token_hash: r.get("set_by_token_hash"),
-            updated_at: r.get("updated_at"),
-        }).unwrap_or_default())
+        Ok(row
+            .map(|r| GlobalSettings {
+                hive_shelf_id: r.get("hive_shelf_id"),
+                user_journals_shelf_id: r.get("user_journals_shelf_id"),
+                set_by_token_hash: r.get("set_by_token_hash"),
+                updated_at: r.get("updated_at"),
+            })
+            .unwrap_or_default())
     }
 
     async fn save_global_settings(
@@ -457,7 +469,7 @@ impl DbBackend for PostgresDb {
         set_by_token_hash: &str,
     ) -> Result<(), String> {
         let existing_setter: Option<String> = sqlx::query_scalar(
-            "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0"
+            "SELECT set_by_token_hash FROM global_settings WHERE id = 1 AND updated_at > 0",
         )
         .fetch_optional(&self.pool)
         .await
@@ -471,7 +483,7 @@ impl DbBackend for PostgresDb {
                  user_journals_shelf_id = $2,
                  set_by_token_hash = $3,
                  updated_at = $4
-             WHERE id = 1"
+             WHERE id = 1",
         )
         .bind(settings.hive_shelf_id)
         .bind(settings.user_journals_shelf_id)
@@ -482,7 +494,6 @@ impl DbBackend for PostgresDb {
         .map_err(|e| format!("save_global_settings: {e}"))?;
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -545,7 +556,9 @@ impl SemanticDb for PostgresDb {
 
         // Migration: add worker_id column if missing (existing databases)
         sqlx::query("ALTER TABLE embed_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT")
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Issue #54 — job lifecycle columns.
         for sql in [
@@ -563,37 +576,53 @@ impl SemanticDb for PostgresDb {
 
         // Metadata key-value store (v0.5.0+)
         sqlx::query("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Schema migration: add updated_at column if missing
         sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS updated_at TEXT")
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Permission ACL: per-page role visibility, populated at embed time
         // by walking BookStack content_permissions inheritance.
         sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS acl_default_open BOOLEAN")
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
         sqlx::query("ALTER TABLE pages ADD COLUMN IF NOT EXISTS acl_computed_at BIGINT")
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS page_view_acl (
                 page_id BIGINT NOT NULL,
                 role_id BIGINT NOT NULL,
                 PRIMARY KEY (page_id, role_id)
-            )"
-        ).execute(&self.pool).await
-            .map_err(|e| format!("Failed to create page_view_acl: {e}"))?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_page_view_acl_role ON page_view_acl(role_id, page_id)")
-            .execute(&self.pool).await.ok();
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to create page_view_acl: {e}"))?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_page_view_acl_role ON page_view_acl(role_id, page_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
 
         // Reconciliation tracker — single-row table for the daily ACL refresh job.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS acl_reconcile_state (
                 scope TEXT PRIMARY KEY,
                 last_full_run BIGINT NOT NULL DEFAULT 0
-            )"
-        ).execute(&self.pool).await
-            .map_err(|e| format!("Failed to create acl_reconcile_state: {e}"))?;
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to create acl_reconcile_state: {e}"))?;
 
         eprintln!("Semantic: PostgreSQL tables initialized");
         Ok(())
@@ -630,7 +659,9 @@ impl SemanticDb for PostgresDb {
         // CASCADE handles chunks; manually delete relationships
         sqlx::query("DELETE FROM relationships WHERE source_page_id = $1 OR target_page_id = $1")
             .bind(page_id)
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
         sqlx::query("DELETE FROM pages WHERE page_id = $1")
             .bind(page_id)
             .execute(&self.pool)
@@ -687,7 +718,10 @@ impl SemanticDb for PostgresDb {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("get_page_book_ids failed: {e}"))?;
-        Ok(rows.iter().map(|r| (r.get("page_id"), r.get("book_id"))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("page_id"), r.get("book_id")))
+            .collect())
     }
 
     async fn get_page_metas(&self, page_ids: &[i64]) -> Result<Vec<PageMeta>, String> {
@@ -697,33 +731,40 @@ impl SemanticDb for PostgresDb {
         let ids: Vec<i64> = page_ids.to_vec();
         let rows = sqlx::query(
             "SELECT page_id, book_id, chapter_id, name, slug, content_hash, updated_at
-             FROM pages WHERE page_id = ANY($1)"
+             FROM pages WHERE page_id = ANY($1)",
         )
         .bind(&ids)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("get_page_metas failed: {e}"))?;
 
-        Ok(rows.iter().map(|r| PageMeta {
-            page_id: r.get("page_id"),
-            book_id: r.get("book_id"),
-            chapter_id: r.get("chapter_id"),
-            name: r.get("name"),
-            slug: r.get("slug"),
-            content_hash: r.get("content_hash"),
-            updated_at: r.get("updated_at"),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| PageMeta {
+                page_id: r.get("page_id"),
+                book_id: r.get("book_id"),
+                chapter_id: r.get("chapter_id"),
+                name: r.get("name"),
+                slug: r.get("slug"),
+                content_hash: r.get("content_hash"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 
     async fn insert_chunks(&self, page_id: i64, chunks: &[ChunkInsert]) -> Result<(), String> {
         // Wrap DELETE + INSERTs in a transaction to prevent partial state
         // (without this, queries hitting the table between DELETE and INSERT see zero chunks)
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| format!("insert_chunks transaction begin failed: {e}"))?;
 
         sqlx::query("DELETE FROM chunks WHERE page_id = $1")
             .bind(page_id)
-            .execute(&mut *tx).await
+            .execute(&mut *tx)
+            .await
             .map_err(|e| format!("insert_chunks delete failed: {e}"))?;
 
         for chunk in chunks {
@@ -743,7 +784,8 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("insert_chunks failed for chunk {}: {e}", chunk.chunk_index))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| format!("insert_chunks commit failed: {e}"))?;
         Ok(())
     }
@@ -755,37 +797,48 @@ impl SemanticDb for PostgresDb {
         let rows = sqlx::query(
             "SELECT c.id, c.page_id, c.heading_path, c.content, p.name
              FROM chunks c JOIN pages p ON c.page_id = p.page_id
-             WHERE c.id = ANY($1)"
+             WHERE c.id = ANY($1)",
         )
         .bind(chunk_ids)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("get_chunk_details failed: {e}"))?;
 
-        Ok(rows.iter().map(|r| ChunkDetail {
-            chunk_id: r.get("id"),
-            page_id: r.get("page_id"),
-            heading_path: r.get("heading_path"),
-            content: r.get("content"),
-            page_name: r.get("name"),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| ChunkDetail {
+                chunk_id: r.get("id"),
+                page_id: r.get("page_id"),
+                heading_path: r.get("heading_path"),
+                content: r.get("content"),
+                page_name: r.get("name"),
+            })
+            .collect())
     }
 
-    async fn replace_relationships(&self, source: i64, targets: &[(i64, String)]) -> Result<(), String> {
+    async fn replace_relationships(
+        &self,
+        source: i64,
+        targets: &[(i64, String)],
+    ) -> Result<(), String> {
         // Only delete explicit link relationships; preserve inferred "similar" ones
         sqlx::query("DELETE FROM relationships WHERE source_page_id = $1 AND link_type = 'link'")
             .bind(source)
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
 
         for (target_id, link_type) in targets {
             sqlx::query(
                 "INSERT INTO relationships (source_page_id, target_page_id, link_type)
-                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
             )
             .bind(source)
             .bind(target_id)
             .bind(link_type)
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
         }
         Ok(())
     }
@@ -799,36 +852,46 @@ impl SemanticDb for PostgresDb {
                     .bind(page_id)
                     .fetch_all(&pool)
                     .await
-                    .map(|rows| rows.iter().map(|r| RelatedPage {
-                        page_id: r.get(0),
-                        name: r.get(1),
-                    }).collect::<Vec<_>>())
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|r| RelatedPage {
+                                page_id: r.get(0),
+                                name: r.get(1),
+                            })
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default()
             }
         };
 
-        let linked_from = query_related(&self.pool,
+        let linked_from = query_related(
+            &self.pool,
             "SELECT r.source_page_id, p.name FROM relationships r
              JOIN pages p ON r.source_page_id = p.page_id
              WHERE r.target_page_id = $1 LIMIT 20",
             page_id,
-        ).await;
+        )
+        .await;
 
-        let links_to = query_related(&self.pool,
+        let links_to = query_related(
+            &self.pool,
             "SELECT r.target_page_id, p.name FROM relationships r
              JOIN pages p ON r.target_page_id = p.page_id
              WHERE r.source_page_id = $1 LIMIT 20",
             page_id,
-        ).await;
+        )
+        .await;
 
-        let co_linked = query_related(&self.pool,
+        let co_linked = query_related(
+            &self.pool,
             "SELECT DISTINCT r2.source_page_id, p.name FROM relationships r1
              JOIN relationships r2 ON r1.target_page_id = r2.target_page_id
              JOIN pages p ON r2.source_page_id = p.page_id
              WHERE r1.source_page_id = $1 AND r2.source_page_id != $1
              LIMIT 10",
             page_id,
-        ).await;
+        )
+        .await;
 
         // Siblings: same chapter or same book
         let siblings = {
@@ -875,12 +938,20 @@ impl SemanticDb for PostgresDb {
             }
         };
 
-        Ok(MarkovBlanket { linked_from, links_to, co_linked, siblings })
+        Ok(MarkovBlanket {
+            linked_from,
+            links_to,
+            co_linked,
+            siblings,
+        })
     }
 
     async fn create_embed_job(&self, scope: &str) -> Result<(i64, bool), String> {
         // Atomic check-and-insert in a serializable transaction to prevent duplicates
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| format!("create_embed_job transaction failed: {e}"))?;
 
         // Dedup: pending/running collapse onto the existing job. Failed jobs
@@ -891,7 +962,7 @@ impl SemanticDb for PostgresDb {
              WHERE scope = $1 \
                AND (status IN ('pending', 'running') \
                     OR (status = 'failed' AND resolved_status IS NULL)) \
-             ORDER BY id DESC LIMIT 1 FOR UPDATE"
+             ORDER BY id DESC LIMIT 1 FOR UPDATE",
         )
         .bind(scope)
         .fetch_optional(&mut *tx)
@@ -899,7 +970,9 @@ impl SemanticDb for PostgresDb {
         .map_err(|e| format!("create_embed_job check failed: {e}"))?;
 
         if let Some(row) = existing {
-            tx.commit().await.map_err(|e| format!("create_embed_job commit failed: {e}"))?;
+            tx.commit()
+                .await
+                .map_err(|e| format!("create_embed_job commit failed: {e}"))?;
             return Ok((row.get("id"), false));
         }
 
@@ -912,22 +985,22 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("create_embed_job insert failed: {e}"))?;
 
-        tx.commit().await.map_err(|e| format!("create_embed_job commit failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("create_embed_job commit failed: {e}"))?;
         Ok((row.get("id"), true))
     }
 
     async fn claim_next_job(&self, worker_id: &str) -> Result<Option<EmbedJob>, String> {
         // FOR UPDATE SKIP LOCKED enables concurrent embedder workers
-        let row = sqlx::query(
-            &format!(
-                "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2 \
+        let row = sqlx::query(&format!(
+            "UPDATE embed_jobs SET status = 'running', started_at = $1, worker_id = $2 \
                  WHERE id = ( \
                     SELECT id FROM embed_jobs WHERE status = 'pending' \
                     ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED \
                  ) \
                  RETURNING {EMBED_JOB_COLS}"
-            )
-        )
+        ))
         .bind(Self::now_secs())
         .bind(worker_id)
         .fetch_optional(&self.pool)
@@ -944,7 +1017,7 @@ impl SemanticDb for PostgresDb {
         let failed = sqlx::query(
             "UPDATE embed_jobs \
              SET status = 'failed', finished_at = $1, error = 'worker_restart' \
-             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)"
+             WHERE status = 'running' AND (worker_id = $2 OR worker_id IS NULL)",
         )
         .bind(Self::now_secs())
         .bind(worker_id)
@@ -961,7 +1034,7 @@ impl SemanticDb for PostgresDb {
         let failed = sqlx::query(
             "UPDATE embed_jobs \
              SET status = 'failed', finished_at = $1, error = 'timeout' \
-             WHERE status = 'running' AND started_at < $2"
+             WHERE status = 'running' AND started_at < $2",
         )
         .bind(Self::now_secs())
         .bind(cutoff)
@@ -977,7 +1050,9 @@ impl SemanticDb for PostgresDb {
             .bind(done)
             .bind(total)
             .bind(job_id)
-            .execute(&self.pool).await.ok();
+            .execute(&self.pool)
+            .await
+            .ok();
         Ok(())
     }
 
@@ -991,7 +1066,7 @@ impl SemanticDb for PostgresDb {
             sqlx::query(
                 "UPDATE embed_jobs \
                  SET status = 'failed', finished_at = $1, error = $2 \
-                 WHERE id = $3 AND status IN ('pending', 'running')"
+                 WHERE id = $3 AND status IN ('pending', 'running')",
             )
             .bind(now)
             .bind(reason)
@@ -1007,7 +1082,7 @@ impl SemanticDb for PostgresDb {
                 "UPDATE embed_jobs \
                  SET status = 'succeeded', finished_at = $1, \
                      resolved_status = 'succeeded', resolved_at = $1, error = NULL \
-                 WHERE id = $2 AND status IN ('pending', 'running')"
+                 WHERE id = $2 AND status IN ('pending', 'running')",
             )
             .bind(now)
             .bind(job_id)
@@ -1019,9 +1094,9 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn get_latest_job(&self) -> Result<Option<EmbedJob>, String> {
-        let row = sqlx::query(
-            &format!("SELECT {EMBED_JOB_COLS} FROM embed_jobs ORDER BY id DESC LIMIT 1")
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {EMBED_JOB_COLS} FROM embed_jobs ORDER BY id DESC LIMIT 1"
+        ))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_latest_job failed: {e}"))?;
@@ -1031,9 +1106,13 @@ impl SemanticDb for PostgresDb {
 
     async fn get_stats(&self) -> Result<EmbedStats, String> {
         let pages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pages")
-            .fetch_one(&self.pool).await.unwrap_or((0,));
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((0,));
         let chunks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
-            .fetch_one(&self.pool).await.unwrap_or((0,));
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((0,));
 
         let latest_job = self.get_latest_job().await?;
 
@@ -1045,16 +1124,14 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn list_jobs(&self, recent: usize) -> Result<Vec<EmbedJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "(SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+        let rows = sqlx::query(&format!(
+            "(SELECT {EMBED_JOB_COLS} FROM embed_jobs \
                   WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC) \
                  UNION ALL \
                  (SELECT {EMBED_JOB_COLS} FROM embed_jobs \
                   WHERE status NOT IN ('pending', 'running', 'failed') \
                   ORDER BY id DESC LIMIT {recent})"
-            )
-        )
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("list_jobs failed: {e}"))?;
@@ -1068,7 +1145,7 @@ impl SemanticDb for PostgresDb {
             "UPDATE embed_jobs \
              SET status = 'cancelled', resolved_status = 'cancelled', \
                  resolved_at = $1, finished_at = $1 \
-             WHERE id = $2 AND status IN ('pending', 'running')"
+             WHERE id = $2 AND status IN ('pending', 'running')",
         )
         .bind(now)
         .bind(job_id)
@@ -1079,13 +1156,11 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn should_stop_embed_job(&self, job_id: i64) -> Result<bool, String> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM embed_jobs WHERE id = $1"
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("should_stop_embed_job: {e}"))?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM embed_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("should_stop_embed_job: {e}"))?;
         Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some(s) if s != "running"))
     }
 
@@ -1094,7 +1169,7 @@ impl SemanticDb for PostgresDb {
         sqlx::query(
             "UPDATE embed_jobs \
              SET status = 'failed', finished_at = $1, error = $2 \
-             WHERE id = $3 AND status IN ('pending', 'running')"
+             WHERE id = $3 AND status IN ('pending', 'running')",
         )
         .bind(now)
         .bind(reason)
@@ -1106,12 +1181,10 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn list_failed_open_embed_jobs(&self) -> Result<Vec<EmbedJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+        let rows = sqlx::query(&format!(
+            "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
                  WHERE status = 'failed' ORDER BY id ASC"
-            )
-        )
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("list_failed_open_embed_jobs: {e}"))?;
@@ -1123,7 +1196,7 @@ impl SemanticDb for PostgresDb {
             "SELECT 1::BIGINT FROM embed_jobs \
              WHERE scope = $1 AND id > $2 \
                AND status IN ('pending','running','succeeded','cancelled','closed') \
-             LIMIT 1"
+             LIMIT 1",
         )
         .bind(scope)
         .bind(excluded_id)
@@ -1137,13 +1210,12 @@ impl SemanticDb for PostgresDb {
         let mut len = 1usize;
         let mut current = job_id;
         for _ in 0..1024 {
-            let parent: Option<(Option<i64>,)> = sqlx::query_as(
-                "SELECT retry_of FROM embed_jobs WHERE id = $1"
-            )
-            .bind(current)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| format!("embed_job_retry_chain_len: {e}"))?;
+            let parent: Option<(Option<i64>,)> =
+                sqlx::query_as("SELECT retry_of FROM embed_jobs WHERE id = $1")
+                    .bind(current)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| format!("embed_job_retry_chain_len: {e}"))?;
             match parent.and_then(|(p,)| p) {
                 Some(p) => {
                     len += 1;
@@ -1164,7 +1236,7 @@ impl SemanticDb for PostgresDb {
             sqlx::query(
                 "UPDATE embed_jobs \
                  SET prev_status = status, status = 'closed', resolved_status = $1 \
-                 WHERE id = $2 AND status != 'closed'"
+                 WHERE id = $2 AND status != 'closed'",
             )
             .bind(rs)
             .bind(job_id)
@@ -1175,7 +1247,7 @@ impl SemanticDb for PostgresDb {
             sqlx::query(
                 "UPDATE embed_jobs \
                  SET prev_status = status, status = 'closed' \
-                 WHERE id = $1 AND status != 'closed'"
+                 WHERE id = $1 AND status != 'closed'",
             )
             .bind(job_id)
             .execute(&self.pool)
@@ -1197,16 +1269,13 @@ impl SemanticDb for PostgresDb {
         Ok(row.0)
     }
 
-    async fn list_archivable_embed_jobs(
-        &self,
-        older_than_secs: i64,
-    ) -> Result<Vec<i64>, String> {
+    async fn list_archivable_embed_jobs(&self, older_than_secs: i64) -> Result<Vec<i64>, String> {
         let cutoff = Self::now_secs() - older_than_secs;
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM embed_jobs \
              WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
                AND resolved_at <= $1 \
-             ORDER BY id ASC"
+             ORDER BY id ASC",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
@@ -1219,12 +1288,10 @@ impl SemanticDb for PostgresDb {
         &self,
         started_before_secs: i64,
     ) -> Result<Vec<EmbedJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
+        let rows = sqlx::query(&format!(
+            "SELECT {EMBED_JOB_COLS} FROM embed_jobs \
                  WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1"
-            )
-        )
+        ))
         .bind(started_before_secs)
         .fetch_all(&self.pool)
         .await
@@ -1248,12 +1315,17 @@ impl SemanticDb for PostgresDb {
         let vec = Vector::from(query_embedding.to_vec());
 
         // Use a transaction so SET LOCAL ef_search applies to the search query
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| format!("vector_search transaction failed: {e}"))?;
 
         // Increase HNSW ef_search for better recall (default 40 can miss results after bulk ops)
         sqlx::query("SET LOCAL hnsw.ef_search = 100")
-            .execute(&mut *tx).await.ok();
+            .execute(&mut *tx)
+            .await
+            .ok();
 
         // Optional book scope. When set, restrict candidates to chunks whose
         // page lives in one of the requested books. Empty slice = full corpus.
@@ -1262,47 +1334,57 @@ impl SemanticDb for PostgresDb {
             _ => None,
         };
 
-        let rows = match book_filter {
-            Some(books) => sqlx::query(
-                "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
+        let rows =
+            match book_filter {
+                Some(books) => sqlx::query(
+                    "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
                  FROM chunks c
                  JOIN pages p ON c.page_id = p.page_id
                  WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
                    AND p.book_id = ANY($4)
                  ORDER BY c.embedding <=> $1::vector
-                 LIMIT $3"
-            )
-            .bind(&vec)
-            .bind(threshold)
-            .bind(limit as i64)
-            .bind(&books)
-            .fetch_all(&mut *tx).await,
-            None => sqlx::query(
-                "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
+                 LIMIT $3",
+                )
+                .bind(&vec)
+                .bind(threshold)
+                .bind(limit as i64)
+                .bind(&books)
+                .fetch_all(&mut *tx)
+                .await,
+                None => {
+                    sqlx::query(
+                        "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
                  FROM chunks
                  WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
                  ORDER BY embedding <=> $1::vector
-                 LIMIT $3"
-            )
-            .bind(&vec)
-            .bind(threshold)
-            .bind(limit as i64)
-            .fetch_all(&mut *tx).await,
-        };
+                 LIMIT $3",
+                    )
+                    .bind(&vec)
+                    .bind(threshold)
+                    .bind(limit as i64)
+                    .fetch_all(&mut *tx)
+                    .await
+                }
+            };
         let rows = rows.map_err(|e| format!("vector_search failed: {e}"))?;
 
         tx.commit().await.ok();
 
-        let results: Vec<SearchHit> = rows.iter().map(|r| SearchHit {
-            chunk_id: r.get("id"),
-            page_id: r.get("page_id"),
-            score: r.get("score"),
-        }).collect();
+        let results: Vec<SearchHit> = rows
+            .iter()
+            .map(|r| SearchHit {
+                chunk_id: r.get("id"),
+                page_id: r.get("page_id"),
+                score: r.get("score"),
+            })
+            .collect();
 
         // Diagnostic: if zero results, check why
         if results.is_empty() {
             let chunk_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
-                .fetch_one(&self.pool).await.unwrap_or((0,));
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or((0,));
             if chunk_count.0 == 0 {
                 eprintln!("vector_search: 0 results — chunks table is EMPTY (embeddings may have been cleared)");
             } else {
@@ -1327,16 +1409,29 @@ impl SemanticDb for PostgresDb {
     async fn clear_all_embeddings(&self) -> Result<(), String> {
         // Log what's being cleared for debugging intermittent search death
         let pages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pages")
-            .fetch_one(&self.pool).await.unwrap_or((0,));
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((0,));
         let chunks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
-            .fetch_one(&self.pool).await.unwrap_or((0,));
-        eprintln!("clear_all_embeddings: clearing {} pages, {} chunks", pages.0, chunks.0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((0,));
+        eprintln!(
+            "clear_all_embeddings: clearing {} pages, {} chunks",
+            pages.0, chunks.0
+        );
 
-        sqlx::query("DELETE FROM relationships").execute(&self.pool).await
+        sqlx::query("DELETE FROM relationships")
+            .execute(&self.pool)
+            .await
             .map_err(|e| format!("clear relationships: {e}"))?;
-        sqlx::query("DELETE FROM chunks").execute(&self.pool).await
+        sqlx::query("DELETE FROM chunks")
+            .execute(&self.pool)
+            .await
             .map_err(|e| format!("clear chunks: {e}"))?;
-        sqlx::query("DELETE FROM pages").execute(&self.pool).await
+        sqlx::query("DELETE FROM pages")
+            .execute(&self.pool)
+            .await
             .map_err(|e| format!("clear pages: {e}"))?;
         Ok(())
     }
@@ -1344,17 +1439,22 @@ impl SemanticDb for PostgresDb {
     async fn alter_embedding_dimension(&self, dims: usize) -> Result<(), String> {
         // Drop the HNSW index, alter column type, recreate index
         sqlx::query("DROP INDEX IF EXISTS idx_chunks_embedding")
-            .execute(&self.pool).await
+            .execute(&self.pool)
+            .await
             .map_err(|e| format!("drop index: {e}"))?;
         let alter_sql = format!(
             "ALTER TABLE chunks ALTER COLUMN embedding TYPE vector({dims}) USING embedding::vector({dims})"
         );
         sqlx::query(&alter_sql)
-            .execute(&self.pool).await
+            .execute(&self.pool)
+            .await
             .map_err(|e| format!("alter column: {e}"))?;
-        sqlx::query("CREATE INDEX idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops)")
-            .execute(&self.pool).await
-            .map_err(|e| format!("recreate index: {e}"))?;
+        sqlx::query(
+            "CREATE INDEX idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("recreate index: {e}"))?;
         eprintln!("PostgreSQL: embedding column altered to vector({dims})");
         Ok(())
     }
@@ -1362,7 +1462,8 @@ impl SemanticDb for PostgresDb {
     async fn compute_similar_pages(&self, top_k: usize, threshold: f32) -> Result<usize, String> {
         // Clear existing "similar" relationships
         sqlx::query("DELETE FROM relationships WHERE link_type = 'similar'")
-            .execute(&self.pool).await
+            .execute(&self.pool)
+            .await
             .map_err(|e| format!("clear similar rels: {e}"))?;
 
         // Compute page centroids (average of chunk embeddings) and find top-K
@@ -1419,7 +1520,10 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn upsert_page_acl(&self, acl: &PageAcl) -> Result<(), String> {
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| format!("upsert_page_acl tx: {e}"))?;
         sqlx::query("DELETE FROM page_view_acl WHERE page_id = $1")
             .bind(acl.page_id)
@@ -1429,7 +1533,7 @@ impl SemanticDb for PostgresDb {
         for &role_id in &acl.view_roles {
             sqlx::query(
                 "INSERT INTO page_view_acl (page_id, role_id) VALUES ($1, $2)
-                 ON CONFLICT (page_id, role_id) DO NOTHING"
+                 ON CONFLICT (page_id, role_id) DO NOTHING",
             )
             .bind(acl.page_id)
             .bind(role_id)
@@ -1438,7 +1542,7 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("upsert_page_acl insert: {e}"))?;
         }
         sqlx::query(
-            "UPDATE pages SET acl_default_open = $1, acl_computed_at = $2 WHERE page_id = $3"
+            "UPDATE pages SET acl_default_open = $1, acl_computed_at = $2 WHERE page_id = $3",
         )
         .bind(acl.default_open)
         .bind(acl.computed_at)
@@ -1446,7 +1550,9 @@ impl SemanticDb for PostgresDb {
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("upsert_page_acl flag: {e}"))?;
-        tx.commit().await.map_err(|e| format!("upsert_page_acl commit: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("upsert_page_acl commit: {e}"))?;
         Ok(())
     }
 
@@ -1469,15 +1575,13 @@ impl SemanticDb for PostgresDb {
     }
 
     async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String> {
-        let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT page_id FROM pages WHERE acl_computed_at IS NOT NULL"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("list_acl_page_ids: {e}"))?;
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT page_id FROM pages WHERE acl_computed_at IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("list_acl_page_ids: {e}"))?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
-
 }
 
 // --- IndexDb impl (closes #36) ---
@@ -1663,10 +1767,7 @@ impl IndexDb for PostgresDb {
         Ok(())
     }
 
-    async fn get_indexed_chapter(
-        &self,
-        chapter_id: i64,
-    ) -> Result<Option<IndexedChapter>, String> {
+    async fn get_indexed_chapter(&self, chapter_id: i64) -> Result<Option<IndexedChapter>, String> {
         let row = sqlx::query(
             "SELECT chapter_id, book_id, name, slug, identity_ouid, chapter_kind, archive_year, indexed_at, deleted
              FROM bookstack_chapters WHERE chapter_id = $1",
@@ -1933,7 +2034,9 @@ impl IndexDb for PostgresDb {
         .map_err(|e| format!("create_index_job check: {e}"))?;
 
         if let Some(row) = existing {
-            tx.commit().await.map_err(|e| format!("create_index_job commit: {e}"))?;
+            tx.commit()
+                .await
+                .map_err(|e| format!("create_index_job commit: {e}"))?;
             return Ok((row.get("id"), false));
         }
 
@@ -1949,23 +2052,23 @@ impl IndexDb for PostgresDb {
         .await
         .map_err(|e| format!("create_index_job insert: {e}"))?;
 
-        tx.commit().await.map_err(|e| format!("create_index_job commit: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("create_index_job commit: {e}"))?;
         Ok((inserted.get("id"), true))
     }
 
     async fn claim_next_index_job(&self) -> Result<Option<IndexJob>, String> {
         // FOR UPDATE SKIP LOCKED enables multiple worker processes to run
         // safely against the same database without claiming the same job.
-        let row = sqlx::query(
-            &format!(
-                "UPDATE index_jobs SET status = 'running', started_at = $1 \
+        let row = sqlx::query(&format!(
+            "UPDATE index_jobs SET status = 'running', started_at = $1 \
                  WHERE id = ( \
                      SELECT id FROM index_jobs WHERE status = 'pending' \
                      ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
                  ) \
                  RETURNING {INDEX_JOB_COLS}"
-            )
-        )
+        ))
         .bind(Self::now_secs())
         .fetch_optional(&self.pool)
         .await
@@ -1989,11 +2092,7 @@ impl IndexDb for PostgresDb {
         Ok(())
     }
 
-    async fn complete_index_job(
-        &self,
-        job_id: i64,
-        error: Option<&str>,
-    ) -> Result<(), String> {
+    async fn complete_index_job(&self, job_id: i64, error: Option<&str>) -> Result<(), String> {
         let now = Self::now_secs();
         if let Some(reason) = error {
             // Status guard makes this idempotent — a cancel that landed
@@ -2029,12 +2128,10 @@ impl IndexDb for PostgresDb {
     }
 
     async fn list_pending_index_jobs(&self, limit: i64) -> Result<Vec<IndexJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+        let rows = sqlx::query(&format!(
+            "SELECT {INDEX_JOB_COLS} FROM index_jobs \
                  WHERE status = 'pending' ORDER BY id ASC LIMIT $1"
-            )
-        )
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -2043,9 +2140,9 @@ impl IndexDb for PostgresDb {
     }
 
     async fn get_latest_index_job(&self) -> Result<Option<IndexJob>, String> {
-        let row = sqlx::query(
-            &format!("SELECT {INDEX_JOB_COLS} FROM index_jobs ORDER BY id DESC LIMIT 1")
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {INDEX_JOB_COLS} FROM index_jobs ORDER BY id DESC LIMIT 1"
+        ))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_latest_index_job: {e}"))?;
@@ -2058,7 +2155,7 @@ impl IndexDb for PostgresDb {
             "UPDATE index_jobs \
              SET status = 'cancelled', resolved_status = 'cancelled', \
                  resolved_at = $1, finished_at = $1 \
-             WHERE id = $2 AND status IN ('pending', 'running')"
+             WHERE id = $2 AND status IN ('pending', 'running')",
         )
         .bind(now)
         .bind(job_id)
@@ -2069,13 +2166,11 @@ impl IndexDb for PostgresDb {
     }
 
     async fn should_stop_index_job(&self, job_id: i64) -> Result<bool, String> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM index_jobs WHERE id = $1"
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("should_stop_index_job: {e}"))?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM index_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("should_stop_index_job: {e}"))?;
         Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some(s) if s != "running"))
     }
 
@@ -2084,7 +2179,7 @@ impl IndexDb for PostgresDb {
         sqlx::query(
             "UPDATE index_jobs \
              SET status = 'failed', finished_at = $1, error = $2 \
-             WHERE id = $3 AND status IN ('pending', 'running')"
+             WHERE id = $3 AND status IN ('pending', 'running')",
         )
         .bind(now)
         .bind(reason)
@@ -2096,12 +2191,10 @@ impl IndexDb for PostgresDb {
     }
 
     async fn list_failed_open_index_jobs(&self) -> Result<Vec<IndexJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+        let rows = sqlx::query(&format!(
+            "SELECT {INDEX_JOB_COLS} FROM index_jobs \
                  WHERE status = 'failed' ORDER BY id ASC"
-            )
-        )
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("list_failed_open_index_jobs: {e}"))?;
@@ -2113,7 +2206,7 @@ impl IndexDb for PostgresDb {
             "SELECT 1::BIGINT FROM index_jobs \
              WHERE scope = $1 AND id > $2 \
                AND status IN ('pending','running','succeeded','cancelled','closed') \
-             LIMIT 1"
+             LIMIT 1",
         )
         .bind(scope)
         .bind(excluded_id)
@@ -2127,13 +2220,12 @@ impl IndexDb for PostgresDb {
         let mut len = 1usize;
         let mut current = job_id;
         for _ in 0..1024 {
-            let parent: Option<(Option<i64>,)> = sqlx::query_as(
-                "SELECT retry_of FROM index_jobs WHERE id = $1"
-            )
-            .bind(current)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| format!("index_job_retry_chain_len: {e}"))?;
+            let parent: Option<(Option<i64>,)> =
+                sqlx::query_as("SELECT retry_of FROM index_jobs WHERE id = $1")
+                    .bind(current)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| format!("index_job_retry_chain_len: {e}"))?;
             match parent.and_then(|(p,)| p) {
                 Some(p) => {
                     len += 1;
@@ -2154,7 +2246,7 @@ impl IndexDb for PostgresDb {
             sqlx::query(
                 "UPDATE index_jobs \
                  SET prev_status = status, status = 'closed', resolved_status = $1 \
-                 WHERE id = $2 AND status != 'closed'"
+                 WHERE id = $2 AND status != 'closed'",
             )
             .bind(rs)
             .bind(job_id)
@@ -2165,7 +2257,7 @@ impl IndexDb for PostgresDb {
             sqlx::query(
                 "UPDATE index_jobs \
                  SET prev_status = status, status = 'closed' \
-                 WHERE id = $1 AND status != 'closed'"
+                 WHERE id = $1 AND status != 'closed'",
             )
             .bind(job_id)
             .execute(&self.pool)
@@ -2183,7 +2275,7 @@ impl IndexDb for PostgresDb {
     ) -> Result<i64, String> {
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO index_jobs (scope, kind, status, triggered_by, retry_of) \
-             VALUES ($1, $2, 'pending', 'reconciler', $3) RETURNING id"
+             VALUES ($1, $2, 'pending', 'reconciler', $3) RETURNING id",
         )
         .bind(scope)
         .bind(kind)
@@ -2194,16 +2286,13 @@ impl IndexDb for PostgresDb {
         Ok(row.0)
     }
 
-    async fn list_archivable_index_jobs(
-        &self,
-        older_than_secs: i64,
-    ) -> Result<Vec<i64>, String> {
+    async fn list_archivable_index_jobs(&self, older_than_secs: i64) -> Result<Vec<i64>, String> {
         let cutoff = Self::now_secs() - older_than_secs;
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM index_jobs \
              WHERE status IN ('succeeded', 'cancelled') AND resolved_at IS NOT NULL \
                AND resolved_at <= $1 \
-             ORDER BY id ASC"
+             ORDER BY id ASC",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
@@ -2216,12 +2305,10 @@ impl IndexDb for PostgresDb {
         &self,
         started_before_secs: i64,
     ) -> Result<Vec<IndexJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "SELECT {INDEX_JOB_COLS} FROM index_jobs \
+        let rows = sqlx::query(&format!(
+            "SELECT {INDEX_JOB_COLS} FROM index_jobs \
                  WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1"
-            )
-        )
+        ))
         .bind(started_before_secs)
         .fetch_all(&self.pool)
         .await
@@ -2230,16 +2317,14 @@ impl IndexDb for PostgresDb {
     }
 
     async fn list_index_jobs(&self, recent: usize) -> Result<Vec<IndexJob>, String> {
-        let rows = sqlx::query(
-            &format!(
-                "(SELECT {INDEX_JOB_COLS} FROM index_jobs \
+        let rows = sqlx::query(&format!(
+            "(SELECT {INDEX_JOB_COLS} FROM index_jobs \
                   WHERE status IN ('pending', 'running', 'failed') ORDER BY id ASC) \
                  UNION ALL \
                  (SELECT {INDEX_JOB_COLS} FROM index_jobs \
                   WHERE status NOT IN ('pending', 'running', 'failed') \
                   ORDER BY id DESC LIMIT {recent})"
-            )
-        )
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("list_index_jobs: {e}"))?;

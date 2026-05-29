@@ -38,8 +38,7 @@ use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 async fn main() {
     eprintln!("BookStack MCP Worker v{}", env!("CARGO_PKG_VERSION"));
 
-    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
-        .expect("BSMCP_BOOKSTACK_URL is required");
+    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
 
     let encryption_key = env::var("BSMCP_ENCRYPTION_KEY")
         .expect("BSMCP_ENCRYPTION_KEY is required (32+ character key, must match the server's)");
@@ -64,39 +63,36 @@ async fn main() {
     // Select database backend — must point at the SAME database the server
     // uses so the index_jobs queue is shared.
     let backend_type = DbBackendType::from_env();
-    let (db, index_db, semantic_db): (
-        Arc<dyn DbBackend>,
-        Arc<dyn IndexDb>,
-        Arc<dyn SemanticDb>,
-    ) = match backend_type {
-        DbBackendType::Sqlite => {
-            let db_path = env::var("BSMCP_DB_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
-            eprintln!("Database: SQLite ({})", db_path.display());
-            let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
-            (
-                db.clone() as Arc<dyn DbBackend>,
-                db.clone() as Arc<dyn IndexDb>,
-                db as Arc<dyn SemanticDb>,
-            )
-        }
-        DbBackendType::Postgres => {
-            let database_url = env::var("BSMCP_DATABASE_URL")
-                .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
-            eprintln!("Database: PostgreSQL");
-            let db = Arc::new(
-                bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
-                    .await
-                    .expect("Failed to connect to PostgreSQL"),
-            );
-            (
-                db.clone() as Arc<dyn DbBackend>,
-                db.clone() as Arc<dyn IndexDb>,
-                db as Arc<dyn SemanticDb>,
-            )
-        }
-    };
+    let (db, index_db, semantic_db): (Arc<dyn DbBackend>, Arc<dyn IndexDb>, Arc<dyn SemanticDb>) =
+        match backend_type {
+            DbBackendType::Sqlite => {
+                let db_path = env::var("BSMCP_DB_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
+                eprintln!("Database: SQLite ({})", db_path.display());
+                let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
+                (
+                    db.clone() as Arc<dyn DbBackend>,
+                    db.clone() as Arc<dyn IndexDb>,
+                    db as Arc<dyn SemanticDb>,
+                )
+            }
+            DbBackendType::Postgres => {
+                let database_url = env::var("BSMCP_DATABASE_URL")
+                    .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
+                eprintln!("Database: PostgreSQL");
+                let db = Arc::new(
+                    bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
+                        .await
+                        .expect("Failed to connect to PostgreSQL"),
+                );
+                (
+                    db.clone() as Arc<dyn DbBackend>,
+                    db.clone() as Arc<dyn IndexDb>,
+                    db as Arc<dyn SemanticDb>,
+                )
+            }
+        };
 
     let bs_client = bsmcp_common::bookstack::BookStackClient::new(
         &bookstack_url,
@@ -109,9 +105,7 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
-    eprintln!(
-        "Worker starting — delta interval: {delta_interval}s (0 = webhook-only)"
-    );
+    eprintln!("Worker starting — delta interval: {delta_interval}s (0 = webhook-only)");
 
     let worker = bsmcp_worker::IndexWorker::new(bs_client, db, index_db);
     let handle = worker.spawn(delta_interval, Some(semantic_db));

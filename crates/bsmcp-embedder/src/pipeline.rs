@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fastembed::{
-    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, RerankInitOptions,
-    RerankerModel, TextEmbedding, TextRerank, TokenizerFiles, UserDefinedEmbeddingModel,
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, RerankInitOptions, RerankerModel,
+    TextEmbedding, TextRerank, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 
 use bsmcp_common::acl::{build_role_context, reconcile_all_pages, resolve_page_acl, RoleContext};
@@ -69,8 +69,7 @@ impl EmbedModel {
             let options = InitOptions::new(builtin)
                 .with_cache_dir(cache_dir.into())
                 .with_show_download_progress(true);
-            TextEmbedding::try_new(options)
-                .map_err(|e| format!("Model init failed: {e}"))?
+            TextEmbedding::try_new(options).map_err(|e| format!("Model init failed: {e}"))?
         } else {
             // Custom model: download from HuggingFace and load via UserDefinedEmbeddingModel
             let downloaded = download_hf_model(config.hf_repo, cache_dir)?;
@@ -91,7 +90,10 @@ impl EmbedModel {
 
     /// Embed a batch of texts. Thread-safe (locks internally).
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        let mut m = self.model.lock().map_err(|e| format!("Model lock poisoned: {e}"))?;
+        let mut m = self
+            .model
+            .lock()
+            .map_err(|e| format!("Model lock poisoned: {e}"))?;
         m.embed(texts, None).map_err(|e| format!("{e}"))
     }
 }
@@ -133,8 +135,8 @@ impl RerankModel {
         let options = RerankInitOptions::new(reranker)
             .with_cache_dir(cache_dir.into())
             .with_show_download_progress(true);
-        let model = TextRerank::try_new(options)
-            .map_err(|e| format!("Reranker model init failed: {e}"))?;
+        let model =
+            TextRerank::try_new(options).map_err(|e| format!("Reranker model init failed: {e}"))?;
 
         eprintln!("Reranker loaded: {model_name}");
         Ok(Self {
@@ -198,15 +200,15 @@ fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<DownloadedModel, 
     let repo = api.model(repo_id.to_string());
 
     let get = |filename: &str| -> Result<PathBuf, String> {
-        let path = repo.get(filename)
+        let path = repo
+            .get(filename)
             .map_err(|e| format!("Failed to download {filename}: {e}"))?;
         eprintln!("  cached: {}", path.display());
         Ok(path)
     };
 
     // Try onnx/model.onnx first (onnx-community layout), fall back to model.onnx
-    let onnx_path = get("onnx/model.onnx")
-        .or_else(|_| get("model.onnx"))?;
+    let onnx_path = get("onnx/model.onnx").or_else(|_| get("model.onnx"))?;
 
     // External weights (optional)
     let onnx_data_path = get("onnx/model.onnx_data")
@@ -232,8 +234,7 @@ fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<DownloadedModel, 
 /// Load a custom ONNX model from downloaded file paths.
 fn load_custom_model(downloaded: &DownloadedModel) -> Result<TextEmbedding, String> {
     let read = |path: &Path| -> Result<Vec<u8>, String> {
-        std::fs::read(path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))
+        std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))
     };
 
     let onnx_file = read(&downloaded.onnx_path)?;
@@ -244,8 +245,8 @@ fn load_custom_model(downloaded: &DownloadedModel) -> Result<TextEmbedding, Stri
         tokenizer_config_file: read(&downloaded.tokenizer_config_path)?,
     };
 
-    let mut user_model = UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files)
-        .with_pooling(Pooling::Mean);
+    let mut user_model =
+        UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files).with_pooling(Pooling::Mean);
 
     // Load external weights file if present (EmbeddingGemma uses this)
     if let Some(ref data_path) = downloaded.onnx_data_path {
@@ -272,13 +273,23 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
         };
         let data = list.get("data").and_then(|v| v.as_array());
         let Some(shelves) = data else { break };
-        if shelves.is_empty() { break; }
+        if shelves.is_empty() {
+            break;
+        }
 
         for shelf in shelves {
             let shelf_id = shelf.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-            if shelf_id == 0 { continue; }
-            let shelf_name = shelf.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if shelf_name.is_empty() { continue; }
+            if shelf_id == 0 {
+                continue;
+            }
+            let shelf_name = shelf
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if shelf_name.is_empty() {
+                continue;
+            }
 
             // Fetch shelf detail to get its books
             match client.get_shelf(shelf_id).await {
@@ -298,9 +309,14 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
 
         let total = list.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
         offset += 100;
-        if offset >= total { break; }
+        if offset >= total {
+            break;
+        }
     }
-    eprintln!("Pipeline: shelf lookup built ({} book→shelf mappings)", lookup.len());
+    eprintln!(
+        "Pipeline: shelf lookup built ({} book→shelf mappings)",
+        lookup.len()
+    );
     lookup
 }
 
@@ -342,7 +358,8 @@ pub async fn run_pipeline(
         match reconcile_all_pages(client, db).await {
             Ok((processed, failed)) => {
                 eprintln!("Pipeline: ACL reconcile complete — {processed} ok, {failed} failed");
-                db.update_job_progress(job_id, processed as i64, (processed + failed) as i64).await?;
+                db.update_job_progress(job_id, processed as i64, (processed + failed) as i64)
+                    .await?;
                 return Ok(PipelineResult {
                     succeeded: processed,
                     failed_pages: Vec::new(),
@@ -418,7 +435,8 @@ pub async fn run_pipeline(
     }
 
     let total_pages = all_page_ids.len();
-    db.update_job_progress(job_id, 0, total_pages as i64).await?;
+    db.update_job_progress(job_id, 0, total_pages as i64)
+        .await?;
     eprintln!("Pipeline: found {total_pages} pages to embed");
 
     // Always force re-embed (bypass content hash check).
@@ -440,10 +458,21 @@ pub async fn run_pipeline(
         if matches!(db.should_stop_embed_job(job_id).await, Ok(true)) {
             eprintln!("Pipeline: job {job_id} flipped out of running — aborting at page {i}");
             aborted = true;
-            db.update_job_progress(job_id, i as i64, total_pages as i64).await?;
+            db.update_job_progress(job_id, i as i64, total_pages as i64)
+                .await?;
             break;
         }
-        match embed_single_page(db, embedder, client, *page_id, force, &shelf_lookup, role_ctx.as_ref()).await {
+        match embed_single_page(
+            db,
+            embedder,
+            client,
+            *page_id,
+            force,
+            &shelf_lookup,
+            role_ctx.as_ref(),
+        )
+        .await
+        {
             Ok(()) => {
                 succeeded += 1;
                 consecutive_failures = 0;
@@ -461,13 +490,15 @@ pub async fn run_pipeline(
                         total_pages - i - 1
                     );
                     aborted = true;
-                    db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64).await?;
+                    db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64)
+                        .await?;
                     break;
                 }
             }
         }
 
-        db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64).await?;
+        db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64)
+            .await?;
 
         if delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -505,16 +536,27 @@ async fn embed_single_page(
     let name = page.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = page.get("slug").and_then(|v| v.as_str()).unwrap_or("");
     let book_id = page.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let chapter_id = page.get("chapter_id").and_then(|v| v.as_i64()).filter(|&id| id > 0);
+    let chapter_id = page
+        .get("chapter_id")
+        .and_then(|v| v.as_i64())
+        .filter(|&id| id > 0);
 
     // Extract shelf/book/chapter names for chunk context injection
     let shelf_name = shelf_lookup.get(&book_id).map(|s| s.as_str()).unwrap_or("");
-    let book_name = page.get("book").and_then(|b| b.get("name")).and_then(|v| v.as_str()).unwrap_or("");
-    let chapter_name = page.get("chapter").and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    let book_name = page
+        .get("book")
+        .and_then(|b| b.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let chapter_name = page
+        .get("chapter")
+        .and_then(|c| c.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     // Compute content hash to skip unchanged pages (unless forced)
     let content_hash = {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = Sha256::digest(html.as_bytes());
         hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
@@ -527,7 +569,10 @@ async fn embed_single_page(
         }
     }
 
-    let updated_at = page.get("updated_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let updated_at = page
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let meta = PageMeta {
         page_id,
@@ -551,21 +596,31 @@ async fn embed_single_page(
         db.upsert_page(&meta).await?;
         return Ok(());
     }
-    eprintln!("Pipeline: page {page_id} ({name}) — {n} chunks from {len} bytes",
-        n = chunks.len(), len = html.len());
+    eprintln!(
+        "Pipeline: page {page_id} ({name}) — {n} chunks from {len} bytes",
+        n = chunks.len(),
+        len = html.len()
+    );
 
     // Build context prefix for embedding (shelf > book > chapter > page hierarchy)
     let context_prefix = {
         let mut parts = Vec::new();
-        if !shelf_name.is_empty() { parts.push(shelf_name.to_string()); }
-        if !book_name.is_empty() { parts.push(book_name.to_string()); }
-        if !chapter_name.is_empty() { parts.push(chapter_name.to_string()); }
+        if !shelf_name.is_empty() {
+            parts.push(shelf_name.to_string());
+        }
+        if !book_name.is_empty() {
+            parts.push(book_name.to_string());
+        }
+        if !chapter_name.is_empty() {
+            parts.push(chapter_name.to_string());
+        }
         parts.push(name.to_string());
         format!("[{}]\n\n", parts.join(" > "))
     };
 
     // Prepend context to chunk text for embedding (stored content stays clean for display)
-    let texts: Vec<String> = chunks.iter()
+    let texts: Vec<String> = chunks
+        .iter()
         .map(|c| format!("{context_prefix}{}", c.content))
         .collect();
     let embeddings = embedder.embed(texts).await?;

@@ -53,7 +53,11 @@ pub async fn build_role_context(client: &BookStackClient) -> Result<RoleContext,
     let mut offset = 0i64;
     loop {
         let resp = client.list_roles(100, offset).await?;
-        let data = resp.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let data = resp
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         if data.is_empty() {
             break;
         }
@@ -91,7 +95,10 @@ pub async fn build_role_context(client: &BookStackClient) -> Result<RoleContext,
         all_role_ids.len(),
         view_all_role_ids.len()
     );
-    Ok(RoleContext { all_role_ids, view_all_role_ids })
+    Ok(RoleContext {
+        all_role_ids,
+        view_all_role_ids,
+    })
 }
 
 /// True when the role detail JSON includes any of BookStack's system-level
@@ -104,7 +111,10 @@ fn has_view_all_permission(role: &Value) -> bool {
     };
     for perm in perms {
         if let Some(name) = perm.as_str() {
-            if matches!(name, "page-view-all" | "chapter-view-all" | "book-view-all" | "content-export") {
+            if matches!(
+                name,
+                "page-view-all" | "chapter-view-all" | "book-view-all" | "content-export"
+            ) {
                 return true;
             }
         }
@@ -144,7 +154,10 @@ pub async fn resolve_page_acl(
 
     // Chapter-level override?
     if let Some(cid) = chapter_id {
-        if let Ok(cp) = client.get_content_permissions(ContentType::Chapter, cid).await {
+        if let Ok(cp) = client
+            .get_content_permissions(ContentType::Chapter, cid)
+            .await
+        {
             if !is_inheriting(&cp) {
                 return Ok(PageAcl {
                     page_id,
@@ -157,7 +170,10 @@ pub async fn resolve_page_acl(
     }
 
     // Book-level override?
-    if let Ok(bp) = client.get_content_permissions(ContentType::Book, book_id).await {
+    if let Ok(bp) = client
+        .get_content_permissions(ContentType::Book, book_id)
+        .await
+    {
         if !is_inheriting(&bp) {
             return Ok(PageAcl {
                 page_id,

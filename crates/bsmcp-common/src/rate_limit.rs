@@ -151,11 +151,7 @@ pub fn shared() -> RateLimiter {
 /// `None` for HTTP-date forms (RFC 7231 allows them but BookStack/Laravel
 /// emits integer seconds in practice).
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]
