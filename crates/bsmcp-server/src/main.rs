@@ -216,10 +216,10 @@ async fn main() {
     // every tools/call response so an AI session knows the local clock
     // without re-deriving the conversion on every turn.
     let timezone = Arc::new(TimezoneConfig::from_env());
-    eprintln!(
-        "Timezone: {} (source={})",
-        timezone.name,
-        timezone.source.as_str()
+    tracing::info!(
+        timezone = %timezone.name,
+        source = %timezone.source.as_str(),
+        "timezone_resolved"
     );
 
     let state = sse::AppState::new(

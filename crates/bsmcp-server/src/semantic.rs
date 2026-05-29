@@ -956,7 +956,11 @@ impl SemanticState {
                         }
                     }
                     Err(e) => {
-                        eprintln!("resolve_scope: list_indexed_books_by_shelf({sid}) failed: {e}");
+                        tracing::warn!(
+                            shelf_id = sid,
+                            error = %e,
+                            "resolve_scope_shelf_lookup_failed"
+                        );
                     }
                 }
             }
@@ -1062,7 +1066,11 @@ impl SemanticState {
                 .cloned()
                 .unwrap_or_default(),
             Err(e) => {
-                eprintln!("Cascade stage 2: keyword search failed (non-fatal): {e}");
+                tracing::warn!(
+                    stage = 2,
+                    error = %e,
+                    "cascade_keyword_search_failed_non_fatal"
+                );
                 Vec::new()
             }
         };
