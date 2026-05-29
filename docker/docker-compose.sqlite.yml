@@ -4,7 +4,7 @@
 
 services:
   bsmcp-server:
-    image: ghcr.io/bees-roadhouse/bsmcp-server:0.7.0
+    image: ghcr.io/bees-roadhouse/bsmcp-server:dev
     volumes:
       - bsmcp-data:/data
     environment:
@@ -21,15 +21,20 @@ services:
       BSMCP_SEMANTIC_SEARCH: ${BSMCP_SEMANTIC_SEARCH:-true}
       BSMCP_EMBEDDER_URL: ${BSMCP_EMBEDDER_URL:-http://bsmcp-embedder:8081}
       BSMCP_WEBHOOK_SECRET: ${BSMCP_WEBHOOK_SECRET}
+      BSMCP_ACCESS_TOKEN_TTL: ${BSMCP_ACCESS_TOKEN_TTL:-2592000}
+      BSMCP_REFRESH_TOKEN_TTL: ${BSMCP_REFRESH_TOKEN_TTL:-7776000}
       BSMCP_BACKUP_INTERVAL: ${BSMCP_BACKUP_INTERVAL:-24}
       BSMCP_BACKUP_PATH: /data/backups
+      BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN: ${BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN:-180}
+      BSMCP_DEFAULT_TIMEZONE: ${BSMCP_DEFAULT_TIMEZONE:-}
+      BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
     ports:
       - "${BSMCP_PORT:-8080}:${BSMCP_PORT:-8080}"
 
   bsmcp-embedder:
-    image: ghcr.io/bees-roadhouse/bsmcp-embedder:0.7.0
+    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
     cpus: ${BSMCP_EMBED_CPUS:-0}
     volumes:
       - bsmcp-data:/data
@@ -42,7 +47,11 @@ services:
       BSMCP_EMBED_TOKEN_ID: ${BSMCP_EMBED_TOKEN_ID}
       BSMCP_EMBED_TOKEN_SECRET: ${BSMCP_EMBED_TOKEN_SECRET}
       BSMCP_MODEL_PATH: /data/models
+      BSMCP_EMBED_PROVIDER: ${BSMCP_EMBED_PROVIDER:-local}
       BSMCP_EMBED_MODEL: ${BSMCP_EMBED_MODEL:-BAAI/bge-base-en-v1.5}
+      BSMCP_EMBED_API_KEY: ${BSMCP_EMBED_API_KEY:-}
+      BSMCP_EMBED_API_URL: ${BSMCP_EMBED_API_URL:-}
+      BSMCP_EMBED_DIMS: ${BSMCP_EMBED_DIMS:-}
       BSMCP_EMBED_BATCH_SIZE: ${BSMCP_EMBED_BATCH_SIZE:-32}
       BSMCP_EMBED_DELAY_MS: ${BSMCP_EMBED_DELAY_MS:-50}
       BSMCP_EMBED_ON_STARTUP: ${BSMCP_EMBED_ON_STARTUP:-false}
@@ -52,6 +61,13 @@ services:
       BSMCP_EMBED_CONSECUTIVE_ABORT: ${BSMCP_EMBED_CONSECUTIVE_ABORT:-10}
       BSMCP_EMBED_HOST: ${BSMCP_EMBED_HOST:-0.0.0.0}
       BSMCP_EMBED_PORT: ${BSMCP_EMBED_PORT:-8081}
+      # Cross-encoder reranker (powers semantic_search mode=rerank|precision).
+      # Provider: local (in-process ONNX via fastembed) | voyage | openai-compatible | none.
+      BSMCP_RERANK_PROVIDER: ${BSMCP_RERANK_PROVIDER:-none}
+      BSMCP_RERANK_MODEL: ${BSMCP_RERANK_MODEL:-}
+      BSMCP_RERANK_API_KEY: ${BSMCP_RERANK_API_KEY:-}
+      BSMCP_RERANK_API_URL: ${BSMCP_RERANK_API_URL:-}
+      BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
 
@@ -59,7 +75,7 @@ services:
   # SQLite file as the server (single writer at a time; the worker and
   # server coordinate via the queue's per-job claim row).
   bsmcp-worker:
-    image: ghcr.io/bees-roadhouse/bsmcp-worker:0.7.3
+    image: ghcr.io/bees-roadhouse/bsmcp-worker:dev
     volumes:
       - bsmcp-data:/data
     environment:
@@ -70,6 +86,12 @@ services:
       BSMCP_INDEX_TOKEN_ID: ${BSMCP_INDEX_TOKEN_ID:-${BSMCP_EMBED_TOKEN_ID:-}}
       BSMCP_INDEX_TOKEN_SECRET: ${BSMCP_INDEX_TOKEN_SECRET:-${BSMCP_EMBED_TOKEN_SECRET:-}}
       BSMCP_INDEX_DELTA_INTERVAL_SECONDS: ${BSMCP_INDEX_DELTA_INTERVAL_SECONDS:-300}
+      # Job lifecycle housekeeper (applies to both index_jobs + embed_jobs).
+      BSMCP_JOB_TIMEOUT_SECS: ${BSMCP_JOB_TIMEOUT_SECS:-3600}
+      BSMCP_JOB_RECONCILE_SECS: ${BSMCP_JOB_RECONCILE_SECS:-300}
+      BSMCP_JOB_MAX_RETRY_CHAIN: ${BSMCP_JOB_MAX_RETRY_CHAIN:-5}
+      BSMCP_JOB_CLOSE_GRACE_SECS: ${BSMCP_JOB_CLOSE_GRACE_SECS:-30}
+      BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
 
