@@ -87,10 +87,11 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts three containers:
+This starts four containers:
 - **bsmcp-postgres** — PostgreSQL 17 with pgvector extension
 - **bsmcp-server** — MCP server (port 8080)
-- **bsmcp-embedder** — Background embedding service
+- **bsmcp-embedder** — Background embedding service (also serves `/rerank` when a reranker is configured)
+- **bsmcp-worker** — Reconciliation worker: initial walk on cold start, webhook + cron job consumption, periodic delta walk
 
 ### Quick Start (SQLite — simple)
 
@@ -101,7 +102,7 @@ cp .env.example .env
 docker compose -f docker/docker-compose.sqlite.yml up -d
 ```
 
-This starts two containers sharing a SQLite database file.
+This starts three containers (server + embedder + worker) sharing a SQLite database file.
 
 ### Run from source
 
@@ -141,6 +142,7 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
+| `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` | No | `180` | Per-process BookStack API request cap. Lower if multiple processes share a token and you see 429s. |
 
 #### Embedder Variables
 
@@ -148,7 +150,7 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 |----------|----------|---------|-------------|
 | `BSMCP_EMBED_TOKEN_ID` | Yes | - | BookStack API token ID for crawling |
 | `BSMCP_EMBED_TOKEN_SECRET` | Yes | - | BookStack API token secret |
-| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local`, `ollama`, `openai`, `voyage` |
+| `BSMCP_EMBED_PROVIDER` | No | `local` | Embedding backend: `local` (fastembed ONNX), `ollama`, `openai` (or OpenAI-compatible), `voyage`. See [Embedding Providers](#embedding-providers) for per-provider config. |
 | `BSMCP_EMBED_MODEL` | No | (per provider) | Model name (see [Embedding Providers](#embedding-providers)) |
 | `BSMCP_EMBED_API_KEY` | If openai | - | API key for OpenAI embedding provider |
 | `BSMCP_EMBED_API_URL` | No | (per provider) | Base URL for Ollama or OpenAI-compatible endpoint |
@@ -160,12 +162,42 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_EMBED_DELAY_MS` | No | `50` | Delay between pages (API throttle) |
 | `BSMCP_EMBED_POLL_INTERVAL` | No | `5` | Seconds between job queue polls |
 | `BSMCP_EMBED_ON_STARTUP` | No | `false` | `true` = auto-embed on startup, `clean` = clear all embeddings first |
+| `BSMCP_EMBED_FAILURE_THRESHOLD` | No | `10` | Failed pages before a job is marked failed |
+| `BSMCP_EMBED_CONSECUTIVE_ABORT` | No | `10` | Consecutive failures before a job aborts early |
 | `BSMCP_EMBED_HOST` | No | `0.0.0.0` | Embedder listen address |
 | `BSMCP_EMBED_PORT` | No | `8081` | Embedder listen port |
-| `BSMCP_RERANK_PROVIDER` | No | (unset) | Cross-encoder rerank provider: `local`, `voyage`, `openai`, `none`. Off by default; enables `POST /rerank` on the embedder. |
+| `BSMCP_RERANK_PROVIDER` | No | (unset) | Cross-encoder rerank provider: `local`, `voyage`, `openai`, `none`. Off by default; enables `POST /rerank` on the embedder. See [Reranker Providers](#reranker-providers). |
 | `BSMCP_RERANK_MODEL` | If reranker on | (per provider) | Reranker model. Defaults: `BAAI/bge-reranker-v2-m3` (local), `rerank-2` (voyage). Required for `openai`. |
 | `BSMCP_RERANK_API_KEY` | If voyage/openai | - | API key for external rerank provider. |
 | `BSMCP_RERANK_API_URL` | If openai | (per provider) | Base URL. Voyage defaults to `https://api.voyageai.com`; openai requires explicit URL. |
+
+#### Worker Variables
+
+Read by `bsmcp-worker` (the reconciliation worker container). The worker shares the same database as the server and owns the `index_jobs` queue.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BSMCP_BOOKSTACK_URL` | Yes | - | Same as server |
+| `BSMCP_ENCRYPTION_KEY` | Yes | - | Must match the server's (the DB layer initializes its encryption context on every connection) |
+| `BSMCP_INDEX_TOKEN_ID` | Yes* | - | Admin BookStack API token ID for the worker. Falls back to `BSMCP_EMBED_TOKEN_ID` if unset, so single-token deployments don't have to duplicate creds. |
+| `BSMCP_INDEX_TOKEN_SECRET` | Yes* | - | Admin BookStack API token secret. Falls back to `BSMCP_EMBED_TOKEN_SECRET`. |
+| `BSMCP_DB_BACKEND` | No | `sqlite` | Must match the server's (shared DB) |
+| `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite path |
+| `BSMCP_DATABASE_URL` | If postgres | - | PostgreSQL connection string |
+| `BSMCP_INDEX_DELTA_INTERVAL_SECONDS` | No | `300` | Cadence of the periodic delta walk. `0` = disable the delta walk (webhook-driven only). |
+
+\* Required, but the fallback to `BSMCP_EMBED_TOKEN_*` covers most setups.
+
+#### Job Lifecycle Variables
+
+Read by `bsmcp-worker`'s lifecycle housekeeper. Apply to both `embed_jobs` and `index_jobs`.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BSMCP_JOB_TIMEOUT_SECS` | No | `3600` | Hard timeout — any job running longer than this is failed. |
+| `BSMCP_JOB_RECONCILE_SECS` | No | `300` | Reconciler poll interval (scan for failed jobs and retry them). |
+| `BSMCP_JOB_MAX_RETRY_CHAIN` | No | `5` | Max retry-chain length before a job is given up on. |
+| `BSMCP_JOB_CLOSE_GRACE_SECS` | No | `30` | Audit-grace before succeeded/cancelled jobs are archived to closed status. |
 
 See `.env.example` for the full list with comments.
 
@@ -201,6 +233,19 @@ X-Webhook-Secret: YOUR_WEBHOOK_SECRET
 The `YOUR_WEBHOOK_SECRET` value must match `BSMCP_WEBHOOK_SECRET` in your server environment. The server uses constant-time comparison to verify the header.
 
 After saving, any page create/update/delete in BookStack automatically queues a re-embedding job. The embedder picks it up within seconds (configurable via `BSMCP_EMBED_POLL_INTERVAL`).
+
+### Reranker Setup (optional — for `rerank` / `precision` modes)
+
+The cross-encoder reranker is off by default. `semantic_search` falls through to `mode: "standard"` (vector + keyword + Markov-blanket blend) without it. To enable `mode: "rerank"` or `mode: "precision"`:
+
+1. Pick a provider and set `BSMCP_RERANK_PROVIDER` on the **embedder** to one of:
+   - **`local`** — in-process ONNX cross-encoder via fastembed. No API key. Default model: `BAAI/bge-reranker-v2-m3` (~600 MB, downloads on first run). Reuses `BSMCP_MODEL_PATH` for the cache directory.
+   - **`voyage`** — Voyage AI's `/v1/rerank`. Set `BSMCP_RERANK_API_KEY`. Default model: `rerank-2`.
+   - **`openai`** — any OpenAI-shape `/v1/rerank` endpoint (Voyage, Jina, Cohere-via-shim, self-hosted). Requires all of `BSMCP_RERANK_API_KEY`, `BSMCP_RERANK_API_URL`, and `BSMCP_RERANK_MODEL` (no upstream default — OpenAI itself has not shipped a rerank API).
+2. Restart the embedder. On startup it logs `Reranker: <provider> <model>` and starts answering `POST /rerank`. Without configuration it logs `Reranker: disabled (BSMCP_RERANK_PROVIDER unset or 'none')` and `/rerank` returns 503.
+3. Call `semantic_search` with `mode: "rerank"` (refinement on top of the standard pool) or `mode: "precision"` (wider pool, cross-encoder is the ranker of record). The response includes `scoring.rerank` per result and `stats.{rerank_ms, rerank_provider, rerank_model, candidates_reranked}`. If the reranker is disabled, the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop back to `mode: "standard"`.
+
+Per-provider config blocks are documented under [Reranker Providers](#reranker-providers).
 
 ## Connecting
 
@@ -267,9 +312,17 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 (this release) adds the optional cross-encoder reranker. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
+> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 added the optional cross-encoder reranker. v0.12.x (current) is CI/build only — no user-facing behavior change (v0.12.0 = CI rework + semantic refinements; v0.12.1 = fixes the aarch64-linux release binary, adds the cargo fmt gate). Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
-### From v0.10.0 to v0.11.0 (this release)
+### From v0.11.0 to v0.12.x (current)
+
+#### What's automatic
+- No schema, env-var, or API surface changes. Pull new images, restart.
+
+#### What you must do
+- Nothing required. v0.12.1 is the recommended pull because it's the first release with all five native `bsmcp-server` binaries attached (`aarch64-unknown-linux-gnu` was missing from v0.11.0 and v0.12.0 due to a cross-build issue, now fixed).
+
+### From v0.10.0 to v0.11.0
 
 #### What's new
 
@@ -692,6 +745,60 @@ BSMCP_EMBED_MODEL=text-embedding-3-small   # default
 BSMCP_EMBED_API_KEY=sk-...
 BSMCP_EMBED_DIMS=1536                      # must match model output
 BSMCP_EMBED_API_URL=https://api.openai.com # or any compatible endpoint
+```
+
+### Voyage
+
+Uses Voyage AI's embedding API.
+
+```bash
+BSMCP_EMBED_PROVIDER=voyage
+BSMCP_EMBED_MODEL=voyage-3-lite            # default
+BSMCP_EMBED_API_KEY=pa-...
+BSMCP_EMBED_DIMS=512                       # must match model output (voyage-3-lite = 512)
+BSMCP_EMBED_API_URL=https://api.voyageai.com  # default
+```
+
+## Reranker Providers
+
+Set via `BSMCP_RERANK_PROVIDER` on the **embedder**. Off by default. See [Reranker Setup](#reranker-setup-optional--for-rerank--precision-modes) for the activation walkthrough.
+
+### Local (default model: `BAAI/bge-reranker-v2-m3`)
+
+In-process ONNX cross-encoder via fastembed. No external API needed. Downloads the model to `BSMCP_MODEL_PATH` on first run.
+
+| Model Name | Notes |
+|------------|-------|
+| `BAAI/bge-reranker-base` | Smaller, faster |
+| `BAAI/bge-reranker-v2-m3` | **Default.** Multilingual, strong quality. |
+| `jinaai/jina-reranker-v1-turbo-en` | English-only, optimized for latency |
+| `jinaai/jina-reranker-v2-base-multilingual` | Multilingual alternative to bge-v2-m3 |
+
+```bash
+BSMCP_RERANK_PROVIDER=local
+BSMCP_RERANK_MODEL=BAAI/bge-reranker-v2-m3   # default; reuses BSMCP_MODEL_PATH
+```
+
+### Voyage
+
+Uses Voyage AI's `/v1/rerank` endpoint.
+
+```bash
+BSMCP_RERANK_PROVIDER=voyage
+BSMCP_RERANK_MODEL=rerank-2                # default
+BSMCP_RERANK_API_KEY=pa-...
+BSMCP_RERANK_API_URL=https://api.voyageai.com   # default
+```
+
+### OpenAI-compatible (Voyage / Jina / Cohere via shim / self-hosted)
+
+Any endpoint that accepts `{model, query, documents}` and returns `{data:[{index, relevance_score}]}` (or `{results:[...]}`). OpenAI itself has not shipped a rerank API — this provider is for compatible third parties. All three vars required (no upstream default).
+
+```bash
+BSMCP_RERANK_PROVIDER=openai
+BSMCP_RERANK_MODEL=jina-reranker-v2-base-multilingual
+BSMCP_RERANK_API_KEY=...
+BSMCP_RERANK_API_URL=https://api.jina.ai
 ```
 
 ## Search Operators
