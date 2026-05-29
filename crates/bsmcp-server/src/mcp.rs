@@ -7,6 +7,7 @@ use pulldown_cmark::{html, Options, Parser};
 
 use crate::semantic::{trim_match, SearchMode, SemanticState};
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::time::TimezoneConfig;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -15,6 +16,7 @@ pub async fn handle_request(
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
     staging: &crate::staging::StagingStore,
+    tz: &TimezoneConfig,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -58,13 +60,22 @@ pub async fn handle_request(
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let result = execute_tool(name, &args, client, semantic, staging).await;
 
+            // Every tools/call result carries `_meta.time` (issue #67) so a
+            // session can reason about "today / yesterday / this morning"
+            // without re-deriving the conversion on every turn. Field names
+            // match the pre-#79 `meta.briefing.time` shape so any consumer
+            // reading that path adopts with a one-key change.
+            let meta = json!({ "time": tz.time_block() });
+
             let tool_result = match result {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
+                    "_meta": meta,
                 }),
                 Err(e) => json!({
                     "content": [{ "type": "text", "text": format!("Error: {e}") }],
                     "isError": true,
+                    "_meta": meta,
                 }),
             };
 

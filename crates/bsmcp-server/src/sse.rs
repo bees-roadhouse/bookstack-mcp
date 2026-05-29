@@ -18,6 +18,7 @@ use zeroize::Zeroize;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::DbBackend;
+use bsmcp_common::time::TimezoneConfig;
 
 use crate::mcp;
 use crate::oauth::{AuthCode, AUTH_CODE_TTL};
@@ -49,6 +50,9 @@ pub struct AppState {
     /// stub errors per #36). Webhook handler enqueues page:{id} index jobs
     /// here when BookStack page events arrive.
     pub index_db: Arc<dyn bsmcp_common::db::IndexDb>,
+    /// Resolved at startup (`BSMCP_DEFAULT_TIMEZONE` → `TZ` → UTC). Used
+    /// to build `_meta.time` on every tools/call response (issue #67).
+    pub timezone: Arc<TimezoneConfig>,
 }
 
 pub(crate) struct RateLimit {
@@ -105,6 +109,7 @@ impl AppState {
         backup_interval_hours: Option<u64>,
         backup_path: PathBuf,
         semantic: Option<Arc<SemanticState>>,
+        timezone: Arc<TimezoneConfig>,
     ) -> Self {
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -128,6 +133,7 @@ impl AppState {
             staging: crate::staging::new_staging_store(),
             settings_sessions: crate::settings_ui::new_settings_store(),
             index_db,
+            timezone,
         }
     }
 
@@ -432,7 +438,8 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
-    let response = mcp::handle_request(&request, &client, semantic, &state.staging).await;
+    let response =
+        mcp::handle_request(&request, &client, semantic, &state.staging, &state.timezone).await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -525,7 +532,8 @@ pub async fn handle_streamable(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
-    let response = mcp::handle_request(&request, &client, semantic, &state.staging).await;
+    let response =
+        mcp::handle_request(&request, &client, semantic, &state.staging, &state.timezone).await;
 
     match response {
         Some(resp) => {

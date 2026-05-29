@@ -20,6 +20,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use bsmcp_common::config::DbBackendType;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::time::TimezoneConfig;
 
 #[tokio::main]
 async fn main() {
@@ -206,6 +207,17 @@ async fn main() {
     // worker process polls + executes those jobs against the same DB.
     // See crates/bsmcp-worker.
 
+    // Resolve the default timezone once at startup (issue #67):
+    // `BSMCP_DEFAULT_TIMEZONE` → `TZ` → UTC. Surfaced via `_meta.time` on
+    // every tools/call response so an AI session knows the local clock
+    // without re-deriving the conversion on every turn.
+    let timezone = Arc::new(TimezoneConfig::from_env());
+    eprintln!(
+        "Timezone: {} (source={})",
+        timezone.name,
+        timezone.source.as_str()
+    );
+
     let state = sse::AppState::new(
         bookstack_url,
         db,
@@ -214,6 +226,7 @@ async fn main() {
         backup_interval_hours,
         backup_path,
         semantic,
+        timezone,
     );
     state.spawn_cleanup();
     state.spawn_backup();

@@ -12,6 +12,11 @@ reqwest = { version = "0.12", features = ["json", "multipart"] }
 tokio = { version = "1", features = ["fs", "sync", "time"] }
 url = "2"
 zeroize = "1"
+# Time block on every tools/call response (issue #67). chrono-tz brings the
+# IANA database so `BSMCP_DEFAULT_TIMEZONE=America/New_York` parses and
+# `now_local`/`now_human` format with the right offset + zone abbreviation.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time", "sync", "test-util"] }
