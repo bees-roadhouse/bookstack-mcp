@@ -40,7 +40,6 @@ use serde_json::Value;
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::GlobalSettings;
 
 const DEFAULT_RECONCILE_SECS: u64 = 300;
 const DEFAULT_TIMEOUT_SECS: i64 = 3600;
@@ -354,17 +353,38 @@ impl IndexWorker {
         }
     }
 
-    /// Initial full walk — every shelf in globals → books → chapters →
+    /// Initial full walk — every shelf in scope → books → chapters →
     /// pages. Also handles pages loose at the book root (no chapter).
     /// Sets `index_meta.last_full_walk_at` on success.
+    ///
+    /// Issue #119: scope is `globals.indexed_shelves` if non-empty; otherwise
+    /// the worker enumerates every shelf the token can see via
+    /// `BookStackClient::list_all_shelves` and walks all of them. The old
+    /// `[hive_shelf_id, user_journals_shelf_id]` fields are gone — on a fresh
+    /// deployment with no settings configured, semantic search now sees the
+    /// whole instance instead of no-op'ing.
     async fn walk_all(&self, job_id: i64) -> Result<(), String> {
         let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let shelves: Vec<i64> = [globals.hive_shelf_id, globals.user_journals_shelf_id]
-            .into_iter()
-            .flatten()
-            .collect();
+        let shelves: Vec<i64> = if globals.indexed_shelves.is_empty() {
+            match self.bs_client.list_all_shelves().await {
+                Ok(all) => {
+                    tracing::info!(shelf_count = all.len(), "indexworker_full_walk_all_shelves");
+                    all
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "indexworker_full_walk_list_shelves_failed");
+                    return Err(format!("list_all_shelves: {e}"));
+                }
+            }
+        } else {
+            tracing::info!(
+                shelf_count = globals.indexed_shelves.len(),
+                "indexworker_full_walk_configured_shelves"
+            );
+            globals.indexed_shelves.clone()
+        };
         if shelves.is_empty() {
-            tracing::warn!("indexworker_full_walk_no_shelves");
+            tracing::warn!("indexworker_full_walk_no_shelves_visible");
             self.stamp_full_walk_done().await?;
             return Ok(());
         }
@@ -379,7 +399,7 @@ impl IndexWorker {
                 tracing::info!(job_id, walk = "all", "indexworker_walk_stopped");
                 return Ok(());
             }
-            match self.walk_shelf(shelf_id, &globals, job_id).await {
+            match self.walk_shelf(shelf_id, job_id).await {
                 Ok(n) => total_pages += n,
                 Err(e) => tracing::error!(shelf_id, error = %e, "indexworker_walk_shelf_failed"),
             }
@@ -472,20 +492,13 @@ impl IndexWorker {
         Ok(())
     }
 
-    async fn walk_shelf(
-        &self,
-        shelf_id: i64,
-        globals: &GlobalSettings,
-        job_id: i64,
-    ) -> Result<usize, String> {
+    async fn walk_shelf(&self, shelf_id: i64, job_id: i64) -> Result<usize, String> {
         let shelf = self.bs_client.get_shelf(shelf_id).await?;
         let name = string_field(&shelf, "name");
         let slug = string_field(&shelf, "slug");
-        let shelf_kind = classify_shelf(
-            shelf_id,
-            globals.hive_shelf_id,
-            globals.user_journals_shelf_id,
-        );
+        // Issue #119: every shelf is `Unclassified` now — see `classify_shelf`
+        // for why the helper survives as a constant.
+        let shelf_kind = classify_shelf(shelf_id);
         self.index_db
             .upsert_indexed_shelf(&IndexedShelf {
                 shelf_id,
@@ -786,24 +799,28 @@ impl IndexWorker {
             .await
     }
 
-    /// Single-book reconcile keyed off book id. When a configured global
-    /// shelf claims this book and that shelf isn't in the index yet,
-    /// cascades a `shelf:{id}` job and fails retryably. Otherwise upserts
-    /// the book row (and the manifest-derived identity_ouid for Identity
-    /// books). Descendants are not touched — the full walk or their own
-    /// per-id jobs handle that.
+    /// Single-book reconcile keyed off book id. When a configured indexed
+    /// shelf claims this book and that shelf isn't in the index yet, cascades
+    /// a `shelf:{id}` job and fails retryably. Otherwise upserts the book
+    /// row. Descendants are not touched — the full walk or their own per-id
+    /// jobs handle that.
+    ///
+    /// Issue #119: parent-shelf attribution probes
+    /// `globals.indexed_shelves` when non-empty, otherwise falls back to the
+    /// full shelf list. Same best-effort shape as before — BookStack's
+    /// `/api/books/{id}` doesn't return the parent shelf, so we probe.
     async fn reconcile_book(&self, book_id: i64) -> Result<(), String> {
         let book = self.bs_client.get_book(book_id).await?;
-        // Best-effort shelf attribution: BookStack's `/api/books/{id}` does
-        // not return the parent shelf, so we probe each globally-configured
-        // shelf for this book id. If neither contains it (or globals are
-        // empty), the book is reconciled with shelf_id=None — the same
-        // shape `walk_book` uses when it can't classify a parent.
         let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let candidate_shelves: Vec<i64> = [globals.hive_shelf_id, globals.user_journals_shelf_id]
-            .into_iter()
-            .flatten()
-            .collect();
+        let candidate_shelves: Vec<i64> = if globals.indexed_shelves.is_empty() {
+            // Configured to walk all — probe every visible shelf. Larger
+            // probe than v0.12.x's two-shelf shape, but the cascade-on-miss
+            // path is rare (only fires on a webhook reaching us before the
+            // initial walk landed the parent).
+            self.bs_client.list_all_shelves().await.unwrap_or_default()
+        } else {
+            globals.indexed_shelves.clone()
+        };
         let mut shelf_id: Option<i64> = None;
         for sid in &candidate_shelves {
             let shelf = match self.bs_client.get_shelf(*sid).await {
@@ -845,11 +862,7 @@ impl IndexWorker {
             }
         }
 
-        let shelf_kind = classify_shelf(
-            shelf_id.unwrap_or(0),
-            globals.hive_shelf_id,
-            globals.user_journals_shelf_id,
-        );
+        let shelf_kind = classify_shelf(shelf_id.unwrap_or(0));
         let name = string_field(&book, "name");
         let slug = string_field(&book, "slug");
         let book_kind = classify_book(&name, shelf_kind);
@@ -876,12 +889,7 @@ impl IndexWorker {
     /// chain — no parent to check. Upserts only the shelf row.
     async fn reconcile_shelf(&self, shelf_id: i64) -> Result<(), String> {
         let shelf = self.bs_client.get_shelf(shelf_id).await?;
-        let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let shelf_kind = classify_shelf(
-            shelf_id,
-            globals.hive_shelf_id,
-            globals.user_journals_shelf_id,
-        );
+        let shelf_kind = classify_shelf(shelf_id);
         self.index_db
             .upsert_indexed_shelf(&IndexedShelf {
                 shelf_id,

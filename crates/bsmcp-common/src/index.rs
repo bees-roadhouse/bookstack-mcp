@@ -312,19 +312,23 @@ pub struct IndexJob {
 // to compute (kind, key, archive_year) for each item. Test-friendly,
 // branch-coverable, no mocks needed.
 
-/// Classify a shelf by id against the globally-configured shelf IDs.
-pub fn classify_shelf(
-    shelf_id: i64,
-    hive_shelf_id: Option<i64>,
-    user_journals_shelf_id: Option<i64>,
-) -> ShelfKind {
-    if Some(shelf_id) == hive_shelf_id {
-        ShelfKind::Hive
-    } else if Some(shelf_id) == user_journals_shelf_id {
-        ShelfKind::UserJournals
-    } else {
-        ShelfKind::Unclassified
-    }
+/// Classify a shelf by id.
+///
+/// Issue #119 (v0.13.0): with the generic `indexed_shelves` model, the
+/// indexer no longer distinguishes "hive shelf" from "user journals shelf".
+/// Every shelf the worker walks is now [`ShelfKind::Unclassified`], so this
+/// helper is a constant — kept as a single call site (rather than inlined
+/// at every walk path) for grep-ability and to make the future "we again
+/// care about shelf roles" reintroduction cheap.
+///
+/// The downstream [`ShelfKind::Hive`] / [`ShelfKind::UserJournals`] arms in
+/// [`classify_book`] / [`classify_chapter`] / [`classify_page`] remain on
+/// the structs for serde back-compat with pre-#119 indexed rows; they're
+/// effectively dead code post-#119 because no shelf classifies into them
+/// anymore. They will get pruned in a follow-up cleanup once any lingering
+/// rows have been re-walked.
+pub fn classify_shelf(_shelf_id: i64) -> ShelfKind {
+    ShelfKind::Unclassified
 }
 
 /// Classify a book by its name and the kind of shelf it lives on.
@@ -514,18 +518,14 @@ fn match_iso_date(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Issue #119 — post-refactor every shelf is `Unclassified`. The Hive /
+    /// UserJournals variants survive on the enum for back-compat with rows
+    /// already in the index but the classifier no longer produces them.
     #[test]
-    fn shelf_classification() {
-        assert_eq!(classify_shelf(927, Some(927), Some(2023)), ShelfKind::Hive);
-        assert_eq!(
-            classify_shelf(2023, Some(927), Some(2023)),
-            ShelfKind::UserJournals
-        );
-        assert_eq!(
-            classify_shelf(99, Some(927), Some(2023)),
-            ShelfKind::Unclassified
-        );
-        assert_eq!(classify_shelf(927, None, None), ShelfKind::Unclassified);
+    fn shelf_classification_is_always_unclassified() {
+        assert_eq!(classify_shelf(927), ShelfKind::Unclassified);
+        assert_eq!(classify_shelf(2023), ShelfKind::Unclassified);
+        assert_eq!(classify_shelf(0), ShelfKind::Unclassified);
     }
 
     #[test]
