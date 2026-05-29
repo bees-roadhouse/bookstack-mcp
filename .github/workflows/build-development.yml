@@ -62,9 +62,6 @@ jobs:
           - image: bsmcp-embedder
             dockerfile: docker/Dockerfile.embedder
             scope: embedder
-          - image: bsmcp-worker
-            dockerfile: docker/Dockerfile.worker
-            scope: worker
     steps:
       - uses: actions/checkout@v4
 

@@ -74,11 +74,19 @@ services:
   # Reconciliation worker — owns the index_jobs queue. Shares the same
   # SQLite file as the server (single writer at a time; the worker and
   # server coordinate via the queue's per-job claim row).
+  #
+  # v0.13.0: this is the SAME image as bsmcp-embedder, selected into
+  # worker mode via `--role=worker` (CLI flag) and BSMCP_ROLE env (belt
+  # + suspenders). bsmcp-worker:<tag> is published as a registry alias
+  # of bsmcp-embedder:<tag> for one release only — switch the `image:`
+  # line during the v0.13.x window. Alias removed in v0.14.0.
   bsmcp-worker:
-    image: ghcr.io/bees-roadhouse/bsmcp-worker:dev
+    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
+    command: ["bsmcp-embedder", "--role=worker"]
     volumes:
       - bsmcp-data:/data
     environment:
+      BSMCP_ROLE: worker
       BSMCP_DB_BACKEND: sqlite
       BSMCP_DB_PATH: /data/bookstack-mcp.db
       BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}

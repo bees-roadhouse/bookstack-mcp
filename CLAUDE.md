@@ -40,18 +40,23 @@ crates/
     src/staging.rs       File staging for upload_image / upload_attachment
     src/migrate.rs       SQLite → PostgreSQL migration tool
 
-  bsmcp-embedder/        Embedder binary (pluggable backends)
-    src/main.rs          Job queue worker + HTTP /embed endpoint + provider selection
+  bsmcp-embedder/        Embedder + reconciliation worker binary
+                         (folded in v0.13.0; closes #56). Role-selected
+                         at run-time via --role={embedder|worker|both}
+                         (CLI flag, primary) or BSMCP_ROLE env (fallback).
+                         Default: embedder.
+    src/main.rs          Role dispatcher + embedder body (provider
+                         selection, HTTP /embed + /rerank + /health,
+                         job queue worker) + worker body (token + delta
+                         interval wiring, IndexWorker spawn).
     src/embed.rs         Embedder trait + implementations (LocalEmbedder, OllamaEmbedder, OpenAIEmbedder)
     src/pipeline.rs      Embedding pipeline (fetch pages, chunk, embed, store)
-
-  bsmcp-worker/          Reconciliation worker binary
-    src/main.rs          Env wiring, db init, BookStackClient, IndexWorker spawn
-    src/lib.rs           IndexWorker — owns the index_jobs queue. Initial full
-                         walk on cold start, polls for webhook + cron jobs,
-                         runs the periodic delta walk. Same database as the
-                         server (server's webhook handler enqueues; worker
-                         consumes).
+    src/worker.rs        IndexWorker — owns the index_jobs queue. Initial
+                         full walk on cold start, polls for webhook + cron
+                         jobs, runs the periodic delta walk + lifecycle
+                         housekeeper across index_jobs and embed_jobs.
+                         Same database as the server (server's webhook
+                         handler enqueues; worker role consumes).
 ```
 
 **Two transports:**

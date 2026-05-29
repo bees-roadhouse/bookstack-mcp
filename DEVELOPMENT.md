@@ -17,7 +17,6 @@ cargo build --release
 # Individual crates
 cargo build --release -p bsmcp-server
 cargo build --release -p bsmcp-embedder
-cargo build --release -p bsmcp-worker
 
 # Check without building
 cargo check
@@ -36,8 +35,9 @@ Then:
 
 ```bash
 cargo run -p bsmcp-server
-cargo run -p bsmcp-embedder  # optional, for semantic search
-cargo run -p bsmcp-worker    # optional, for the reconciliation index
+cargo run -p bsmcp-embedder                       # optional, for semantic search
+cargo run -p bsmcp-embedder -- --role=worker      # optional, reconciliation index worker
+cargo run -p bsmcp-embedder -- --role=both        # both loops in one process
 ```
 
 ## Docker Compose
@@ -158,7 +158,7 @@ Release stream (pushed by `release.yml`'s `build-release-images` on push to `rel
 Tag-push hotfix (`v*` tag → `release.yml` `tag-release`):
 - `{version}`, `{major}.{minor}`, `{major}` — full semver hierarchy
 
-Images are published to `ghcr.io/bees-roadhouse/bsmcp-server`, `ghcr.io/bees-roadhouse/bsmcp-embedder`, and `ghcr.io/bees-roadhouse/bsmcp-worker` for `linux/amd64` and `linux/arm64`.
+Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`. For v0.13.0 only, `ghcr.io/bees-roadhouse/bsmcp-worker:<tag>` is published as a transitional registry alias of `ghcr.io/bees-roadhouse/bsmcp-embedder:<tag>` so existing compose files keep pulling — operators must still set `--role=worker` on the running container. The alias is removed in v0.14.0.
 
 ### Native binary release artifacts
 
@@ -241,7 +241,6 @@ docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.embedder \
   -t ghcr.io/bees-roadhouse/bsmcp-embedder:VERSION --push .
 
-docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile.worker \
-  -t ghcr.io/bees-roadhouse/bsmcp-worker:VERSION --push .
+# v0.13.0: bsmcp-worker is the same image as bsmcp-embedder, selected
+# via --role=worker at run-time. No separate Dockerfile.
 ```
