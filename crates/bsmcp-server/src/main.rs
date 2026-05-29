@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
+use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Redirect};
-use axum::{Router, routing::get};
+use axum::{routing::get, Router};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -32,8 +32,7 @@ async fn main() {
 
     eprintln!("BookStack MCP Server v{}", env!("CARGO_PKG_VERSION"));
 
-    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
-        .expect("BSMCP_BOOKSTACK_URL is required");
+    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
 
     let host = env::var("BSMCP_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("BSMCP_PORT")
@@ -41,8 +40,9 @@ async fn main() {
         .parse()
         .expect("BSMCP_PORT must be a valid port number");
 
-    let encryption_key = env::var("BSMCP_ENCRYPTION_KEY")
-        .expect("BSMCP_ENCRYPTION_KEY is required (32+ character key for AES-256-GCM token encryption)");
+    let encryption_key = env::var("BSMCP_ENCRYPTION_KEY").expect(
+        "BSMCP_ENCRYPTION_KEY is required (32+ character key for AES-256-GCM token encryption)",
+    );
     if encryption_key.len() < 32 {
         panic!("BSMCP_ENCRYPTION_KEY must be at least 32 characters");
     }
@@ -81,16 +81,28 @@ async fn main() {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
             if sqlite_path.exists() {
-                eprintln!("Auto-migration: found SQLite database at {}", sqlite_path.display());
+                eprintln!(
+                    "Auto-migration: found SQLite database at {}",
+                    sqlite_path.display()
+                );
                 match migrate::run(&sqlite_path, &database_url).await {
                     Ok(()) => {
                         // Rename to prevent re-migration on next startup
                         let migrated_path = sqlite_path.with_extension("db.migrated");
                         if let Err(e) = std::fs::rename(&sqlite_path, &migrated_path) {
-                            eprintln!("Auto-migration: warning — could not rename SQLite file: {e}");
-                            eprintln!("Auto-migration: manually remove {} to prevent re-migration", sqlite_path.display());
+                            eprintln!(
+                                "Auto-migration: warning — could not rename SQLite file: {e}"
+                            );
+                            eprintln!(
+                                "Auto-migration: manually remove {} to prevent re-migration",
+                                sqlite_path.display()
+                            );
                         } else {
-                            eprintln!("Auto-migration: renamed {} → {}", sqlite_path.display(), migrated_path.display());
+                            eprintln!(
+                                "Auto-migration: renamed {} → {}",
+                                sqlite_path.display(),
+                                migrated_path.display()
+                            );
                         }
                     }
                     Err(e) => {
@@ -158,8 +170,8 @@ async fn main() {
         if webhook_secret.len() < 16 {
             panic!("BSMCP_WEBHOOK_SECRET must be at least 16 characters");
         }
-        let embedder_url = env::var("BSMCP_EMBEDDER_URL")
-            .unwrap_or_else(|_| "http://bsmcp-embedder:8081".into());
+        let embedder_url =
+            env::var("BSMCP_EMBEDDER_URL").unwrap_or_else(|_| "http://bsmcp-embedder:8081".into());
 
         match &semantic_db {
             Some(sdb) => {
@@ -208,11 +220,23 @@ async fn main() {
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
 
     let mut app = Router::new()
-        .route("/mcp/sse", get(sse::handle_sse).post(sse::handle_streamable))
+        .route(
+            "/mcp/sse",
+            get(sse::handle_sse).post(sse::handle_streamable),
+        )
         .route("/mcp/messages/", axum::routing::post(sse::handle_message))
-        .route("/.well-known/oauth-authorization-server", get(oauth::handle_metadata))
-        .route("/.well-known/oauth-protected-resource", get(oauth::handle_resource_metadata))
-        .route("/authorize", get(oauth::handle_authorize).post(oauth::handle_authorize_submit))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::handle_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::handle_resource_metadata),
+        )
+        .route(
+            "/authorize",
+            get(oauth::handle_authorize).post(oauth::handle_authorize_submit),
+        )
         .route("/token", axum::routing::post(oauth::handle_token))
         .route("/register", axum::routing::post(oauth::handle_register))
         .route(
@@ -221,7 +245,8 @@ async fn main() {
         )
         .route(
             "/settings/probe",
-            get(settings_ui::handle_settings_probe_get).post(settings_ui::handle_settings_probe_post),
+            get(settings_ui::handle_settings_probe_get)
+                .post(settings_ui::handle_settings_probe_post),
         )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
     eprintln!("Settings: UI active at GET/POST /settings");
@@ -239,10 +264,18 @@ async fn main() {
         app = app
             .route("/webhooks/bookstack", axum::routing::post(handle_webhook))
             .route("/status", get(handle_status))
-            .route("/jobs/embed/{id}/cancel", axum::routing::post(handle_cancel_embed_job))
-            .route("/jobs/index/{id}/cancel", axum::routing::post(handle_cancel_index_job));
+            .route(
+                "/jobs/embed/{id}/cancel",
+                axum::routing::post(handle_cancel_embed_job),
+            )
+            .route(
+                "/jobs/index/{id}/cancel",
+                axum::routing::post(handle_cancel_index_job),
+            );
         eprintln!("Semantic: webhook endpoint active at POST /webhooks/bookstack");
-        eprintln!("Semantic: status page at GET /status (auth-gated — Bearer token or settings cookie)");
+        eprintln!(
+            "Semantic: status page at GET /status (auth-gated — Bearer token or settings cookie)"
+        );
         eprintln!("Semantic: cancel endpoints at POST /jobs/{{embed,index}}/:id/cancel");
     }
 
@@ -260,9 +293,7 @@ async fn main() {
                     HeaderName::from_static("mcp-protocol-version"),
                     HeaderName::from_static("last-event-id"),
                 ])
-                .expose_headers([
-                    HeaderName::from_static("mcp-session-id"),
-                ])
+                .expose_headers([HeaderName::from_static("mcp-session-id")]),
         )
         .with_state(state);
 
@@ -332,10 +363,7 @@ async fn enqueue_index_jobs_for_webhook(
     payload: &serde_json::Value,
     state: &sse::AppState,
 ) -> Result<(), String> {
-    let event = payload
-        .get("event")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
     let related = payload.get("related_item").cloned().unwrap_or(json!(null));
     let item_id = related.get("id").and_then(|v| v.as_i64());
 
@@ -403,7 +431,10 @@ async fn enqueue_index_jobs_for_webhook(
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn format_timestamp(ts: Option<i64>) -> String {
@@ -481,7 +512,11 @@ fn render_embed_job_row(job: &bsmcp_common::types::EmbedJob) -> String {
     let finished = format_timestamp(job.finished_at);
     let resolved_at = format_timestamp(job.resolved_at);
     let label = render_status_label(&job.status, job.resolved_status.as_deref());
-    let progress_html = if job.status == "running" || job.status == "succeeded" || job.status == "completed" || job.status == "failed" {
+    let progress_html = if job.status == "running"
+        || job.status == "succeeded"
+        || job.status == "completed"
+        || job.status == "failed"
+    {
         format!(
             r#"
       <div class="bar-bg bar-sm">
@@ -506,7 +541,10 @@ fn render_embed_job_row(job: &bsmcp_common::types::EmbedJob) -> String {
         None => String::new(),
     };
     let resolved_tag = match job.resolved_status.as_deref() {
-        Some(rs) if job.status != "closed" => format!(r#"<span class="resolved-tag">resolved: {}</span>"#, html_escape(rs)),
+        Some(rs) if job.status != "closed" => format!(
+            r#"<span class="resolved-tag">resolved: {}</span>"#,
+            html_escape(rs)
+        ),
         _ => String::new(),
     };
     let resolved_meta = if job.resolved_at.is_some() {
@@ -518,7 +556,11 @@ fn render_embed_job_row(job: &bsmcp_common::types::EmbedJob) -> String {
         Some(e) => format!(r#"<div class="error">Error: {}</div>"#, html_escape(e)),
         None => String::new(),
     };
-    let row_class = if job.status == "closed" { "job-row closed-row" } else { "job-row" };
+    let row_class = if job.status == "closed" {
+        "job-row closed-row"
+    } else {
+        "job-row"
+    };
     let finished_span = if job.finished_at.is_some() {
         format!("<span>Finished: {finished}</span>")
     } else {
@@ -555,7 +597,11 @@ fn render_index_job_row(job: &bsmcp_common::index::IndexJob) -> String {
     let finished = format_timestamp(job.finished_at);
     let resolved_at = format_timestamp(job.resolved_at);
     let label = render_status_label(&job.status, job.resolved_status.as_deref());
-    let progress_html = if job.status == "running" || job.status == "succeeded" || job.status == "completed" || job.status == "failed" {
+    let progress_html = if job.status == "running"
+        || job.status == "succeeded"
+        || job.status == "completed"
+        || job.status == "failed"
+    {
         format!(
             r#"
       <div class="bar-bg bar-sm">
@@ -580,7 +626,10 @@ fn render_index_job_row(job: &bsmcp_common::index::IndexJob) -> String {
         None => String::new(),
     };
     let resolved_tag = match job.resolved_status.as_deref() {
-        Some(rs) if job.status != "closed" => format!(r#"<span class="resolved-tag">resolved: {}</span>"#, html_escape(rs)),
+        Some(rs) if job.status != "closed" => format!(
+            r#"<span class="resolved-tag">resolved: {}</span>"#,
+            html_escape(rs)
+        ),
         _ => String::new(),
     };
     let resolved_meta = if job.resolved_at.is_some() {
@@ -592,7 +641,11 @@ fn render_index_job_row(job: &bsmcp_common::index::IndexJob) -> String {
         Some(e) => format!(r#"<div class="error">Error: {}</div>"#, html_escape(e)),
         None => String::new(),
     };
-    let row_class = if job.status == "closed" { "job-row closed-row" } else { "job-row" };
+    let row_class = if job.status == "closed" {
+        "job-row closed-row"
+    } else {
+        "job-row"
+    };
     let finished_span = if job.finished_at.is_some() {
         format!("<span>Finished: {finished}</span>")
     } else {
@@ -623,7 +676,9 @@ async fn handle_cancel_embed_job(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await.is_ok();
+    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls)
+        .await
+        .is_ok();
     let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
     if !bearer_ok && !cookie_ok {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -634,7 +689,11 @@ async fn handle_cancel_embed_job(
     };
     if let Err(e) = semantic.cancel_embed_job(id).await {
         eprintln!("cancel_embed_job({id}) failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel failed: {e}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cancel failed: {e}"),
+        )
+            .into_response();
     }
     Redirect::to("/status").into_response()
 }
@@ -644,14 +703,20 @@ async fn handle_cancel_index_job(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await.is_ok();
+    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls)
+        .await
+        .is_ok();
     let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
     if !bearer_ok && !cookie_ok {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     if let Err(e) = state.index_db.cancel_index_job(id).await {
         eprintln!("cancel_index_job({id}) failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel failed: {e}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cancel failed: {e}"),
+        )
+            .into_response();
     }
     let _ = header::CONTENT_TYPE;
     Redirect::to("/status").into_response()
@@ -664,7 +729,9 @@ async fn handle_status(
     // Auth-gate: accept either a Bearer token (programmatic) or a valid
     // settings session cookie (browser). Reject otherwise so the embedding
     // status page isn't world-readable.
-    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await.is_ok();
+    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls)
+        .await
+        .is_ok();
     let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
     if !bearer_ok && !cookie_ok {
         return (
@@ -689,8 +756,12 @@ async fn handle_status(
     let total_pages = stats["total_indexed_pages"].as_i64().unwrap_or(0);
     let total_chunks = stats["total_chunks"].as_i64().unwrap_or(0);
 
-    let has_active = jobs.iter().any(|j| j.status == "running" || j.status == "pending")
-        || index_jobs.iter().any(|j| j.status == "running" || j.status == "pending");
+    let has_active = jobs
+        .iter()
+        .any(|j| j.status == "running" || j.status == "pending")
+        || index_jobs
+            .iter()
+            .any(|j| j.status == "running" || j.status == "pending");
     let auto_refresh = if has_active {
         r#"<meta http-equiv="refresh" content="5">"#
     } else {
@@ -704,7 +775,9 @@ async fn handle_status(
     }
 
     if jobs.is_empty() {
-        job_rows = r#"<div class="job-row"><span style="color:#64748b">No embed jobs found</span></div>"#.to_string();
+        job_rows =
+            r#"<div class="job-row"><span style="color:#64748b">No embed jobs found</span></div>"#
+                .to_string();
     }
 
     let mut index_job_rows = String::new();
@@ -712,7 +785,9 @@ async fn handle_status(
         index_job_rows.push_str(&render_index_job_row(job));
     }
     if index_jobs.is_empty() {
-        index_job_rows = r#"<div class="job-row"><span style="color:#64748b">No index jobs found</span></div>"#.to_string();
+        index_job_rows =
+            r#"<div class="job-row"><span style="color:#64748b">No index jobs found</span></div>"#
+                .to_string();
     }
 
     let pending_count = jobs.iter().filter(|j| j.status == "pending").count()
@@ -725,7 +800,8 @@ async fn handle_status(
         "idle".to_string()
     };
 
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <title>BookStack MCP — Embedding Status</title>
@@ -795,7 +871,8 @@ async fn handle_status(
   </div>
   <div class="footer">Auto-refreshes every 5s while jobs are active</div>
 </div>
-</body></html>"#);
+</body></html>"#
+    );
 
     Html(html).into_response()
 }
@@ -819,7 +896,9 @@ async fn run_migration(args: &[String]) {
             "--help" | "-h" => {
                 eprintln!("{usage}");
                 eprintln!("\nMigrates all data from a SQLite database to PostgreSQL.");
-                eprintln!("Encrypted access tokens are copied as-is (same encryption key required).");
+                eprintln!(
+                    "Encrypted access tokens are copied as-is (same encryption key required)."
+                );
                 eprintln!("Chunk embeddings are converted from BLOB to pgvector format.");
                 return;
             }
@@ -851,7 +930,10 @@ async fn run_migration(args: &[String]) {
     };
 
     if !sqlite_path.exists() {
-        eprintln!("Error: SQLite database not found: {}", sqlite_path.display());
+        eprintln!(
+            "Error: SQLite database not found: {}",
+            sqlite_path.display()
+        );
         std::process::exit(1);
     }
 
@@ -860,7 +942,10 @@ async fn run_migration(args: &[String]) {
             eprintln!("\nMigration completed successfully.");
             eprintln!("You can now switch to PostgreSQL by setting:");
             eprintln!("  BSMCP_DB_BACKEND=postgres");
-            eprintln!("  BSMCP_DATABASE_URL={}", migrate::redact_url(&postgres_url));
+            eprintln!(
+                "  BSMCP_DATABASE_URL={}",
+                migrate::redact_url(&postgres_url)
+            );
         }
         Err(e) => {
             eprintln!("\nMigration failed: {e}");

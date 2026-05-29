@@ -25,3 +25,9 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
+# Forces openssl-sys to vendor (build OpenSSL from source) so cross-builds
+# (notably aarch64-unknown-linux-gnu) don't need a target-architecture sysroot
+# with libssl-dev. Reaches openssl-sys through reqwest -> hyper-tls -> native-tls.
+# release.yml's binary matrix builds bsmcp-server for all five targets, so this
+# crate is the right place for the dep.
+openssl = { version = "0.10", features = ["vendored"] }

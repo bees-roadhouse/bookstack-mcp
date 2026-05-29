@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-const DEFAULT_ACCESS_TOKEN_TTL_SECS: u64 = 30 * 86400;  // 30 days
+const DEFAULT_ACCESS_TOKEN_TTL_SECS: u64 = 30 * 86400; // 30 days
 const DEFAULT_REFRESH_TOKEN_TTL_SECS: u64 = 90 * 86400; // 90 days
 
 /// Access token TTL. Configurable via `BSMCP_ACCESS_TOKEN_TTL` (seconds).

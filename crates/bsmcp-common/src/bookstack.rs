@@ -19,13 +19,13 @@ fn is_restricted_ip(ip: &IpAddr) -> bool {
             || v4.is_link_local()        // 169.254.0.0/16 (AWS IMDS, etc.)
             || v4.is_broadcast()         // 255.255.255.255
             || v4.is_unspecified()       // 0.0.0.0
-            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGN)
+            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGN)
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()             // ::1
             || v6.is_unspecified()       // ::
             || (v6.segments()[0] & 0xffc0) == 0xfe80  // fe80::/10 link-local
-            || (v6.segments()[0] & 0xfe00) == 0xfc00  // fc00::/7 ULA
+            || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         }
     }
 }
@@ -55,18 +55,25 @@ pub async fn resolve_file_content(
             // Only http and https schemes are permitted.
             match parsed.scheme() {
                 "http" | "https" => {}
-                scheme => return Err(format!("URL scheme '{}' is not allowed; only http and https are permitted", scheme)),
+                scheme => {
+                    return Err(format!(
+                        "URL scheme '{}' is not allowed; only http and https are permitted",
+                        scheme
+                    ))
+                }
             }
 
             // Resolve hostname, reject private/loopback/link-local IPs, then pin the
             // validated addresses into the reqwest client to prevent DNS rebinding.
-            let host = parsed.host_str()
+            let host = parsed
+                .host_str()
                 .ok_or_else(|| format!("URL '{}' has no host", url))?;
             let port = parsed.port_or_known_default().unwrap_or(80);
-            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
-                .await
-                .map_err(|e| format!("Failed to resolve host '{}': {}", host, e))?
-                .collect();
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host(format!("{}:{}", host, port))
+                    .await
+                    .map_err(|e| format!("Failed to resolve host '{}': {}", host, e))?
+                    .collect();
             if addrs.is_empty() {
                 return Err(format!("Host '{}' resolved to no addresses", host));
             }
@@ -84,10 +91,13 @@ pub async fn resolve_file_content(
             for addr in &addrs {
                 client_builder = client_builder.resolve(host, *addr);
             }
-            let client = client_builder.build()
+            let client = client_builder
+                .build()
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-            let resp = client.get(url).send()
+            let resp = client
+                .get(url)
+                .send()
                 .await
                 .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
             if !resp.status().is_success() {
@@ -97,7 +107,10 @@ pub async fn resolve_file_content(
             // Fast-reject via Content-Length before downloading the body.
             if let Some(len) = resp.content_length() {
                 if len as usize > MAX_FILE_CONTENT_SIZE {
-                    return Err(format!("Remote file too large: {} bytes (limit {})", len, MAX_FILE_CONTENT_SIZE));
+                    return Err(format!(
+                        "Remote file too large: {} bytes (limit {})",
+                        len, MAX_FILE_CONTENT_SIZE
+                    ));
                 }
             }
 
@@ -107,7 +120,11 @@ pub async fn resolve_file_content(
                 .map_err(|e| format!("Failed to read URL response: {}", e))?;
 
             if bytes.len() > MAX_FILE_CONTENT_SIZE {
-                return Err(format!("Remote file too large: {} bytes (limit {})", bytes.len(), MAX_FILE_CONTENT_SIZE));
+                return Err(format!(
+                    "Remote file too large: {} bytes (limit {})",
+                    bytes.len(),
+                    MAX_FILE_CONTENT_SIZE
+                ));
             }
 
             let filename = url
@@ -138,7 +155,9 @@ impl ExportFormat {
             "markdown" => Ok(Self::Markdown),
             "plaintext" => Ok(Self::Plaintext),
             "html" => Ok(Self::Html),
-            _ => Err(format!("Invalid export format: '{s}'. Must be one of: markdown, plaintext, html")),
+            _ => Err(format!(
+                "Invalid export format: '{s}'. Must be one of: markdown, plaintext, html"
+            )),
         }
     }
 
@@ -165,7 +184,9 @@ impl ContentType {
             "chapter" => Ok(Self::Chapter),
             "book" => Ok(Self::Book),
             "shelf" => Ok(Self::Shelf),
-            _ => Err(format!("Invalid content type: '{s}'. Must be one of: page, chapter, book, shelf")),
+            _ => Err(format!(
+                "Invalid content type: '{s}'. Must be one of: page, chapter, book, shelf"
+            )),
         }
     }
 
@@ -250,32 +271,43 @@ impl BookStackClient {
     /// Read response as JSON, enforcing size limit even for chunked responses.
     async fn read_json(resp: reqwest::Response) -> Result<Value, String> {
         Self::check_content_length(&resp, MAX_RESPONSE_SIZE)?;
-        let bytes = resp.bytes().await
-            .map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            eprintln!("Response read error: {e}");
+            "Failed to read response".to_string()
+        })?;
         if bytes.len() > MAX_RESPONSE_SIZE {
             return Err(format!("Response too large: {} bytes", bytes.len()));
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|e| { eprintln!("JSON parse error: {e}"); "Invalid response from BookStack".to_string() })
+        serde_json::from_slice(&bytes).map_err(|e| {
+            eprintln!("JSON parse error: {e}");
+            "Invalid response from BookStack".to_string()
+        })
     }
 
     /// Read response as text, enforcing size limit even for chunked responses.
     async fn read_text(resp: reqwest::Response) -> Result<String, String> {
         Self::check_content_length(&resp, MAX_RESPONSE_SIZE)?;
-        let bytes = resp.bytes().await
-            .map_err(|e| { eprintln!("Response read error: {e}"); "Failed to read response".to_string() })?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            eprintln!("Response read error: {e}");
+            "Failed to read response".to_string()
+        })?;
         if bytes.len() > MAX_RESPONSE_SIZE {
             return Err(format!("Response too large: {} bytes", bytes.len()));
         }
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| { eprintln!("UTF-8 decode error: {e}"); "Invalid response encoding".to_string() })
+        String::from_utf8(bytes.to_vec()).map_err(|e| {
+            eprintln!("UTF-8 decode error: {e}");
+            "Invalid response encoding".to_string()
+        })
     }
 
     /// Read error body with a size limit to prevent memory exhaustion from error responses.
     /// Streams chunks to avoid buffering arbitrarily large error responses.
     async fn read_error_body(mut resp: reqwest::Response) -> String {
         // Fast-reject if Content-Length exceeds limit
-        if resp.content_length().is_some_and(|len| len as usize > MAX_ERROR_BODY_SIZE) {
+        if resp
+            .content_length()
+            .is_some_and(|len| len as usize > MAX_ERROR_BODY_SIZE)
+        {
             return "[error body too large]".to_string();
         }
         let mut buf = Vec::with_capacity(MAX_ERROR_BODY_SIZE.min(4096));
@@ -374,16 +406,24 @@ impl BookStackClient {
         Self::read_json(resp).await
     }
 
-    async fn post_multipart(&self, path: &str, form: reqwest::multipart::Form) -> Result<Value, String> {
+    async fn post_multipart(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<Value, String> {
         // Multipart bodies stream and aren't `try_clone`-safe; skip retry.
         self.rate_limiter.acquire().await;
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/api/{}", self.base_url, path))
             .header("Authorization", self.auth_header())
             .multipart(form)
             .send()
             .await
-            .map_err(|e| { eprintln!("BookStack request error: {e}"); "Request failed".to_string() })?;
+            .map_err(|e| {
+                eprintln!("BookStack request error: {e}");
+                "Request failed".to_string()
+            })?;
         self.rate_limiter.observe_limit(resp.headers());
 
         if !resp.status().is_success() {
@@ -482,7 +522,10 @@ impl BookStackClient {
                 }
             }
         }
-        Err("No role named \"Admin\" found in BookStack — cannot apply admin-only permission lock".to_string())
+        Err(
+            "No role named \"Admin\" found in BookStack — cannot apply admin-only permission lock"
+                .to_string(),
+        )
     }
 
     // --- Permission check ---
@@ -504,10 +547,14 @@ impl BookStackClient {
     // --- Shelves ---
 
     pub async fn list_shelves(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("shelves", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "shelves",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     pub async fn get_shelf(&self, id: i64) -> Result<Value, String> {
@@ -515,9 +562,13 @@ impl BookStackClient {
     }
 
     pub async fn create_shelf(&self, name: &str, description: &str) -> Result<Value, String> {
-        self.post("shelves", &serde_json::json!({
-            "name": name, "description": description,
-        })).await
+        self.post(
+            "shelves",
+            &serde_json::json!({
+                "name": name, "description": description,
+            }),
+        )
+        .await
     }
 
     pub async fn update_shelf(&self, id: i64, data: &Value) -> Result<Value, String> {
@@ -531,10 +582,14 @@ impl BookStackClient {
     // --- Books ---
 
     pub async fn list_books(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("books", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "books",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     pub async fn get_book(&self, id: i64) -> Result<Value, String> {
@@ -542,9 +597,13 @@ impl BookStackClient {
     }
 
     pub async fn create_book(&self, name: &str, description: &str) -> Result<Value, String> {
-        self.post("books", &serde_json::json!({
-            "name": name, "description": description,
-        })).await
+        self.post(
+            "books",
+            &serde_json::json!({
+                "name": name, "description": description,
+            }),
+        )
+        .await
     }
 
     pub async fn update_book(&self, id: i64, data: &Value) -> Result<Value, String> {
@@ -558,20 +617,33 @@ impl BookStackClient {
     // --- Chapters ---
 
     pub async fn list_chapters(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("chapters", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "chapters",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     pub async fn get_chapter(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("chapters/{id}"), &[]).await
     }
 
-    pub async fn create_chapter(&self, book_id: i64, name: &str, description: &str) -> Result<Value, String> {
-        self.post("chapters", &serde_json::json!({
-            "book_id": book_id, "name": name, "description": description,
-        })).await
+    pub async fn create_chapter(
+        &self,
+        book_id: i64,
+        name: &str,
+        description: &str,
+    ) -> Result<Value, String> {
+        self.post(
+            "chapters",
+            &serde_json::json!({
+                "book_id": book_id, "name": name, "description": description,
+            }),
+        )
+        .await
     }
 
     pub async fn update_chapter(&self, id: i64, data: &Value) -> Result<Value, String> {
@@ -585,10 +657,14 @@ impl BookStackClient {
     // --- Pages ---
 
     pub async fn list_pages(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("pages", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "pages",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     /// List pages whose `updated_at` is strictly greater than the given
@@ -752,11 +828,15 @@ impl BookStackClient {
     // --- Search ---
 
     pub async fn search(&self, query: &str, page: i64, count: i64) -> Result<Value, String> {
-        self.get("search", &[
-            ("query", query),
-            ("page", &page.to_string()),
-            ("count", &count.to_string()),
-        ]).await
+        self.get(
+            "search",
+            &[
+                ("query", query),
+                ("page", &page.to_string()),
+                ("count", &count.to_string()),
+            ],
+        )
+        .await
     }
 
     // --- Attachments ---
@@ -823,14 +903,19 @@ impl BookStackClient {
     // --- Recycle Bin ---
 
     pub async fn list_recycle_bin(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("recycle-bin", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "recycle-bin",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     pub async fn restore_recycle_bin_item(&self, id: i64) -> Result<Value, String> {
-        self.put(&format!("recycle-bin/{id}"), &serde_json::json!({})).await
+        self.put(&format!("recycle-bin/{id}"), &serde_json::json!({}))
+            .await
     }
 
     pub async fn destroy_recycle_bin_item(&self, id: i64) -> Result<(), String> {
@@ -840,10 +925,14 @@ impl BookStackClient {
     // --- Users ---
 
     pub async fn list_users(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("users", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "users",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     pub async fn get_user(&self, id: i64) -> Result<Value, String> {
@@ -865,9 +954,7 @@ impl BookStackClient {
     /// for non-empty-result reasons.
     pub async fn whoami(&self) -> Result<Option<UserIdentity>, String> {
         // Probe via search. Single-page results, page-type only, created-by-self.
-        let resp = self
-            .search("{type:page} {created_by:me}", 1, 1)
-            .await?;
+        let resp = self.search("{type:page} {created_by:me}", 1, 1).await?;
         let candidates = resp.get("data").and_then(|v| v.as_array());
         let Some(items) = candidates else {
             return Ok(None);
@@ -911,10 +998,14 @@ impl BookStackClient {
     // --- Audit Log ---
 
     pub async fn list_audit_log(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("audit-log", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "audit-log",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     // --- System ---
@@ -925,7 +1016,12 @@ impl BookStackClient {
 
     // --- Image Gallery ---
 
-    pub async fn list_images(&self, count: i64, offset: i64, filter: &[(&str, &str)]) -> Result<Value, String> {
+    pub async fn list_images(
+        &self,
+        count: i64,
+        offset: i64,
+        filter: &[(&str, &str)],
+    ) -> Result<Value, String> {
         let mut query: Vec<(&str, &str)> = vec![];
         let count_str = count.to_string();
         let offset_str = offset.to_string();
@@ -947,11 +1043,22 @@ impl BookStackClient {
         self.delete(&format!("image-gallery/{id}")).await
     }
 
-    pub async fn upload_image(&self, name: &str, image_type: &str, uploaded_to: i64, filename: &str, bytes: Vec<u8>, mime_type: &str) -> Result<Value, String> {
+    pub async fn upload_image(
+        &self,
+        name: &str,
+        image_type: &str,
+        uploaded_to: i64,
+        filename: &str,
+        bytes: Vec<u8>,
+        mime_type: &str,
+    ) -> Result<Value, String> {
         let file_part = reqwest::multipart::Part::bytes(bytes)
             .file_name(filename.to_string())
             .mime_str(mime_type)
-            .map_err(|e| { eprintln!("Multipart error: {e}"); "Invalid mime type".to_string() })?;
+            .map_err(|e| {
+                eprintln!("Multipart error: {e}");
+                "Invalid mime type".to_string()
+            })?;
         let form = reqwest::multipart::Form::new()
             .text("name", name.to_string())
             .text("type", image_type.to_string())
@@ -962,11 +1069,21 @@ impl BookStackClient {
 
     // --- File Attachments ---
 
-    pub async fn create_file_attachment(&self, name: &str, uploaded_to: i64, filename: &str, bytes: Vec<u8>, mime_type: &str) -> Result<Value, String> {
+    pub async fn create_file_attachment(
+        &self,
+        name: &str,
+        uploaded_to: i64,
+        filename: &str,
+        bytes: Vec<u8>,
+        mime_type: &str,
+    ) -> Result<Value, String> {
         let file_part = reqwest::multipart::Part::bytes(bytes)
             .file_name(filename.to_string())
             .mime_str(mime_type)
-            .map_err(|e| { eprintln!("Multipart error: {e}"); "Invalid mime type".to_string() })?;
+            .map_err(|e| {
+                eprintln!("Multipart error: {e}");
+                "Invalid mime type".to_string()
+            })?;
         let form = reqwest::multipart::Form::new()
             .text("name", name.to_string())
             .text("uploaded_to", uploaded_to.to_string())
@@ -976,23 +1093,38 @@ impl BookStackClient {
 
     // --- Content Permissions ---
 
-    pub async fn get_content_permissions(&self, content_type: ContentType, content_id: i64) -> Result<Value, String> {
+    pub async fn get_content_permissions(
+        &self,
+        content_type: ContentType,
+        content_id: i64,
+    ) -> Result<Value, String> {
         let ct = content_type.as_str();
-        self.get(&format!("content-permissions/{ct}/{content_id}"), &[]).await
+        self.get(&format!("content-permissions/{ct}/{content_id}"), &[])
+            .await
     }
 
-    pub async fn update_content_permissions(&self, content_type: ContentType, content_id: i64, data: &Value) -> Result<Value, String> {
+    pub async fn update_content_permissions(
+        &self,
+        content_type: ContentType,
+        content_id: i64,
+        data: &Value,
+    ) -> Result<Value, String> {
         let ct = content_type.as_str();
-        self.put(&format!("content-permissions/{ct}/{content_id}"), data).await
+        self.put(&format!("content-permissions/{ct}/{content_id}"), data)
+            .await
     }
 
     // --- Roles ---
 
     pub async fn list_roles(&self, count: i64, offset: i64) -> Result<Value, String> {
-        self.get("roles", &[
-            ("count", &count.to_string()),
-            ("offset", &offset.to_string()),
-        ]).await
+        self.get(
+            "roles",
+            &[
+                ("count", &count.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )
+        .await
     }
 
     pub async fn get_role(&self, id: i64) -> Result<Value, String> {

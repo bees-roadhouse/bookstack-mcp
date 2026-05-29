@@ -62,7 +62,8 @@ pub async fn handle_stage_upload(
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Unknown staging_id — call prepare_upload first"})),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
@@ -73,20 +74,21 @@ pub async fn handle_stage_upload(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "No file field in multipart body"})),
-            ).into_response();
+            )
+                .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Multipart parse error: {e}")})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
-    let filename = field.file_name()
-        .unwrap_or("upload")
-        .to_string();
-    let mime_type = field.content_type()
+    let filename = field.file_name().unwrap_or("upload").to_string();
+    let mime_type = field
+        .content_type()
         .unwrap_or("application/octet-stream")
         .to_string();
 
@@ -105,7 +107,8 @@ pub async fn handle_stage_upload(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Failed to read file: {e}")})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -114,12 +117,15 @@ pub async fn handle_stage_upload(
     // Replace the pre-registered slot with actual file data
     {
         let mut store = state.staging.write().await;
-        store.insert(staging_id.clone(), StagingEntry {
-            bytes,
-            filename: filename.clone(),
-            mime_type: mime_type.clone(),
-            created_at: Instant::now(),
-        });
+        store.insert(
+            staging_id.clone(),
+            StagingEntry {
+                bytes,
+                filename: filename.clone(),
+                mime_type: mime_type.clone(),
+                created_at: Instant::now(),
+            },
+        );
     }
 
     eprintln!("Staging: stored {staging_id} ({filename}, {mime_type}, {size} bytes)");
@@ -132,5 +138,6 @@ pub async fn handle_stage_upload(
             "mime_type": mime_type,
             "size": size,
         })),
-    ).into_response()
+    )
+        .into_response()
 }

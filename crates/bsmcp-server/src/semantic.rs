@@ -78,15 +78,26 @@ struct RerankResponse {
 /// consumers can tell a clipped chunk from a naturally short one. Char-count
 /// is used (not byte-count) so multibyte UTF-8 isn't sliced mid-codepoint.
 pub fn trim_match(mut hit: Value, max_chunks: usize, max_chars: usize) -> Value {
-    let Some(obj) = hit.as_object_mut() else { return hit; };
-    let Some(chunks) = obj.get_mut("chunks").and_then(|v| v.as_array_mut()) else { return hit; };
+    let Some(obj) = hit.as_object_mut() else {
+        return hit;
+    };
+    let Some(chunks) = obj.get_mut("chunks").and_then(|v| v.as_array_mut()) else {
+        return hit;
+    };
     chunks.truncate(max_chunks);
     for chunk in chunks.iter_mut() {
-        let Some(chunk_obj) = chunk.as_object_mut() else { continue; };
-        let Some(content) = chunk_obj.get("content").and_then(|v| v.as_str()) else { continue; };
+        let Some(chunk_obj) = chunk.as_object_mut() else {
+            continue;
+        };
+        let Some(content) = chunk_obj.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
         if content.chars().count() > max_chars {
             let truncated: String = content.chars().take(max_chars).collect();
-            chunk_obj.insert("content".to_string(), Value::String(format!("{truncated}…")));
+            chunk_obj.insert(
+                "content".to_string(),
+                Value::String(format!("{truncated}…")),
+            );
             chunk_obj.insert("truncated".to_string(), Value::Bool(true));
         }
     }
@@ -185,7 +196,8 @@ impl SemanticState {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
-            let resp = match self.http_client
+            let resp = match self
+                .http_client
                 .post(&url)
                 .json(&json!({ "texts": [query] }))
                 .send()
@@ -211,16 +223,20 @@ impl SemanticState {
                 return Err(format!("Embedder error {status}: {body}"));
             }
 
-            let body: Value = resp.json().await
+            let body: Value = resp
+                .json()
+                .await
                 .map_err(|e| format!("Embedder response parse error: {e}"))?;
 
-            let embedding = body.get("embeddings")
+            let embedding = body
+                .get("embeddings")
                 .and_then(|v| v.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_array())
                 .ok_or("Invalid embedder response format")?;
 
-            let vec: Vec<f32> = embedding.iter()
+            let vec: Vec<f32> = embedding
+                .iter()
                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                 .collect();
 
@@ -239,11 +255,7 @@ impl SemanticState {
     /// accessible pages, 403/404 for restricted. This correctly handles custom
     /// entity permissions (unlike filter[id:in] on the list endpoint).
     /// Results are cached per (token_id, page_id) for 5 minutes.
-    async fn filter_by_permission(
-        &self,
-        page_ids: &[i64],
-        client: &BookStackClient,
-    ) -> Vec<i64> {
+    async fn filter_by_permission(&self, page_ids: &[i64], client: &BookStackClient) -> Vec<i64> {
         let token_id = client.token_id().to_string();
         let now = Instant::now();
 
@@ -293,17 +305,22 @@ impl SemanticState {
             {
                 let mut cache = self.permission_cache.write().await;
                 for &(pid, ok) in &results {
-                    cache.insert((token_id.clone(), pid), CachedAccess {
-                        accessible: ok,
-                        cached_at: now,
-                    });
+                    cache.insert(
+                        (token_id.clone(), pid),
+                        CachedAccess {
+                            accessible: ok,
+                            cached_at: now,
+                        },
+                    );
                     if ok {
                         accessible.push(pid);
                     }
                 }
                 // Evict stale entries if cache grows large
                 if cache.len() > 10_000 {
-                    cache.retain(|_, entry| now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL);
+                    cache.retain(|_, entry| {
+                        now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL
+                    });
                 }
             }
         }
@@ -349,9 +366,8 @@ impl SemanticState {
         // cross-encoder benefits from seeing more candidates, and the rerank
         // step itself caps the embedder side at 200 documents.
         let candidate_multiplier: usize = if mode == SearchMode::Precision { 5 } else { 2 };
-        let book_filter_owned: Option<Vec<i64>> = book_filter
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_vec());
+        let book_filter_owned: Option<Vec<i64>> =
+            book_filter.filter(|s| !s.is_empty()).map(|s| s.to_vec());
         let vector_future = async {
             let query_vec = self.embed_query(query).await?;
             self.db
@@ -367,12 +383,11 @@ impl SemanticState {
         let keyword_future = async {
             if hybrid {
                 match client.search(query, 1, (limit * 2) as i64).await {
-                    Ok(resp) => {
-                        resp.get("data")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default()
-                    }
+                    Ok(resp) => resp
+                        .get("data")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default(),
                     Err(e) => {
                         eprintln!("Hybrid: keyword search failed (non-fatal): {e}");
                         Vec::new()
@@ -395,12 +410,14 @@ impl SemanticState {
             // Keyword results don't carry book_id; fetch the book_id for each
             // candidate page in one batched DB call and drop anything outside
             // the allowed set.
-            let candidate_ids: Vec<i64> = keyword_results.iter()
+            let candidate_ids: Vec<i64> = keyword_results
+                .iter()
                 .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("page"))
                 .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
                 .collect();
             if !candidate_ids.is_empty() {
-                let book_lookup: HashMap<i64, i64> = self.db
+                let book_lookup: HashMap<i64, i64> = self
+                    .db
                     .get_page_book_ids(&candidate_ids)
                     .await
                     .unwrap_or_default()
@@ -485,27 +502,30 @@ impl SemanticState {
         let scored_page_ids: Vec<i64> = page_scores.keys().copied().collect();
         let scored_set: HashSet<i64> = scored_page_ids.iter().copied().collect();
 
-        let blanket_fetches: Vec<(i64, MarkovBlanket)> = stream::iter(scored_page_ids.iter().copied())
-            .map(|pid| async move {
-                match self.db.get_markov_blanket(pid).await {
-                    Ok(b) => Some((pid, b)),
-                    Err(e) => {
-                        eprintln!("Blanket: error for page {pid}: {e}");
-                        None
+        let blanket_fetches: Vec<(i64, MarkovBlanket)> =
+            stream::iter(scored_page_ids.iter().copied())
+                .map(|pid| async move {
+                    match self.db.get_markov_blanket(pid).await {
+                        Ok(b) => Some((pid, b)),
+                        Err(e) => {
+                            eprintln!("Blanket: error for page {pid}: {e}");
+                            None
+                        }
                     }
-                }
-            })
-            .buffer_unordered(20)
-            .filter_map(|x| async move { x })
-            .collect()
-            .await;
+                })
+                .buffer_unordered(20)
+                .filter_map(|x| async move { x })
+                .collect()
+                .await;
 
         let blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
 
         for (&page_id, blanket) in blanket_cache.iter() {
             let mut strong = 0usize;
             let mut weak = 0usize;
-            for related in blanket.linked_from.iter()
+            for related in blanket
+                .linked_from
+                .iter()
                 .chain(blanket.links_to.iter())
                 .chain(blanket.co_linked.iter())
                 .chain(blanket.siblings.iter())
@@ -535,7 +555,8 @@ impl SemanticState {
         }
 
         // Compute final blended score and sort
-        let mut page_results: Vec<(i64, f32, &PageScore)> = page_scores.iter()
+        let mut page_results: Vec<(i64, f32, &PageScore)> = page_scores
+            .iter()
             .map(|(&pid, score)| {
                 let blended = if score.keyword_rank > 0.0 && score.vector_score > 0.0 {
                     // Both sources matched — weighted blend
@@ -569,7 +590,8 @@ impl SemanticState {
             }
             page_scores.retain(|pid, _| accessible_set.contains(pid));
 
-            page_results = page_scores.iter()
+            page_results = page_scores
+                .iter()
                 .map(|(&pid, score)| (pid, score.vector_score, score))
                 .collect();
             page_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -581,7 +603,8 @@ impl SemanticState {
         // DB roundtrips for limit=40). Collect all IDs once, fetch in two
         // queries, then assemble.
         let final_page_ids: Vec<i64> = page_results.iter().map(|(pid, _, _)| *pid).collect();
-        let all_chunk_ids: Vec<i64> = page_results.iter()
+        let all_chunk_ids: Vec<i64> = page_results
+            .iter()
             .flat_map(|(_, _, score)| score.chunks.iter().map(|c| c.0))
             .collect();
 
@@ -594,9 +617,13 @@ impl SemanticState {
             metas.iter().map(|m| (m.page_id, m)).collect();
 
         // Group chunk details by their page_id so each result picks up only its chunks.
-        let mut chunks_by_page: HashMap<i64, Vec<&bsmcp_common::types::ChunkDetail>> = HashMap::new();
+        let mut chunks_by_page: HashMap<i64, Vec<&bsmcp_common::types::ChunkDetail>> =
+            HashMap::new();
         for detail in &chunk_details {
-            chunks_by_page.entry(detail.page_id).or_default().push(detail);
+            chunks_by_page
+                .entry(detail.page_id)
+                .or_default()
+                .push(detail);
         }
 
         // RERANK MODE: refine the standard top-N ordering with a cross-encoder.
@@ -618,10 +645,7 @@ impl SemanticState {
                     .iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|c| c.0);
-                let page_name = meta_by_page
-                    .get(pid)
-                    .map(|m| m.name.as_str())
-                    .unwrap_or("");
+                let page_name = meta_by_page.get(pid).map(|m| m.name.as_str()).unwrap_or("");
                 let (heading, content) = best_chunk_id
                     .and_then(|cid| chunk_by_id.get(&cid))
                     .map(|d| (d.heading_path.as_str(), d.content.as_str()))
@@ -669,7 +693,8 @@ impl SemanticState {
         // re-ranking. Most final results will hit the cache for free.
         let mut blanket_cache = blanket_cache;
         if verbose {
-            let missing: Vec<i64> = final_page_ids.iter()
+            let missing: Vec<i64> = final_page_ids
+                .iter()
                 .copied()
                 .filter(|pid| !blanket_cache.contains_key(pid))
                 .collect();
@@ -701,7 +726,12 @@ impl SemanticState {
             if !score.chunks.is_empty() {
                 if let Some(details) = chunks_by_page.get(page_id) {
                     for detail in details {
-                        let chunk_score = score.chunks.iter().find(|c| c.0 == detail.chunk_id).map(|c| c.1).unwrap_or(0.0);
+                        let chunk_score = score
+                            .chunks
+                            .iter()
+                            .find(|c| c.0 == detail.chunk_id)
+                            .map(|c| c.1)
+                            .unwrap_or(0.0);
                         chunks_json.push(json!({
                             "heading_path": detail.heading_path,
                             "content": detail.content,
@@ -840,7 +870,11 @@ impl SemanticState {
                 .ok_or("Rerank item missing 'score'")? as f32;
             hits.push((idx, score));
         }
-        Ok(RerankResponse { hits, provider, model })
+        Ok(RerankResponse {
+            hits,
+            provider,
+            model,
+        })
     }
 
     /// Cross-encoder rerank step for **precision** mode. Replaces the blanket
@@ -920,10 +954,7 @@ impl SemanticState {
         let mut docs: Vec<String> = Vec::with_capacity(candidates.len());
         let mut doc_to_page: Vec<i64> = Vec::with_capacity(candidates.len());
         for (pid, cid) in &candidates {
-            let page_name = meta_by_page
-                .get(pid)
-                .map(|m| m.name.as_str())
-                .unwrap_or("");
+            let page_name = meta_by_page.get(pid).map(|m| m.name.as_str()).unwrap_or("");
             let (heading, content) = chunk_by_id
                 .get(cid)
                 .map(|d| (d.heading_path.as_str(), d.content.as_str()))
@@ -957,14 +988,15 @@ impl SemanticState {
         let mut blanket_cache: HashMap<i64, MarkovBlanket> = HashMap::new();
         if verbose {
             let final_pids: Vec<i64> = ranked.iter().map(|(pid, _)| *pid).collect();
-            let extras: Vec<(i64, MarkovBlanket)> = stream::iter(final_pids)
-                .map(|pid| async move {
-                    self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
-                })
-                .buffer_unordered(20)
-                .filter_map(|x| async move { x })
-                .collect()
-                .await;
+            let extras: Vec<(i64, MarkovBlanket)> =
+                stream::iter(final_pids)
+                    .map(|pid| async move {
+                        self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
+                    })
+                    .buffer_unordered(20)
+                    .filter_map(|x| async move { x })
+                    .collect()
+                    .await;
             for (pid, b) in extras {
                 blanket_cache.insert(pid, b);
             }
@@ -973,7 +1005,10 @@ impl SemanticState {
         let mut chunks_by_page: HashMap<i64, Vec<&bsmcp_common::types::ChunkDetail>> =
             HashMap::new();
         for detail in &chunk_details {
-            chunks_by_page.entry(detail.page_id).or_default().push(detail);
+            chunks_by_page
+                .entry(detail.page_id)
+                .or_default()
+                .push(detail);
         }
 
         let mut results = Vec::with_capacity(ranked.len());
@@ -1053,9 +1088,15 @@ impl SemanticState {
     pub async fn trigger_reembed(&self, scope: &str) -> Result<Value, String> {
         let (job_id, is_new) = self.db.create_embed_job(scope).await?;
         let (status, message) = if is_new {
-            ("queued", "Embedding job queued. The embedder will pick it up shortly.")
+            (
+                "queued",
+                "Embedding job queued. The embedder will pick it up shortly.",
+            )
         } else {
-            ("already_active", "A job with this scope is already active. Returning existing job.")
+            (
+                "already_active",
+                "A job with this scope is already active. Returning existing job.",
+            )
         };
         Ok(json!({
             "status": status,
@@ -1089,7 +1130,10 @@ impl SemanticState {
     }
 
     /// List all active (pending/running/failed-open) jobs plus recent terminal jobs.
-    pub async fn list_jobs(&self, recent: usize) -> Result<Vec<bsmcp_common::types::EmbedJob>, String> {
+    pub async fn list_jobs(
+        &self,
+        recent: usize,
+    ) -> Result<Vec<bsmcp_common::types::EmbedJob>, String> {
         self.db.list_jobs(recent).await
     }
 
@@ -1129,7 +1173,9 @@ impl SemanticState {
                 if let Some(pid) = item_id {
                     let scope = format!("page:{pid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: {event} — queued page:{pid} embed job {job_id} (new={is_new})");
+                    eprintln!(
+                        "Semantic: {event} — queued page:{pid} embed job {job_id} (new={is_new})"
+                    );
                 }
             }
             "page_move" => {
@@ -1138,7 +1184,9 @@ impl SemanticState {
                 if let Some(pid) = item_id {
                     let scope = format!("page:{pid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: page_move — queued page:{pid} embed job {job_id} (new={is_new})");
+                    eprintln!(
+                        "Semantic: page_move — queued page:{pid} embed job {job_id} (new={is_new})"
+                    );
                 }
             }
             "page_delete" => {
@@ -1158,7 +1206,9 @@ impl SemanticState {
                 if let Some(bid) = book_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})");
+                    eprintln!(
+                        "Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})"
+                    );
                 }
             }
             "chapter_move" => {
@@ -1218,7 +1268,9 @@ impl SemanticState {
                 if let Some(bid) = item_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})");
+                    eprintln!(
+                        "Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})"
+                    );
                 }
             }
             "book_delete" => {
@@ -1243,7 +1295,9 @@ impl SemanticState {
                     match self.index_db.list_indexed_books_by_shelf(sid).await {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!("Semantic: {event} — index lookup failed for shelf {sid}: {e}");
+                            eprintln!(
+                                "Semantic: {event} — index lookup failed for shelf {sid}: {e}"
+                            );
                             Vec::new()
                         }
                     }
@@ -1285,7 +1339,9 @@ impl SemanticState {
                     eprintln!("Semantic: role_delete — purged role {rid} from page_view_acl");
                 }
                 let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
-                eprintln!("Semantic: role_delete — queued ACL reconcile job {job_id} (new={is_new})");
+                eprintln!(
+                    "Semantic: role_delete — queued ACL reconcile job {job_id} (new={is_new})"
+                );
             }
 
             // --- Permission change on a specific entity ---

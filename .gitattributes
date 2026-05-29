@@ -1,2 +1,10 @@
 entrypoint.sh text eol=lf
 *.sh text eol=lf
+
+# CI regenerates these on every push; the per-PR auto-commit always
+# disagrees with the version on the target branch after any merge.
+# Resolve to "ours" (the target branch's version) on merge or rebase;
+# the next push fires generate-artifacts.yml and rewrites them cleanly.
+# Closes the rebase-friction tail #95 documents.
+SBOM.md       merge=ours
+STRUCTURE.md  merge=ours
