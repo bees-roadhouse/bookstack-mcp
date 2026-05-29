@@ -593,10 +593,11 @@ impl BookStackClient {
     }
 
     /// Paginated enumeration of every shelf the token can see. Returns the
-    /// flat list of shelf ids — used by the index worker's full walk when
-    /// `GlobalSettings::indexed_shelves` is empty (issue #119, the
-    /// "walk-all-by-default" path). BookStack's `/api/shelves` caps at 500
-    /// per page; we page until `data` comes back empty.
+    /// flat list of shelf ids — used by the index worker's full walk on
+    /// every run (issue #122, the unconditional walk-all path; replaces the
+    /// briefly-shipped #119/#120 "walk-all when `indexed_shelves` is empty"
+    /// branching). BookStack's `/api/shelves` caps at 500 per page; we page
+    /// until `data` comes back empty.
     pub async fn list_all_shelves(&self) -> Result<Vec<i64>, String> {
         const PAGE_SIZE: i64 = 500;
         let mut ids = Vec::new();

@@ -139,14 +139,13 @@ pub async fn handle_settings_get(State(state): State<AppState>, headers: HeaderM
 
 #[derive(Deserialize, Default)]
 pub struct SettingsForm {
-    // Issue #119 — single comma-separated integer list. Empty input = walk
-    // every visible shelf (the new default). Replaces the v0.12.x
-    // hive_shelf_id + user_journals_shelf_id named inputs.
-    #[serde(default)]
-    pub indexed_shelves: Option<String>,
     // Issue #80 — cascade multipliers + named scopes. Multipliers come in
     // as four separate number inputs; kb_scopes is a single JSON textarea
     // because the shape is open-ended (HashMap<String, ScopeDef>).
+    //
+    // Issue #122: the v0.13.0-RC `indexed_shelves` field is gone — the
+    // indexer walks every visible shelf unconditionally and per-call
+    // scoping on `semantic_search` is the only scope surface.
     #[serde(default)]
     pub cascade_stage1: Option<String>,
     #[serde(default)]
@@ -181,10 +180,6 @@ pub async fn handle_settings_post(
     let is_admin = bs_client.is_admin().await.unwrap_or(false);
     if is_admin {
         let mut globals = state.db.get_global_settings().await.unwrap_or_default();
-        // Issue #119 — parse comma-separated integer list. Malformed entries
-        // (non-numeric tokens, garbage) are dropped silently; empty input
-        // becomes an empty Vec, the walk-all sentinel.
-        globals.indexed_shelves = parse_indexed_shelves(&form.indexed_shelves);
 
         // Issue #80 — cascade multipliers. An empty input keeps the existing
         // value (so partial form posts don't accidentally reset the cascade
@@ -255,21 +250,6 @@ pub async fn handle_settings_probe_post(
 
 // --- Form parsing helpers ---
 
-/// Parse the comma-separated `indexed_shelves` form field into a clean
-/// `Vec<i64>`. Empty / whitespace-only input → empty Vec (the walk-all
-/// sentinel). Garbage tokens (non-numeric) are silently dropped — the
-/// form is admin-only and round-trips through the input on render, so an
-/// operator can see what the parser kept. Issue #119.
-fn parse_indexed_shelves(v: &Option<String>) -> Vec<i64> {
-    v.as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<i64>().ok())
-        .collect()
-}
-
 fn parse_optional_u32(v: &Option<String>) -> Option<u32> {
     v.as_deref()
         .map(str::trim)
@@ -291,12 +271,6 @@ fn render_settings_page(g: &GlobalSettings) -> String {
     } else {
         serde_json::to_string_pretty(&g.kb_scopes).unwrap_or_default()
     };
-    let indexed_shelves_csv = g
-        .indexed_shelves
-        .iter()
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -324,13 +298,13 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
 <p class="note">Admin-only global server config. Non-admin saves silently drop every field below.</p>
 <form method="post" action="/settings">
   <h2>Index worker</h2>
-  <label>Indexed shelves <input type="text" name="indexed_shelves" value="{indexed_shelves}" placeholder="42, 87"></label>
   <p class="help">
-    Comma-separated shelf IDs the full walk crawls (e.g. <code>42, 87</code>).
-    <strong>Leave empty to walk every shelf the index token can see</strong> — the
-    default for fresh deployments. Replaces the v0.12.x <code>hive_shelf_id</code> +
-    <code>user_journals_shelf_id</code> fields (issue #119); their values were
-    auto-migrated into this list on upgrade.
+    The full walk crawls <strong>every shelf the index token can see</strong>,
+    unconditionally (issue #122). Scope queries at the call site via
+    <code>semantic_search</code>'s <code>shelf_ids</code> /
+    <code>book_ids</code> / <code>chapter_ids</code> / <code>page_ids</code> /
+    <code>scopes</code> params (issue #80) — no global indexed-shelves cut to
+    configure here.
   </p>
 
   <h2>Semantic search — precision cascade (issue #80)</h2>
@@ -366,7 +340,6 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
 </form>
 </body>
 </html>"#,
-        indexed_shelves = html_escape(&indexed_shelves_csv),
         cascade_stage1 = g.cascade_multipliers.stage1,
         cascade_stage2 = g.cascade_multipliers.stage2,
         cascade_stage3 = g.cascade_multipliers.stage3,
@@ -383,35 +356,32 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
 mod tests {
     use super::*;
 
+    /// Issue #122 — the form must still validate clean serde for the
+    /// remaining cascade + kb_scopes fields after `indexed_shelves` was
+    /// dropped. A POST body carrying just those fields parses cleanly with
+    /// the dropped key absent.
     #[test]
-    fn parse_indexed_shelves_empty_input_yields_empty_vec() {
-        assert!(parse_indexed_shelves(&None).is_empty());
-        assert!(parse_indexed_shelves(&Some(String::new())).is_empty());
-        assert!(parse_indexed_shelves(&Some("   ".to_string())).is_empty());
-        assert!(parse_indexed_shelves(&Some(",,  ,".to_string())).is_empty());
+    fn settings_form_deserializes_without_indexed_shelves() {
+        // Simulate an x-www-form-urlencoded POST body.
+        let body =
+            "cascade_stage1=4&cascade_stage2=3&cascade_stage3=2&cascade_stage4=1&kb_scopes_json=";
+        let form: SettingsForm =
+            serde_urlencoded::from_str(body).expect("form must parse without indexed_shelves");
+        assert_eq!(form.cascade_stage1.as_deref(), Some("4"));
+        assert_eq!(form.cascade_stage2.as_deref(), Some("3"));
+        assert_eq!(form.cascade_stage3.as_deref(), Some("2"));
+        assert_eq!(form.cascade_stage4.as_deref(), Some("1"));
+        assert_eq!(form.kb_scopes_json.as_deref(), Some(""));
     }
 
+    /// Issue #122 — a stale form payload still carrying the dropped
+    /// `indexed_shelves` field must not break parsing. Unknown form fields
+    /// are tolerated and silently dropped.
     #[test]
-    fn parse_indexed_shelves_well_formed_csv() {
-        assert_eq!(
-            parse_indexed_shelves(&Some("42, 87, 100".to_string())),
-            vec![42, 87, 100]
-        );
-        // Whitespace tolerated, order preserved.
-        assert_eq!(
-            parse_indexed_shelves(&Some("  1 ,2,  3  ".to_string())),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[test]
-    fn parse_indexed_shelves_drops_garbage_tokens() {
-        // Mix of valid + garbage — valid ones survive in input order.
-        assert_eq!(
-            parse_indexed_shelves(&Some("42, foo, 87, bar, 100".to_string())),
-            vec![42, 87, 100]
-        );
-        // All-garbage input collapses to empty (walk-all sentinel).
-        assert!(parse_indexed_shelves(&Some("foo, bar, baz".to_string())).is_empty());
+    fn settings_form_deserializes_ignoring_legacy_indexed_shelves() {
+        let body = "indexed_shelves=42,87&cascade_stage1=4&cascade_stage2=3&cascade_stage3=2&cascade_stage4=1";
+        let form: SettingsForm = serde_urlencoded::from_str(body)
+            .expect("form must tolerate legacy indexed_shelves field");
+        assert_eq!(form.cascade_stage1.as_deref(), Some("4"));
     }
 }

@@ -314,19 +314,20 @@ pub struct IndexJob {
 
 /// Classify a shelf by id.
 ///
-/// Issue #119 (v0.13.0): with the generic `indexed_shelves` model, the
-/// indexer no longer distinguishes "hive shelf" from "user journals shelf".
-/// Every shelf the worker walks is now [`ShelfKind::Unclassified`], so this
-/// helper is a constant — kept as a single call site (rather than inlined
-/// at every walk path) for grep-ability and to make the future "we again
-/// care about shelf roles" reintroduction cheap.
+/// Issue #122 (v0.13.0): the indexer walks every visible shelf
+/// unconditionally and no longer distinguishes "hive shelf" from
+/// "user journals shelf". Every shelf the worker walks is now
+/// [`ShelfKind::Unclassified`], so this helper is a constant — kept as a
+/// single call site (rather than inlined at every walk path) for
+/// grep-ability and to make the future "we again care about shelf roles"
+/// reintroduction cheap.
 ///
 /// The downstream [`ShelfKind::Hive`] / [`ShelfKind::UserJournals`] arms in
 /// [`classify_book`] / [`classify_chapter`] / [`classify_page`] remain on
 /// the structs for serde back-compat with pre-#119 indexed rows; they're
-/// effectively dead code post-#119 because no shelf classifies into them
-/// anymore. They will get pruned in a follow-up cleanup once any lingering
-/// rows have been re-walked.
+/// effectively dead code post-#119/#122 because no shelf classifies into
+/// them anymore. They will get pruned in a follow-up cleanup once any
+/// lingering rows have been re-walked.
 pub fn classify_shelf(_shelf_id: i64) -> ShelfKind {
     ShelfKind::Unclassified
 }

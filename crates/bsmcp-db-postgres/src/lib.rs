@@ -78,12 +78,6 @@ impl PostgresDb {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
                 id INT PRIMARY KEY CHECK (id = 1),
-                /* Issue #119 — generic shelf list replacing hive_shelf_id +
-                   user_journals_shelf_id. Empty array = walk every shelf
-                   (the new default for fresh deployments). Non-empty =
-                   walk only the listed shelves. Stored as JSONB for cheap
-                   indexed lookups if we ever grow filters on it. */
-                indexed_shelves_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                 set_by_token_hash TEXT,
                 updated_at BIGINT NOT NULL DEFAULT 0,
                 /* Issue #80 — named scope cuts (HashMap<String, ScopeDef>)
@@ -91,6 +85,11 @@ impl PostgresDb {
                    JSON blobs. Empty/NULL means: use defaults. */
                 kb_scopes_json TEXT,
                 cascade_multipliers_json TEXT
+                /* Issue #122 — the v0.13.0-RC `indexed_shelves_json` column
+                   (and the v0.12.x `hive_shelf_id` + `user_journals_shelf_id`
+                   columns it replaced) are dropped via the migration block
+                   below. The indexer walks every visible shelf
+                   unconditionally; scope is per-call only. */
             )",
         )
         .execute(&pool)
@@ -124,68 +123,22 @@ impl PostgresDb {
             // multipliers. IF NOT EXISTS keeps the migration idempotent.
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS kb_scopes_json TEXT",
             "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS cascade_multipliers_json TEXT",
-            // Issue #119 — add indexed_shelves_json BEFORE attempting to
-            // back-fill it from the soon-to-be-dropped legacy columns. The
-            // back-fill runs in its own dedicated step below; the legacy
-            // DROP COLUMN IF EXISTS calls happen after.
-            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS indexed_shelves_json JSONB NOT NULL DEFAULT '[]'::jsonb",
+            // Issue #122 — drop the v0.13.0-RC `indexed_shelves_json` column
+            // (#120, which itself replaced the v0.12.x `hive_shelf_id` +
+            // `user_journals_shelf_id` pair, also dropped here). The indexer
+            // now walks every visible shelf unconditionally; per-call scope
+            // on `semantic_search` is the only scope surface. Postgres native
+            // `DROP COLUMN IF EXISTS` makes this idempotent on re-runs and a
+            // no-op on fresh installs that never had the column.
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS indexed_shelves_json",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS hive_shelf_id",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS user_journals_shelf_id",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
 
         sqlx::query("INSERT INTO global_settings (id, updated_at) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
             .execute(&pool).await.ok();
-
-        // Issue #119 — back-fill `indexed_shelves_json` from the legacy
-        // `hive_shelf_id` + `user_journals_shelf_id` columns when they still
-        // exist and the new field is still the default empty array. Wrapped
-        // in a DO block + EXECUTE-with-string so a missing legacy column
-        // doesn't blow up the boot path (post-migration databases just
-        // no-op through here). The dynamic EXECUTE is required because
-        // a static UPDATE in this position would fail to parse on a
-        // post-migration db where `hive_shelf_id` no longer exists.
-        sqlx::query(
-            r#"DO $migrate$
-             BEGIN
-               IF EXISTS (
-                 SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'global_settings'
-                   AND column_name = 'hive_shelf_id'
-               ) AND EXISTS (
-                 SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'global_settings'
-                   AND column_name = 'user_journals_shelf_id'
-               ) THEN
-                 EXECUTE $exec$
-                   UPDATE global_settings
-                   SET indexed_shelves_json = (
-                     SELECT COALESCE(
-                       jsonb_agg(DISTINCT v ORDER BY v) FILTER (WHERE v IS NOT NULL),
-                       '[]'::jsonb
-                     )
-                     FROM (
-                       VALUES (hive_shelf_id), (user_journals_shelf_id)
-                     ) AS legacy(v)
-                   )
-                   WHERE id = 1
-                     AND (indexed_shelves_json IS NULL OR indexed_shelves_json = '[]'::jsonb)
-                     AND (hive_shelf_id IS NOT NULL OR user_journals_shelf_id IS NOT NULL)
-                 $exec$;
-               END IF;
-             END $migrate$;"#,
-        )
-        .execute(&pool)
-        .await
-        .ok();
-
-        // Now drop the legacy columns. Native IF EXISTS on Postgres makes
-        // this safely idempotent on re-runs.
-        for sql in [
-            "ALTER TABLE global_settings DROP COLUMN IF EXISTS hive_shelf_id",
-            "ALTER TABLE global_settings DROP COLUMN IF EXISTS user_journals_shelf_id",
-        ] {
-            sqlx::query(sql).execute(&pool).await.ok();
-        }
 
         // v1.0.0 — DB-as-index schema. Mirror of every BookStack content item
         // we care about. Phase 3 ships the schema only; the reconciliation
@@ -514,8 +467,7 @@ impl DbBackend for PostgresDb {
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
-            "SELECT indexed_shelves_json::text AS indexed_shelves_json,
-                    set_by_token_hash, updated_at,
+            "SELECT set_by_token_hash, updated_at,
                     kb_scopes_json, cascade_multipliers_json
              FROM global_settings WHERE id = 1",
         )
@@ -525,13 +477,8 @@ impl DbBackend for PostgresDb {
 
         Ok(row
             .map(|r| {
-                let indexed_shelves_json: Option<String> = r.get("indexed_shelves_json");
                 let kb_scopes_json: Option<String> = r.get("kb_scopes_json");
                 let cascade_json: Option<String> = r.get("cascade_multipliers_json");
-                let indexed_shelves = indexed_shelves_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default();
                 let kb_scopes = kb_scopes_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok())
@@ -541,7 +488,6 @@ impl DbBackend for PostgresDb {
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or_default();
                 GlobalSettings {
-                    indexed_shelves,
                     set_by_token_hash: r.get("set_by_token_hash"),
                     updated_at: r.get("updated_at"),
                     kb_scopes,
@@ -577,21 +523,15 @@ impl DbBackend for PostgresDb {
             serde_json::to_string(&settings.cascade_multipliers)
                 .map_err(|e| format!("save_global_settings: serialize cascade_multipliers: {e}"))?,
         );
-        // Issue #119 — always persist (empty = walk-all sentinel). Stored
-        // as TEXT here and cast to JSONB by the parameter binding below.
-        let indexed_shelves_json = serde_json::to_string(&settings.indexed_shelves)
-            .map_err(|e| format!("save_global_settings: serialize indexed_shelves: {e}"))?;
 
         sqlx::query(
             "UPDATE global_settings
-             SET indexed_shelves_json = $1::jsonb,
-                 set_by_token_hash = $2,
-                 updated_at = $3,
-                 kb_scopes_json = $4,
-                 cascade_multipliers_json = $5
+             SET set_by_token_hash = $1,
+                 updated_at = $2,
+                 kb_scopes_json = $3,
+                 cascade_multipliers_json = $4
              WHERE id = 1",
         )
-        .bind(&indexed_shelves_json)
         .bind(&final_setter)
         .bind(Self::now_secs())
         .bind(&kb_scopes_json)
