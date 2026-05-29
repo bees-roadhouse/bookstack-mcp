@@ -438,8 +438,15 @@ pub async fn handle_message(
     };
 
     let semantic = state.semantic.as_deref();
-    let response =
-        mcp::handle_request(&request, &client, semantic, &state.staging, &state.timezone).await;
+    let response = mcp::handle_request(
+        &request,
+        &client,
+        semantic,
+        state.index_db.as_ref(),
+        &state.staging,
+        &state.timezone,
+    )
+    .await;
 
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
@@ -532,8 +539,15 @@ pub async fn handle_streamable(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
-    let response =
-        mcp::handle_request(&request, &client, semantic, &state.staging, &state.timezone).await;
+    let response = mcp::handle_request(
+        &request,
+        &client,
+        semantic,
+        state.index_db.as_ref(),
+        &state.staging,
+        &state.timezone,
+    )
+    .await;
 
     match response {
         Some(resp) => {

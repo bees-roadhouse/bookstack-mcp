@@ -353,4 +353,35 @@ pub trait IndexDb: Send + Sync + 'static {
 
     async fn get_index_meta(&self, key: &str) -> Result<Option<String>, String>;
     async fn set_index_meta(&self, key: &str, value: &str) -> Result<(), String>;
+
+    // --- Directory tree (issue #69) ---
+
+    /// List every non-deleted shelf in the index. Used by `read_directory_tree`
+    /// when scope is `All` to enumerate the top level.
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String>;
+
+    /// List every non-deleted book that isn't assigned to any shelf. Returned
+    /// alongside `list_indexed_shelves` for the `All` scope so the synthetic
+    /// "Unshelved" group can wrap them.
+    async fn list_indexed_books_unshelved(&self) -> Result<Vec<IndexedBook>, String>;
+
+    /// Assemble a scoped, depth-limited directory tree from the bookstack_*
+    /// index tables (NOT live BookStack — target ~10ms warm).
+    ///
+    /// Depth semantics: 0 returns just the root nodes (shelves or the
+    /// requested book/chapter) with empty `children`; 1 expands one level;
+    /// unbounded (`depth = None`) walks down to pages. `scope` chooses the
+    /// root; `All` materializes every shelf plus a synthetic "Unshelved"
+    /// pseudo-shelf (id = 0, kind = `Shelf`) that holds any book with
+    /// `shelf_id IS NULL`.
+    ///
+    /// Soft-deleted rows (`deleted = TRUE`) are skipped at every level. ACL
+    /// filtering is the caller's job — this method returns the structural
+    /// candidate tree; the MCP layer filters pages via BookStack's
+    /// `can_access_page` and prunes empty branches.
+    async fn read_directory_tree(
+        &self,
+        scope: DirectoryScope,
+        depth: Option<u32>,
+    ) -> Result<Vec<DirectoryNode>, String>;
 }
