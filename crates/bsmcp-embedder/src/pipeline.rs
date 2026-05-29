@@ -76,7 +76,11 @@ impl EmbedModel {
             load_custom_model(&downloaded)?
         };
 
-        eprintln!("Model loaded: {} ({} dims)", config.hf_repo, config.dims);
+        tracing::info!(
+            repo = config.hf_repo,
+            dims = config.dims,
+            "pipeline_model_loaded"
+        );
         Ok(Self {
             model: std::sync::Mutex::new(model),
             dims: config.dims,
@@ -138,7 +142,7 @@ impl RerankModel {
         let model =
             TextRerank::try_new(options).map_err(|e| format!("Reranker model init failed: {e}"))?;
 
-        eprintln!("Reranker loaded: {model_name}");
+        tracing::info!(model = %model_name, "pipeline_reranker_loaded");
         Ok(Self {
             model: std::sync::Mutex::new(model),
             model_name: model_name.to_string(),
@@ -192,7 +196,7 @@ struct DownloadedModel {
 fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<DownloadedModel, String> {
     use hf_hub::api::sync::ApiBuilder;
 
-    eprintln!("Downloading model from HuggingFace: {repo_id}");
+    tracing::info!(repo = %repo_id, "pipeline_hf_download_starting");
     let api = ApiBuilder::new()
         .with_cache_dir(PathBuf::from(cache_dir))
         .build()
@@ -203,7 +207,7 @@ fn download_hf_model(repo_id: &str, cache_dir: &str) -> Result<DownloadedModel, 
         let path = repo
             .get(filename)
             .map_err(|e| format!("Failed to download {filename}: {e}"))?;
-        eprintln!("  cached: {}", path.display());
+        tracing::debug!(path = %path.display(), "pipeline_hf_cached");
         Ok(path)
     };
 
@@ -267,7 +271,7 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
         let list = match client.list_shelves(100, offset).await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Pipeline: failed to list shelves for context lookup: {e}");
+                tracing::error!(error = %e, "pipeline_list_shelves_failed");
                 break;
             }
         };
@@ -303,7 +307,7 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
                         }
                     }
                 }
-                Err(e) => eprintln!("Pipeline: failed to get shelf {shelf_id}: {e}"),
+                Err(e) => tracing::error!(shelf_id, error = %e, "pipeline_get_shelf_failed"),
             }
         }
 
@@ -313,10 +317,7 @@ async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
             break;
         }
     }
-    eprintln!(
-        "Pipeline: shelf lookup built ({} book→shelf mappings)",
-        lookup.len()
-    );
+    tracing::info!(mappings = lookup.len(), "pipeline_shelf_lookup_built");
     lookup
 }
 
@@ -349,7 +350,7 @@ pub async fn run_pipeline(
     _batch_size: usize,
     consecutive_abort: usize,
 ) -> Result<PipelineResult, String> {
-    eprintln!("Pipeline: starting (scope={scope}, job_id={job_id})");
+    tracing::info!(scope = %scope, job_id, "pipeline_starting");
 
     // ACL-only reconciliation path. Triggered by webhooks for role events or
     // by the daily reconciliation cron — no embedding work, just refresh
@@ -357,7 +358,7 @@ pub async fn run_pipeline(
     if scope == "acl_reconcile" {
         match reconcile_all_pages(client, db).await {
             Ok((processed, failed)) => {
-                eprintln!("Pipeline: ACL reconcile complete — {processed} ok, {failed} failed");
+                tracing::info!(processed, failed, "pipeline_acl_reconcile_complete");
                 db.update_job_progress(job_id, processed as i64, (processed + failed) as i64)
                     .await?;
                 return Ok(PipelineResult {
@@ -367,7 +368,7 @@ pub async fn run_pipeline(
                 });
             }
             Err(e) => {
-                eprintln!("Pipeline: ACL reconcile failed: {e}");
+                tracing::error!(error = %e, "pipeline_acl_reconcile_failed");
                 return Err(e);
             }
         }
@@ -383,7 +384,7 @@ pub async fn run_pipeline(
     let role_ctx = match build_role_context(client).await {
         Ok(rc) => Some(rc),
         Err(e) => {
-            eprintln!("Pipeline: role context unavailable, ACL stamping disabled this run: {e}");
+            tracing::warn!(error = %e, "pipeline_role_context_unavailable_acl_disabled");
             None
         }
     };
@@ -437,7 +438,7 @@ pub async fn run_pipeline(
     let total_pages = all_page_ids.len();
     db.update_job_progress(job_id, 0, total_pages as i64)
         .await?;
-    eprintln!("Pipeline: found {total_pages} pages to embed");
+    tracing::info!(total_pages, "pipeline_pages_found");
 
     // Always force re-embed (bypass content hash check).
     // Context prefix changes (shelf/book/chapter renames, moves) don't change
@@ -456,7 +457,7 @@ pub async fn run_pipeline(
         // it on every page so a user-issued cancel takes effect within
         // one page rather than waiting for the whole walk to finish.
         if matches!(db.should_stop_embed_job(job_id).await, Ok(true)) {
-            eprintln!("Pipeline: job {job_id} flipped out of running — aborting at page {i}");
+            tracing::info!(job_id, page_index = i, "pipeline_job_cancelled_aborting");
             aborted = true;
             db.update_job_progress(job_id, i as i64, total_pages as i64)
                 .await?;
@@ -478,16 +479,16 @@ pub async fn run_pipeline(
                 consecutive_failures = 0;
             }
             Err(e) => {
-                eprintln!("Pipeline: error embedding page {page_id}: {e}");
+                tracing::error!(page_id = *page_id, error = %e, "pipeline_page_embed_failed");
                 failed_pages.push((*page_id, e));
                 consecutive_failures += 1;
 
                 // Abort early if we hit too many consecutive failures — likely systemic
                 if consecutive_failures >= consecutive_abort {
-                    eprintln!(
-                        "Pipeline: aborting — {consecutive_failures} consecutive failures \
-                         (likely systemic issue, not retrying remaining {} pages)",
-                        total_pages - i - 1
+                    tracing::error!(
+                        consecutive_failures,
+                        remaining = total_pages - i - 1,
+                        "pipeline_aborting_systemic_failures"
                     );
                     aborted = true;
                     db.update_job_progress(job_id, (i + 1) as i64, total_pages as i64)
@@ -507,9 +508,14 @@ pub async fn run_pipeline(
 
     let failed_count = failed_pages.len();
     if failed_count > 0 {
-        eprintln!("Pipeline: finished with {failed_count} failure(s) out of {total_pages} pages (aborted={aborted})");
+        tracing::warn!(
+            failed = failed_count,
+            total_pages,
+            aborted,
+            "pipeline_finished_with_failures"
+        );
     } else {
-        eprintln!("Pipeline: completed ({total_pages} pages, 0 failures)");
+        tracing::info!(total_pages, "pipeline_completed");
     }
 
     Ok(PipelineResult {
@@ -590,16 +596,23 @@ async fn embed_single_page(
         if html.len() > 100 {
             // Log a sample of the HTML to help diagnose why chunking failed
             let sample: String = html.chars().take(300).collect();
-            eprintln!("Pipeline: page {page_id} ({name}) has {len} bytes of HTML but chunker produced 0 chunks. Sample: {sample}",
-                len = html.len());
+            tracing::warn!(
+                page_id,
+                name = %name,
+                html_len = html.len(),
+                sample = %sample,
+                "pipeline_chunker_empty_result"
+            );
         }
         db.upsert_page(&meta).await?;
         return Ok(());
     }
-    eprintln!(
-        "Pipeline: page {page_id} ({name}) — {n} chunks from {len} bytes",
-        n = chunks.len(),
-        len = html.len()
+    tracing::debug!(
+        page_id,
+        name = %name,
+        chunks = chunks.len(),
+        html_len = html.len(),
+        "pipeline_page_chunked"
     );
 
     // Build context prefix for embedding (shelf > book > chapter > page hierarchy)
@@ -678,11 +691,11 @@ async fn embed_single_page(
         match resolve_page_acl(client, page_id, chapter_id, book_id, rc).await {
             Ok(acl) => {
                 if let Err(e) = db.upsert_page_acl(&acl).await {
-                    eprintln!("Pipeline: page {page_id} ACL upsert failed (non-fatal): {e}");
+                    tracing::warn!(page_id, error = %e, "pipeline_acl_upsert_failed");
                 }
             }
             Err(e) => {
-                eprintln!("Pipeline: page {page_id} ACL resolve failed (non-fatal): {e}");
+                tracing::warn!(page_id, error = %e, "pipeline_acl_resolve_failed");
             }
         }
     }

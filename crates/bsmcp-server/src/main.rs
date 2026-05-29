@@ -27,11 +27,16 @@ async fn main() {
     // Check for migration subcommand
     let args: Vec<String> = env::args().collect();
     if args.len() >= 2 && args[1] == "migrate" {
+        // Migrate CLI is interactive: it writes user-facing progress on stderr
+        // and exits. Tracing subscriber is intentionally not initialized for
+        // this path so the migration output stays human-readable instead of
+        // becoming log records.
         run_migration(&args[2..]).await;
         return;
     }
 
-    eprintln!("BookStack MCP Server v{}", env!("CARGO_PKG_VERSION"));
+    bsmcp_common::logging::init("bsmcp-server");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "server_starting");
 
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
 
@@ -47,7 +52,7 @@ async fn main() {
     if encryption_key.len() < 32 {
         panic!("BSMCP_ENCRYPTION_KEY must be at least 32 characters");
     }
-    eprintln!("Encryption: enabled (AES-256-GCM)");
+    tracing::info!(cipher = "AES-256-GCM", "encryption_enabled");
 
     // Select database backend
     let backend_type = DbBackendType::from_env();
@@ -64,7 +69,7 @@ async fn main() {
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            eprintln!("Database: SQLite ({})", db_path.display());
+            tracing::info!(backend = "sqlite", path = %db_path.display(), "database_selected");
             let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
             (
                 db.clone() as Arc<dyn DbBackend>,
@@ -75,40 +80,38 @@ async fn main() {
         DbBackendType::Postgres => {
             let database_url = env::var("BSMCP_DATABASE_URL")
                 .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
-            eprintln!("Database: PostgreSQL");
+            tracing::info!(backend = "postgres", "database_selected");
 
             // Auto-migrate from SQLite if a database file exists
             let sqlite_path = env::var("BSMCP_DB_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
             if sqlite_path.exists() {
-                eprintln!(
-                    "Auto-migration: found SQLite database at {}",
-                    sqlite_path.display()
+                tracing::info!(
+                    sqlite_path = %sqlite_path.display(),
+                    "auto_migration_found_sqlite"
                 );
                 match migrate::run(&sqlite_path, &database_url).await {
                     Ok(()) => {
                         // Rename to prevent re-migration on next startup
                         let migrated_path = sqlite_path.with_extension("db.migrated");
                         if let Err(e) = std::fs::rename(&sqlite_path, &migrated_path) {
-                            eprintln!(
-                                "Auto-migration: warning — could not rename SQLite file: {e}"
-                            );
-                            eprintln!(
-                                "Auto-migration: manually remove {} to prevent re-migration",
-                                sqlite_path.display()
+                            tracing::warn!(
+                                error = %e,
+                                sqlite_path = %sqlite_path.display(),
+                                "auto_migration_rename_failed"
                             );
                         } else {
-                            eprintln!(
-                                "Auto-migration: renamed {} → {}",
-                                sqlite_path.display(),
-                                migrated_path.display()
+                            tracing::info!(
+                                from = %sqlite_path.display(),
+                                to = %migrated_path.display(),
+                                "auto_migration_renamed"
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("Auto-migration: failed — {e}");
-                        eprintln!("Auto-migration: continuing with empty PostgreSQL database");
+                        tracing::error!(error = %e, "auto_migration_failed");
+                        tracing::warn!("auto_migration_continuing_empty");
                     }
                 }
             }
@@ -136,7 +139,7 @@ async fn main() {
         if let Some(domain) = &public_domain {
             urls.push(format!("https://{domain}"));
         } else {
-            eprintln!("Warning: BSMCP_PUBLIC_DOMAIN is not set — AI assistants won't be able to present clickable BookStack links to users");
+            tracing::warn!("public_domain_unset — AI assistants won't be able to present clickable BookStack links to users");
         }
         if let Ok(domain) = env::var("BSMCP_INTERNAL_DOMAIN") {
             let domain = domain.trim().trim_end_matches('/');
@@ -145,7 +148,7 @@ async fn main() {
             }
         }
         if !urls.is_empty() {
-            eprintln!("Known URLs: {}", urls.join(", "));
+            tracing::info!(urls = %urls.join(", "), "known_urls_configured");
         }
         urls
     };
@@ -177,11 +180,11 @@ async fn main() {
         match &semantic_db {
             Some(sdb) => {
                 if let Err(e) = sdb.init_semantic_tables().await {
-                    eprintln!("Semantic: failed to initialize tables — {e}");
-                    eprintln!("Semantic: continuing without semantic search");
+                    tracing::error!(error = %e, "semantic_init_failed");
+                    tracing::warn!("semantic_disabled_due_to_init_failure");
                     None
                 } else {
-                    eprintln!("Semantic: enabled (embedder_url={embedder_url})");
+                    tracing::info!(embedder_url = %embedder_url, "semantic_enabled");
                     let state = Arc::new(semantic::SemanticState::new(
                         sdb.clone(),
                         db.clone(),
@@ -194,12 +197,12 @@ async fn main() {
                 }
             }
             None => {
-                eprintln!("Semantic: no semantic database available");
+                tracing::warn!("semantic_no_db_available");
                 None
             }
         }
     } else {
-        eprintln!("Semantic: disabled");
+        tracing::info!("semantic_disabled");
         None
     };
 
@@ -213,10 +216,10 @@ async fn main() {
     // every tools/call response so an AI session knows the local clock
     // without re-deriving the conversion on every turn.
     let timezone = Arc::new(TimezoneConfig::from_env());
-    eprintln!(
-        "Timezone: {} (source={})",
-        timezone.name,
-        timezone.source.as_str()
+    tracing::info!(
+        timezone = %timezone.name,
+        source = %timezone.source.as_str(),
+        "timezone_resolved"
     );
 
     let state = sse::AppState::new(
@@ -263,7 +266,7 @@ async fn main() {
                 .post(settings_ui::handle_settings_probe_post),
         )
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }));
-    eprintln!("Settings: UI active at GET/POST /settings");
+    tracing::info!(route = "/settings", "settings_ui_active");
 
     // Staging upload endpoint for file uploads (50MB limit)
     app = app.route(
@@ -271,7 +274,7 @@ async fn main() {
         axum::routing::post(staging::handle_stage_upload)
             .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
     );
-    eprintln!("Staging: upload endpoint active at POST /stage/upload/:id");
+    tracing::info!(route = "/stage/upload/:id", "staging_upload_active");
 
     // Conditional webhook + status routes for semantic search
     if state.semantic.is_some() {
@@ -286,11 +289,15 @@ async fn main() {
                 "/jobs/index/{id}/cancel",
                 axum::routing::post(handle_cancel_index_job),
             );
-        eprintln!("Semantic: webhook endpoint active at POST /webhooks/bookstack");
-        eprintln!(
-            "Semantic: status page at GET /status (auth-gated — Bearer token or settings cookie)"
+        tracing::info!(route = "/webhooks/bookstack", "semantic_webhook_active");
+        tracing::info!(
+            route = "/status",
+            "semantic_status_active (auth-gated — Bearer token or settings cookie)"
         );
-        eprintln!("Semantic: cancel endpoints at POST /jobs/{{embed,index}}/:id/cancel");
+        tracing::info!(
+            routes = "/jobs/{embed,index}/:id/cancel",
+            "semantic_cancel_active"
+        );
     }
 
     let app = app
@@ -312,7 +319,7 @@ async fn main() {
         .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
-    eprintln!("BookStack MCP server listening on {addr}");
+    tracing::info!(addr = %addr, "server_listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -338,7 +345,9 @@ async fn handle_webhook(
         .or_else(|| {
             let qs = params.get("secret").cloned();
             if qs.is_some() {
-                eprintln!("Webhook: secret via query param is deprecated — use X-Webhook-Secret header instead");
+                tracing::warn!(
+                    "webhook_query_secret_deprecated — use X-Webhook-Secret header instead"
+                );
             }
             qs
         });
@@ -354,7 +363,7 @@ async fn handle_webhook(
     };
 
     if let Err(e) = semantic.handle_webhook(&payload).await {
-        eprintln!("Webhook error: {e}");
+        tracing::error!(error = %e, "webhook_handler_error");
     }
 
     // Index reconciliation: enqueue page-scope jobs alongside the existing
@@ -362,7 +371,7 @@ async fn handle_webhook(
     // worker policies tune independently. Best-effort — failures here
     // never block the webhook from returning ACCEPTED.
     if let Err(e) = enqueue_index_jobs_for_webhook(&payload, &state).await {
-        eprintln!("IndexWorker: webhook enqueue failed (non-fatal): {e}");
+        tracing::error!(error = %e, "indexworker_webhook_enqueue_failed");
     }
 
     StatusCode::ACCEPTED.into_response()
@@ -389,13 +398,13 @@ async fn enqueue_index_jobs_for_webhook(
                     .index_db
                     .create_index_job(&scope, "both", "webhook")
                     .await?;
-                eprintln!("IndexWorker: {event} — queued {scope} job {job_id} (new={is_new})");
+                tracing::info!(event = %event, scope = %scope, job_id, is_new, "indexworker_job_queued");
             }
         }
         "page_delete" => {
             if let Some(pid) = item_id {
                 state.index_db.soft_delete_indexed_page(pid).await?;
-                eprintln!("IndexWorker: page_delete — soft-deleted page {pid} from index");
+                tracing::info!(page_id = pid, "indexworker_page_soft_deleted");
             }
         }
         "chapter_create" | "chapter_update" | "chapter_delete" | "chapter_move" => {
@@ -411,7 +420,7 @@ async fn enqueue_index_jobs_for_webhook(
                 .index_db
                 .create_index_job("all", "both", "webhook")
                 .await?;
-            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+            tracing::info!(event = %event, scope = "all", job_id, is_new, "indexworker_full_walk_queued");
         }
         "book_update" | "book_sort" | "book_create_from_chapter" | "book_delete" => {
             if event == "book_delete" {
@@ -423,7 +432,7 @@ async fn enqueue_index_jobs_for_webhook(
                 .index_db
                 .create_index_job("all", "both", "webhook")
                 .await?;
-            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+            tracing::info!(event = %event, scope = "all", job_id, is_new, "indexworker_full_walk_queued");
         }
         "bookshelf_create_from_book" | "bookshelf_update" | "bookshelf_delete" => {
             if event == "bookshelf_delete" {
@@ -435,7 +444,7 @@ async fn enqueue_index_jobs_for_webhook(
                 .index_db
                 .create_index_job("all", "both", "webhook")
                 .await?;
-            eprintln!("IndexWorker: {event} — queued full walk job {job_id} (new={is_new})");
+            tracing::info!(event = %event, scope = "all", job_id, is_new, "indexworker_full_walk_queued");
         }
         _ => {
             // Unknown event — log and ignore, matching semantic.rs's behavior.
@@ -702,7 +711,7 @@ async fn handle_cancel_embed_job(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
     if let Err(e) = semantic.cancel_embed_job(id).await {
-        eprintln!("cancel_embed_job({id}) failed: {e}");
+        tracing::error!(job_id = id, error = %e, "cancel_embed_job_failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cancel failed: {e}"),
@@ -725,7 +734,7 @@ async fn handle_cancel_index_job(
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     if let Err(e) = state.index_db.cancel_index_job(id).await {
-        eprintln!("cancel_index_job({id}) failed: {e}");
+        tracing::error!(job_id = id, error = %e, "cancel_index_job_failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cancel failed: {e}"),

@@ -206,11 +206,11 @@ impl SemanticState {
             .and_then(|v| v.parse().ok())
             .unwrap_or(24);
         if interval_hours == 0 {
-            eprintln!("Semantic: ACL reconciliation disabled (BSMCP_ACL_RECONCILE_HOURS=0)");
+            tracing::info!("semantic_acl_reconcile_disabled");
             return;
         }
         let interval = Duration::from_secs(interval_hours * 3600);
-        eprintln!("Semantic: ACL reconcile cron active — every {interval_hours}h");
+        tracing::info!(interval_hours, "semantic_acl_reconcile_cron_active");
         tokio::spawn(async move {
             // Stagger initial run so server startup isn't immediately followed
             // by a heavy reconcile. 5 minutes is enough for the embedder to
@@ -218,10 +218,12 @@ impl SemanticState {
             tokio::time::sleep(Duration::from_secs(5 * 60)).await;
             loop {
                 match self.db.create_embed_job("acl_reconcile").await {
-                    Ok((job_id, is_new)) => eprintln!(
-                        "Semantic: ACL reconcile cron — queued job {job_id} (new={is_new})"
-                    ),
-                    Err(e) => eprintln!("Semantic: ACL reconcile cron — queue failed: {e}"),
+                    Ok((job_id, is_new)) => {
+                        tracing::info!(job_id, is_new, "semantic_acl_reconcile_cron_queued")
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "semantic_acl_reconcile_cron_queue_failed")
+                    }
                 }
                 tokio::time::sleep(interval).await;
             }
@@ -236,7 +238,7 @@ impl SemanticState {
 
         for attempt in 0..2 {
             if attempt > 0 {
-                eprintln!("embed_query: retry {attempt} after error: {last_err}");
+                tracing::warn!(attempt, error = %last_err, "embed_query_retry");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
@@ -445,7 +447,7 @@ impl SemanticState {
                         .cloned()
                         .unwrap_or_default(),
                     Err(e) => {
-                        eprintln!("Hybrid: keyword search failed (non-fatal): {e}");
+                        tracing::warn!(error = %e, "hybrid_keyword_search_failed");
                         Vec::new()
                     }
                 }
@@ -561,7 +563,7 @@ impl SemanticState {
                     match self.db.get_markov_blanket(pid).await {
                         Ok(b) => Some((pid, b)),
                         Err(e) => {
-                            eprintln!("Blanket: error for page {pid}: {e}");
+                            tracing::warn!(page_id = pid, error = %e, "blanket_fetch_error");
                             None
                         }
                     }
@@ -954,7 +956,11 @@ impl SemanticState {
                         }
                     }
                     Err(e) => {
-                        eprintln!("resolve_scope: list_indexed_books_by_shelf({sid}) failed: {e}");
+                        tracing::warn!(
+                            shelf_id = sid,
+                            error = %e,
+                            "resolve_scope_shelf_lookup_failed"
+                        );
                     }
                 }
             }
@@ -1060,7 +1066,11 @@ impl SemanticState {
                 .cloned()
                 .unwrap_or_default(),
             Err(e) => {
-                eprintln!("Cascade stage 2: keyword search failed (non-fatal): {e}");
+                tracing::warn!(
+                    stage = 2,
+                    error = %e,
+                    "cascade_keyword_search_failed_non_fatal"
+                );
                 Vec::new()
             }
         };
@@ -1463,7 +1473,7 @@ impl SemanticState {
         let related = payload.get("related_item").unwrap_or(&json!(null));
         let item_id = related.get("id").and_then(|v| v.as_i64());
 
-        eprintln!("Semantic: webhook event={event} item_id={item_id:?}");
+        tracing::info!(event = %event, item_id = ?item_id, "webhook_received");
 
         match event {
             // --- Page events ---
@@ -1471,8 +1481,12 @@ impl SemanticState {
                 if let Some(pid) = item_id {
                     let scope = format!("page:{pid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!(
-                        "Semantic: {event} — queued page:{pid} embed job {job_id} (new={is_new})"
+                    tracing::info!(
+                        event = %event,
+                        scope = %scope,
+                        job_id,
+                        is_new,
+                        "semantic_embed_job_queued"
                     );
                 }
             }
@@ -1482,8 +1496,12 @@ impl SemanticState {
                 if let Some(pid) = item_id {
                     let scope = format!("page:{pid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!(
-                        "Semantic: page_move — queued page:{pid} embed job {job_id} (new={is_new})"
+                    tracing::info!(
+                        event = "page_move",
+                        scope = %scope,
+                        job_id,
+                        is_new,
+                        "semantic_embed_job_queued"
                     );
                 }
             }
@@ -1494,7 +1512,7 @@ impl SemanticState {
                     // index doesn't accumulate dead entries.
                     self.db.delete_page(pid).await?;
                     let _ = self.db.delete_page_acl(pid).await;
-                    eprintln!("Semantic: deleted embeddings + ACL for page {pid}");
+                    tracing::info!(page_id = pid, "semantic_page_deleted");
                 }
             }
 
@@ -1504,8 +1522,12 @@ impl SemanticState {
                 if let Some(bid) = book_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!(
-                        "Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})"
+                    tracing::info!(
+                        event = %event,
+                        scope = %scope,
+                        job_id,
+                        is_new,
+                        "semantic_embed_job_queued"
                     );
                 }
             }
@@ -1523,7 +1545,14 @@ impl SemanticState {
                 if let Some(bid) = new_book_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!("Semantic: chapter_move — queued book:{bid} (dest) embed job {job_id} (new={is_new})");
+                    tracing::info!(
+                        event = "chapter_move",
+                        scope = %scope,
+                        role = "dest",
+                        job_id,
+                        is_new,
+                        "semantic_embed_job_queued"
+                    );
                 }
 
                 if let Some(cid) = item_id {
@@ -1531,7 +1560,12 @@ impl SemanticState {
                         Ok(Some(ch)) => Some(ch.book_id),
                         Ok(None) => None,
                         Err(e) => {
-                            eprintln!("Semantic: chapter_move — index lookup failed for chapter {cid}: {e}");
+                            tracing::error!(
+                                event = "chapter_move",
+                                chapter_id = cid,
+                                error = %e,
+                                "semantic_chapter_move_index_lookup_failed"
+                            );
                             None
                         }
                     };
@@ -1539,7 +1573,14 @@ impl SemanticState {
                         Some(pbid) if Some(pbid) != new_book_id => {
                             let scope = format!("book:{pbid}");
                             let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                            eprintln!("Semantic: chapter_move — queued book:{pbid} (prev source) embed job {job_id} (new={is_new})");
+                            tracing::info!(
+                                event = "chapter_move",
+                                scope = %scope,
+                                role = "prev_source",
+                                job_id,
+                                is_new,
+                                "semantic_embed_job_queued"
+                            );
                         }
                         Some(_) => {
                             // Index already reflects new book_id (e.g., the
@@ -1552,7 +1593,14 @@ impl SemanticState {
                             // pre-fix behavior so we don't silently miss the
                             // source book.
                             let (job_id, is_new) = self.db.create_embed_job("all").await?;
-                            eprintln!("Semantic: chapter_move — chapter {cid} not in index, fell back to scope=all embed job {job_id} (new={is_new})");
+                            tracing::warn!(
+                                event = "chapter_move",
+                                chapter_id = cid,
+                                scope = "all",
+                                job_id,
+                                is_new,
+                                "semantic_chapter_move_scope_all_fallback"
+                            );
                         }
                     }
                 }
@@ -1566,15 +1614,23 @@ impl SemanticState {
                 if let Some(bid) = item_id {
                     let scope = format!("book:{bid}");
                     let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                    eprintln!(
-                        "Semantic: {event} — queued book:{bid} embed job {job_id} (new={is_new})"
+                    tracing::info!(
+                        event = %event,
+                        scope = %scope,
+                        job_id,
+                        is_new,
+                        "semantic_embed_job_queued"
                     );
                 }
             }
             "book_delete" => {
                 // Pages are cascade-deleted by BookStack; page_delete webhooks
                 // should fire for each page. Just log for awareness.
-                eprintln!("Semantic: book_delete (id={item_id:?}) — page deletions handled by page_delete events");
+                tracing::info!(
+                    event = "book_delete",
+                    item_id = ?item_id,
+                    "semantic_book_delete_noted (page deletions handled by page_delete events)"
+                );
             }
 
             // --- Shelf events (scope to the affected books) ---
@@ -1593,8 +1649,11 @@ impl SemanticState {
                     match self.index_db.list_indexed_books_by_shelf(sid).await {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!(
-                                "Semantic: {event} — index lookup failed for shelf {sid}: {e}"
+                            tracing::error!(
+                                event = %event,
+                                shelf_id = sid,
+                                error = %e,
+                                "semantic_shelf_index_lookup_failed"
                             );
                             Vec::new()
                         }
@@ -1605,19 +1664,31 @@ impl SemanticState {
 
                 if books.is_empty() {
                     let (job_id, is_new) = self.db.create_embed_job("all").await?;
-                    eprintln!("Semantic: {event} — shelf {shelf_id:?} has no indexed books, fell back to scope=all embed job {job_id} (new={is_new})");
+                    tracing::warn!(
+                        event = %event,
+                        shelf_id = ?shelf_id,
+                        scope = "all",
+                        job_id,
+                        is_new,
+                        "semantic_shelf_scope_all_fallback"
+                    );
                 } else {
                     for book in &books {
                         let scope = format!("book:{}", book.book_id);
                         let (job_id, is_new) = self.db.create_embed_job(&scope).await?;
-                        eprintln!(
-                            "Semantic: {event} — queued book:{} embed job {job_id} (new={is_new})",
-                            book.book_id
+                        tracing::info!(
+                            event = %event,
+                            scope = %scope,
+                            job_id,
+                            is_new,
+                            "semantic_embed_job_queued"
                         );
                     }
-                    eprintln!(
-                        "Semantic: {event} — enqueued {} scoped book jobs for shelf {shelf_id:?}",
-                        books.len()
+                    tracing::info!(
+                        event = %event,
+                        shelf_id = ?shelf_id,
+                        count = books.len(),
+                        "semantic_shelf_book_jobs_enqueued"
                     );
                 }
             }
@@ -1629,16 +1700,26 @@ impl SemanticState {
             // ACL store is refreshed without paying the cost of re-embedding.
             "role_create" | "role_update" => {
                 let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
-                eprintln!("Semantic: {event} — queued ACL reconcile job {job_id} (new={is_new})");
+                tracing::info!(
+                    event = %event,
+                    scope = "acl_reconcile",
+                    job_id,
+                    is_new,
+                    "semantic_embed_job_queued"
+                );
             }
             "role_delete" => {
                 if let Some(rid) = item_id {
                     let _ = self.db.delete_role_from_acl(rid).await;
-                    eprintln!("Semantic: role_delete — purged role {rid} from page_view_acl");
+                    tracing::info!(role_id = rid, "semantic_role_purged_from_acl");
                 }
                 let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
-                eprintln!(
-                    "Semantic: role_delete — queued ACL reconcile job {job_id} (new={is_new})"
+                tracing::info!(
+                    event = "role_delete",
+                    scope = "acl_reconcile",
+                    job_id,
+                    is_new,
+                    "semantic_embed_job_queued"
                 );
             }
 
@@ -1651,11 +1732,18 @@ impl SemanticState {
             // path is already battle-tested.
             "permissions_update" => {
                 let (job_id, is_new) = self.db.create_embed_job("acl_reconcile").await?;
-                eprintln!("Semantic: permissions_update (item={item_id:?}) — queued ACL reconcile job {job_id} (new={is_new})");
+                tracing::info!(
+                    event = "permissions_update",
+                    item_id = ?item_id,
+                    scope = "acl_reconcile",
+                    job_id,
+                    is_new,
+                    "semantic_embed_job_queued"
+                );
             }
 
             _ => {
-                eprintln!("Semantic: ignoring webhook event {event}");
+                tracing::debug!(event = %event, "semantic_webhook_ignored");
             }
         }
 

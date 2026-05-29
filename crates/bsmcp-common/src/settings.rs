@@ -117,15 +117,19 @@ impl CascadeMultipliers {
                     if n > 0 {
                         *slot = n;
                     } else {
-                        eprintln!(
-                            "settings: ignoring {var}={v} (must be > 0); keeping {prev}",
-                            prev = *slot
+                        tracing::warn!(
+                            env_var = %var,
+                            value = %v,
+                            kept = *slot,
+                            "settings_env_rejected_non_positive"
                         );
                     }
                 } else {
-                    eprintln!(
-                        "settings: ignoring {var}={v} (not a positive integer); keeping {prev}",
-                        prev = *slot
+                    tracing::warn!(
+                        env_var = %var,
+                        value = %v,
+                        kept = *slot,
+                        "settings_env_rejected_not_integer"
                     );
                 }
             }
@@ -143,9 +147,9 @@ impl CascadeMultipliers {
         {
             self
         } else {
-            eprintln!(
-                "settings: cascade multipliers {self:?} are not a valid non-increasing cascade \
-                 (stage1 >= stage2 >= stage3 >= stage4 >= 1); falling back to defaults"
+            tracing::warn!(
+                multipliers = ?self,
+                "settings_cascade_invalid_falling_back_to_defaults"
             );
             Self::default()
         }

@@ -448,7 +448,7 @@ impl DbBackend for PostgresDb {
     }
 
     async fn backup(&self, _path: &Path) -> Result<(), String> {
-        eprintln!("Backup: PostgreSQL backups should use pg_dump externally");
+        tracing::info!("postgres_backup_no_op (use pg_dump externally)");
         Ok(())
     }
 
@@ -665,7 +665,7 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("Failed to create acl_reconcile_state: {e}"))?;
 
-        eprintln!("Semantic: PostgreSQL tables initialized");
+        tracing::info!(backend = "postgres", "semantic_tables_initialized");
         Ok(())
     }
 
@@ -1477,7 +1477,7 @@ impl SemanticDb for PostgresDb {
                 .await
                 .unwrap_or((0,));
             if chunk_count.0 == 0 {
-                eprintln!("vector_search: 0 results — chunks table is EMPTY (embeddings may have been cleared)");
+                tracing::warn!("postgres_vector_search_chunks_empty");
             } else {
                 // Check max score to see if threshold is the issue
                 let top: Option<(f32,)> = sqlx::query_as(
@@ -1489,8 +1489,13 @@ impl SemanticDb for PostgresDb {
                 .ok()
                 .flatten();
                 let max_score = top.map(|t| t.0).unwrap_or(0.0);
-                eprintln!("vector_search: 0 results — {count} chunks exist, threshold={threshold:.3}, max_score={max_score:.3}, dims={dims}",
-                    count = chunk_count.0, dims = query_embedding.len());
+                tracing::warn!(
+                    chunks = chunk_count.0,
+                    threshold = format!("{threshold:.3}"),
+                    max_score = format!("{max_score:.3}"),
+                    dims = query_embedding.len(),
+                    "postgres_vector_search_no_results"
+                );
             }
         }
 
@@ -1507,9 +1512,10 @@ impl SemanticDb for PostgresDb {
             .fetch_one(&self.pool)
             .await
             .unwrap_or((0,));
-        eprintln!(
-            "clear_all_embeddings: clearing {} pages, {} chunks",
-            pages.0, chunks.0
+        tracing::info!(
+            pages = pages.0,
+            chunks = chunks.0,
+            "postgres_clear_all_embeddings"
         );
 
         sqlx::query("DELETE FROM relationships")
@@ -1546,7 +1552,7 @@ impl SemanticDb for PostgresDb {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("recreate index: {e}"))?;
-        eprintln!("PostgreSQL: embedding column altered to vector({dims})");
+        tracing::info!(dims, "postgres_embedding_column_altered");
         Ok(())
     }
 
@@ -1587,7 +1593,7 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("compute_similar_pages: {e}"))?;
 
         let count = result.rows_affected() as usize;
-        eprintln!("Semantic: computed {count} similar-page relationships (top_k={top_k}, threshold={threshold})");
+        tracing::info!(count, top_k, threshold, "semantic_similar_pages_computed");
         Ok(count)
     }
 

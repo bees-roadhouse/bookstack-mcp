@@ -281,14 +281,15 @@ impl SqliteDb {
         if backups.len() > 3 {
             for entry in &backups[..backups.len() - 3] {
                 if let Err(e) = std::fs::remove_file(entry.path()) {
-                    eprintln!(
-                        "Failed to remove old backup {}: {e}",
-                        entry.path().display()
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "sqlite_backup_remove_old_failed"
                     );
                 } else {
-                    eprintln!(
-                        "Removed old backup: {}",
-                        entry.file_name().to_string_lossy()
+                    tracing::info!(
+                        file = %entry.file_name().to_string_lossy(),
+                        "sqlite_backup_removed_old"
                     );
                 }
             }
@@ -618,7 +619,7 @@ impl DbBackend for SqliteDb {
             .map_err(|e| format!("VACUUM INTO failed: {e}"))?;
 
             drop(conn);
-            eprintln!("Backup created: {}", backup_file.display());
+            tracing::info!(path = %backup_file.display(), "sqlite_backup_created");
 
             SqliteDb::cleanup_old_backups(&backup_dir);
             Ok(())
@@ -730,7 +731,7 @@ impl SemanticDb for SqliteDb {
                  );"
             ).map_err(|e| format!("Failed to create ACL tables: {e}"))?;
 
-            eprintln!("Semantic: tables initialized");
+            tracing::info!(backend = "sqlite", "semantic_tables_initialized");
             Ok(())
         })
         .await
@@ -923,7 +924,12 @@ impl SemanticDb for SqliteDb {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![page_id, chunk.chunk_index as i64, chunk.heading_path, chunk.content, chunk.content_hash, blob],
                 ) {
-                    eprintln!("DB: insert chunk {} for page {page_id}: {e}", chunk.chunk_index);
+                    tracing::error!(
+                        chunk_index = chunk.chunk_index,
+                        page_id,
+                        error = %e,
+                        "sqlite_insert_chunk_failed"
+                    );
                 }
             }
             tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
@@ -1768,7 +1774,12 @@ impl SemanticDb for SqliteDb {
             }
             tx.commit().map_err(|e| format!("commit: {e}"))?;
 
-            eprintln!("Semantic: computed {total_inserted} similar-page relationships (top_k={top_k}, threshold={threshold})");
+            tracing::info!(
+                inserted = total_inserted,
+                top_k,
+                threshold,
+                "semantic_similar_pages_computed"
+            );
             Ok(total_inserted)
         })
         .await

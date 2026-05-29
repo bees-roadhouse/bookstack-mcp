@@ -8,6 +8,7 @@ bsmcp-common = { path = "../bsmcp-common" }
 bsmcp-db-sqlite = { path = "../bsmcp-db-sqlite" }
 bsmcp-db-postgres = { path = "../bsmcp-db-postgres" }
 tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -13,6 +13,13 @@ resolver = "2"
 edition = "2021"
 version = "0.12.2"
 
+[workspace.dependencies]
+# Structured logging. `json` feature enables the JSON output mode that
+# `BSMCP_LOG_FORMAT=json` selects; `env-filter` parses `RUST_LOG`. The
+# logging subscriber is initialized per-binary via `bsmcp_common::logging`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
 [profile.release]
 lto = true
 strip = true

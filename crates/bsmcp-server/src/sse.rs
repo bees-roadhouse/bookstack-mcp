@@ -152,7 +152,7 @@ impl AppState {
                     sessions.retain(|sid, s| {
                         let expired = s.tx.is_closed() || s.created_at.elapsed() > SESSION_TTL;
                         if expired {
-                            eprintln!("Session {sid} cleaned up");
+                            tracing::debug!(session_id = %sid, "session_cleaned_up");
                         }
                         !expired
                     });
@@ -179,7 +179,7 @@ impl AppState {
                     crate::staging::cleanup_expired_sync(&staging_clone);
                 }
                 if let Err(e) = db.cleanup_expired_tokens().await {
-                    eprintln!("Token cleanup error: {e}");
+                    tracing::error!(error = %e, "token_cleanup_error");
                 }
             }
         });
@@ -192,16 +192,17 @@ impl AppState {
         let db = self.db.clone();
         let backup_path = self.backup_path.clone();
         let interval = Duration::from_secs(interval_hours * 3600);
-        eprintln!(
-            "Backup: enabled every {interval_hours}h to {}",
-            backup_path.display()
+        tracing::info!(
+            interval_hours,
+            path = %backup_path.display(),
+            "backup_enabled"
         );
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 match db.backup(&backup_path).await {
-                    Ok(()) => eprintln!("Backup: completed successfully"),
-                    Err(e) => eprintln!("Backup: failed — {e}"),
+                    Ok(()) => tracing::info!("backup_completed"),
+                    Err(e) => tracing::error!(error = %e, "backup_failed"),
                 }
             }
         });
@@ -243,7 +244,7 @@ pub async fn resolve_credentials(
         .unwrap_or("");
 
     if !auth.starts_with("Bearer ") {
-        eprintln!("Auth: no Bearer token in request");
+        tracing::debug!("auth_no_bearer");
         return Err(unauthorized("Bearer token required", headers, known_urls));
     }
 
@@ -251,23 +252,23 @@ pub async fn resolve_credentials(
 
     // Legacy format: token_id:token_secret
     if let Some((id, secret)) = token.split_once(':') {
-        eprintln!("Auth: legacy token format (token_id:secret)");
+        tracing::debug!(scheme = "legacy", "auth_token_resolved");
         return Ok((id.to_string(), secret.to_string()));
     }
 
     // OAuth access token (from database)
     match db.get_access_token(token).await {
         Ok(Some((token_id, token_secret))) => {
-            eprintln!("Auth: OAuth token resolved");
+            tracing::debug!(scheme = "oauth", "auth_token_resolved");
             return Ok((token_id, token_secret));
         }
         Ok(None) => {}
         Err(e) => {
-            eprintln!("Auth: token lookup error: {e}");
+            tracing::error!(error = %e, "auth_token_lookup_error");
         }
     }
 
-    eprintln!("Auth: token not recognized");
+    tracing::debug!("auth_token_not_recognized");
     Err(unauthorized(
         "Invalid or expired token",
         headers,
@@ -276,7 +277,7 @@ pub async fn resolve_credentials(
 }
 
 pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    eprintln!("GET /mcp/sse — SSE connection attempt");
+    tracing::debug!(method = "GET", route = "/mcp/sse", "sse_connect_attempt");
     let (token_id, token_secret) =
         match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
             Ok(creds) => creds,
@@ -291,7 +292,7 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
     );
 
     if let Err(e) = client.validate().await {
-        eprintln!("Credential validation failed: {e}");
+        tracing::warn!(error = %e, "credential_validation_failed");
         return unauthorized(
             "BookStack credentials are invalid or expired — please re-authenticate",
             &headers,
@@ -334,7 +335,7 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
         );
     }
 
-    eprintln!("SSE session {session_id} created");
+    tracing::info!(session_id = %session_id, "sse_session_created");
 
     let endpoint_url = format!("/mcp/messages/?sessionId={session_id}");
     let _ = tx
@@ -359,7 +360,11 @@ pub async fn handle_message(
     Query(params): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
-    eprintln!("POST /mcp/messages/ — message request");
+    tracing::debug!(
+        method = "POST",
+        route = "/mcp/messages/",
+        "sse_message_request"
+    );
     let (token_id, token_secret) =
         match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
             Ok(creds) => creds,
@@ -451,7 +456,7 @@ pub async fn handle_message(
     if let Some(response) = response {
         let data = serde_json::to_string(&response).unwrap_or_default();
         if let Err(e) = tx.try_send(Ok(Event::default().event("message").data(data))) {
-            eprintln!("SSE send failed for session {session_id}: {e}");
+            tracing::warn!(session_id = %session_id, error = %e, "sse_send_failed");
         }
     }
 
@@ -463,7 +468,7 @@ pub async fn handle_streamable(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    eprintln!("POST /mcp/sse — Streamable HTTP request");
+    tracing::debug!(method = "POST", route = "/mcp/sse", "streamable_request");
     let (token_id, token_secret) =
         match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
             Ok(creds) => creds,
@@ -514,7 +519,7 @@ pub async fn handle_streamable(
 
     if method == "initialize" {
         if let Err(e) = client.validate().await {
-            eprintln!("Streamable: credential validation failed: {e}");
+            tracing::warn!(error = %e, "streamable_credential_validation_failed");
             return unauthorized(
                 "BookStack credentials are invalid or expired — please re-authenticate",
                 &headers,
@@ -555,7 +560,7 @@ pub async fn handle_streamable(
 
             if method == "initialize" {
                 let new_session_id = uuid::Uuid::new_v4().to_string();
-                eprintln!("Streamable session {new_session_id} created");
+                tracing::info!(session_id = %new_session_id, "streamable_session_created");
                 {
                     let mut ss = state.streamable_sessions.write().await;
                     ss.insert(new_session_id.clone(), Instant::now());

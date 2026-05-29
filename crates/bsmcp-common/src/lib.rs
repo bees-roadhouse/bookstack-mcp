@@ -4,6 +4,7 @@ pub mod chunking;
 pub mod config;
 pub mod db;
 pub mod index;
+pub mod logging;
 pub mod rate_limit;
 pub mod settings;
 pub mod time;
