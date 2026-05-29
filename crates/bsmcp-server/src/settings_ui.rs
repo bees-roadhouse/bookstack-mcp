@@ -80,8 +80,14 @@ pub async fn issue_settings_session(
 }
 
 pub fn build_session_cookie(session_id: &str) -> String {
+    // Path=/ so the cookie is sent on every endpoint that admits a
+    // settings-session cookie auth path. Originally scoped to `/settings`
+    // which silently broke browser-session auth on `/status` (page never
+    // renders) and `/cancel/...` redirects. The session id is opaque,
+    // HttpOnly, and cap'd at SETTINGS_SESSION_TTL so the widened scope
+    // doesn't change the threat model — same secret, more routes.
     format!(
-        "{name}={id}; Path=/settings; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
+        "{name}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}; Secure",
         name = SETTINGS_COOKIE_NAME,
         id = session_id,
         ttl = SETTINGS_SESSION_TTL.as_secs(),
