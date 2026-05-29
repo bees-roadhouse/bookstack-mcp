@@ -51,7 +51,12 @@ impl SqliteDb {
                  hive_shelf_id INTEGER,
                  user_journals_shelf_id INTEGER,
                  set_by_token_hash TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT 0
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 /* Issue #80 — named scope cuts (HashMap<String, ScopeDef>)
+                    and the precision-cascade pool multipliers, persisted as
+                    JSON blobs. Empty/NULL means: use defaults. */
+                 kb_scopes_json TEXT,
+                 cascade_multipliers_json TEXT
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -189,6 +194,11 @@ impl SqliteDb {
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_page_id",
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_name",
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_ouid",
+            // Issue #80 — add the kb_scopes + cascade-multipliers JSON
+            // columns on existing databases. Duplicate-column errors swallowed
+            // via .ok() (same pattern as the v0.8.0 block).
+            "ALTER TABLE global_settings ADD COLUMN kb_scopes_json TEXT",
+            "ALTER TABLE global_settings ADD COLUMN cascade_multipliers_json TEXT",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -484,15 +494,28 @@ impl DbBackend for SqliteDb {
             let row = conn
                 .query_row(
                     "SELECT hive_shelf_id, user_journals_shelf_id,
-                        set_by_token_hash, updated_at
+                        set_by_token_hash, updated_at,
+                        kb_scopes_json, cascade_multipliers_json
                  FROM global_settings WHERE id = 1",
                     [],
                     |row| {
+                        let kb_scopes_json: Option<String> = row.get(4)?;
+                        let cascade_json: Option<String> = row.get(5)?;
+                        let kb_scopes = kb_scopes_json
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
+                        let cascade_multipliers = cascade_json
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
                         Ok(GlobalSettings {
                             hive_shelf_id: row.get::<_, Option<i64>>(0)?,
                             user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
                             set_by_token_hash: row.get::<_, Option<String>>(2)?,
                             updated_at: row.get::<_, i64>(3)?,
+                            kb_scopes,
+                            cascade_multipliers,
                         })
                     },
                 )
@@ -511,6 +534,21 @@ impl DbBackend for SqliteDb {
         let conn = self.conn.clone();
         let s = settings.clone();
         let setter = set_by_token_hash.to_string();
+        // Serialize the JSON blobs outside the blocking closure so a malformed
+        // map surfaces as a clean error before we touch SQLite. Empty
+        // map/defaults → NULL so the "use defaults" path stays cheap.
+        let kb_scopes_json = if s.kb_scopes.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&s.kb_scopes)
+                    .map_err(|e| format!("save_global_settings: serialize kb_scopes: {e}"))?,
+            )
+        };
+        let cascade_multipliers_json =
+            Some(serde_json::to_string(&s.cascade_multipliers).map_err(|e| {
+                format!("save_global_settings: serialize cascade_multipliers: {e}")
+            })?);
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let existing_setter: Option<String> = conn
@@ -527,13 +565,17 @@ impl DbBackend for SqliteDb {
                  SET hive_shelf_id = ?1,
                      user_journals_shelf_id = ?2,
                      set_by_token_hash = ?3,
-                     updated_at = ?4
+                     updated_at = ?4,
+                     kb_scopes_json = ?5,
+                     cascade_multipliers_json = ?6
                  WHERE id = 1",
                 params![
                     s.hive_shelf_id,
                     s.user_journals_shelf_id,
                     final_setter,
                     SqliteDb::now_secs(),
+                    kb_scopes_json,
+                    cascade_multipliers_json,
                 ],
             )
             .map_err(|e| format!("save_global_settings: {e}"))?;
@@ -1538,34 +1580,70 @@ impl SemanticDb for SqliteDb {
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
-        book_ids: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
     ) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();
-        // Materialize the optional filter into a Vec the closure can own. Empty
-        // slice means "no filter", same as None.
-        let book_filter: Option<Vec<i64>> = match book_ids {
-            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
-            _ => None,
-        };
+        // Materialize the scope filter into an owned struct the closure can
+        // hold. An all-empty filter collapses to "no scope" (full corpus).
+        let scope_owned: Option<ScopeFilter> = scope.filter(|s| !s.is_empty()).map(|s| {
+            let mut f = s.clone();
+            f.dedup();
+            f
+        });
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ref ids) = book_filter {
-                let placeholders = std::iter::repeat_n("?", ids.len())
-                    .collect::<Vec<_>>()
-                    .join(",");
+            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ref f) = scope_owned {
+                // Union semantics: a chunk qualifies if its parent page
+                // matches any of the supplied book/chapter/page IDs.
+                // Shelf-level IDs are not evaluated here — the caller must
+                // resolve shelves → books before invoking the search.
+                let mut where_parts: Vec<String> = Vec::new();
+                let mut params: Vec<i64> = Vec::new();
+                if !f.book_ids.is_empty() {
+                    let placeholders = std::iter::repeat_n("?", f.book_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    where_parts.push(format!("p.book_id IN ({placeholders})"));
+                    params.extend(f.book_ids.iter().copied());
+                }
+                if !f.chapter_ids.is_empty() {
+                    let placeholders = std::iter::repeat_n("?", f.chapter_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    where_parts.push(format!("p.chapter_id IN ({placeholders})"));
+                    params.extend(f.chapter_ids.iter().copied());
+                }
+                if !f.page_ids.is_empty() {
+                    let placeholders = std::iter::repeat_n("?", f.page_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    where_parts.push(format!("p.page_id IN ({placeholders})"));
+                    params.extend(f.page_ids.iter().copied());
+                }
+
+                // If only shelf_ids were supplied (which we can't resolve at
+                // this layer) we collapse to a no-match query — the cascade
+                // caller is expected to have expanded shelves into books
+                // before reaching here. Returning zero rows is safer than
+                // silently widening the scope.
+                if where_parts.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let where_clause = where_parts.join(" OR ");
                 let sql = format!(
                     "SELECT c.id, c.page_id, c.embedding
                      FROM chunks c JOIN pages p ON c.page_id = p.page_id
-                     WHERE p.book_id IN ({placeholders})"
+                     WHERE {where_clause}"
                 );
                 let mut stmt = conn
                     .prepare(&sql)
                     .map_err(|e| format!("Prepare failed: {e}"))?;
                 let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    params.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                 let out: Vec<(i64, i64, Vec<u8>)> = stmt
                     .query_map(params_vec.as_slice(), |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))

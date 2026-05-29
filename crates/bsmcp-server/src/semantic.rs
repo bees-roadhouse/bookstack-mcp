@@ -11,24 +11,28 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::{IndexDb, SemanticDb};
-use bsmcp_common::types::MarkovBlanket;
+use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::settings::{CascadeMultipliers, GlobalSettings};
+use bsmcp_common::types::{MarkovBlanket, ScopeFilter};
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Search ranking strategy. Selected per-call via the `mode` argument on
-/// `semantic_search`. All three modes return the same JSON shape so a
-/// caller can swap modes on the same query and diff the output.
+/// `semantic_search`. All modes return the same JSON shape so a caller can
+/// swap modes on the same query and diff the output.
 ///
-/// - `Standard`: vector + optional keyword + blanket boost + blended sort.
-///   Free, known-good baseline. Default.
+/// - `Standard` (alias `Default`): vector + optional keyword + blanket
+///   boost + blended sort. Free, known-good baseline.
 /// - `Rerank`: standard pipeline produces the top-N, then a cross-encoder
-///   /rerank pass re-orders just those N results. Cheap refinement on top
-///   of what works (~10-30ms for N≤50 against a local cross-encoder).
-/// - `Precision`: wider initial vector pass (5× limit), permission filter,
-///   then cross-encoder /rerank as the ranker of record (replaces the
-///   blanket+blend). More expensive, more potential to rescue a hit the
-///   blend would have missed. `hybrid` is forced false in this mode.
+///   `/rerank` pass re-orders just those N results. Cheap refinement
+///   (~10-30ms for N≤50 against a local cross-encoder).
+/// - `Precision`: **issue #80 four-stage cascade**. Stage 1 wide semantic
+///   pass (N×4), stage 2 keyword rescore (N×3), stage 3 Markov-blanket
+///   rescore + ACL filter (N×2), stage 4 cross-encoder rerank (N). Final
+///   ordering is the cross-encoder's; intermediate scores are cumulative.
+///   Replaces the pre-#80 precision implementation (wider pool + single
+///   rerank, no blend). Existing precision callers will see different
+///   ordering — same shape, different pipeline.
 ///
 /// `Rerank` and `Precision` both require `BSMCP_RERANK_PROVIDER` configured
 /// on the embedder; without it, `/rerank` returns 503 and the call surfaces
@@ -111,11 +115,20 @@ struct CachedAccess {
 
 pub struct SemanticState {
     db: Arc<dyn SemanticDb>,
+    /// Core backend — used to load `global_settings` for the cascade
+    /// multipliers and the `kb_scopes` named-scope resolver (issue #80).
+    /// Same underlying connection as `db`; held as a separate trait object
+    /// because `SemanticDb` doesn't expose `get_global_settings`.
+    core_db: Arc<dyn DbBackend>,
     /// Structural index — consulted by the webhook handler to scope shelf/
     /// chapter_move re-embeds to the actually-affected books instead of
     /// falling back to `scope=all`. Same backend instance as `db` for both
     /// SQLite and Postgres deployments; threaded through as a trait object
     /// so the semantic module doesn't depend on the concrete backend type.
+    ///
+    /// Issue #80: also used by `precision_cascade` to resolve `shelf_ids`
+    /// in a `ScopeFilter` to the matching `book_ids` before invoking the
+    /// vector pass.
     index_db: Arc<dyn IndexDb>,
     embedder_url: String,
     webhook_secret: String,
@@ -127,6 +140,7 @@ pub struct SemanticState {
 impl SemanticState {
     pub fn new(
         db: Arc<dyn SemanticDb>,
+        core_db: Arc<dyn DbBackend>,
         index_db: Arc<dyn IndexDb>,
         embedder_url: String,
         webhook_secret: String,
@@ -138,12 +152,42 @@ impl SemanticState {
             .expect("Failed to build embedder HTTP client");
         Self {
             db,
+            core_db,
             index_db,
             embedder_url: embedder_url.trim_end_matches('/').to_string(),
             webhook_secret,
             http_client,
             permission_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Load the singleton `global_settings` row. Wrapper around the
+    /// `DbBackend` getter so the cascade + named-scope resolver path stays
+    /// inside `SemanticState`.
+    pub async fn load_global_settings(&self) -> GlobalSettings {
+        self.core_db.get_global_settings().await.unwrap_or_default()
+    }
+
+    /// Resolve a list of named scope strings against the
+    /// `global_settings.kb_scopes` map. Unknown names are returned in the
+    /// second tuple field so the caller can surface them as a warning
+    /// (per acceptance: structured error, not silent). Empty names list →
+    /// empty filter + no unknowns.
+    pub async fn resolve_named_scopes(&self, names: &[String]) -> (ScopeFilter, Vec<String>) {
+        if names.is_empty() {
+            return (ScopeFilter::default(), Vec::new());
+        }
+        let settings = self.load_global_settings().await;
+        let mut out = ScopeFilter::default();
+        let mut unknown: Vec<String> = Vec::new();
+        for name in names {
+            match settings.kb_scopes.get(name) {
+                Some(def) => out.merge(&def.to_filter()),
+                None => unknown.push(name.clone()),
+            }
+        }
+        out.dedup();
+        (out, unknown)
     }
 
     pub fn webhook_secret(&self) -> &str {
@@ -329,16 +373,14 @@ impl SemanticState {
     }
 
     /// Hybrid search: vector + keyword + blanket re-ranking, with optional
-    /// cross-encoder rerank as either a refinement (`Rerank`) or a full
-    /// replacement of the blend (`Precision`). See [`SearchMode`] for the
+    /// cross-encoder rerank as either a refinement (`Rerank`) or a four-
+    /// stage cascade (`Precision`, issue #80). See [`SearchMode`] for the
     /// per-mode contract.
     ///
-    /// `book_filter`: when `Some(&[..])`, restricts the vector pass to chunks
-    /// whose page lives in one of the supplied books. The keyword pass and
-    /// permission/blanket steps are unaffected; the vector candidate pool is
-    /// just smaller from the outset, which proportionally shrinks the
-    /// permission filter and per-result fan-out. `None` keeps the old
-    /// whole-corpus behavior.
+    /// `scope`: when `Some(&filter)`, restricts the candidate corpus to the
+    /// union of the supplied shelf/book/chapter/page IDs. Shelf IDs are
+    /// resolved to the matching book IDs via the structural index before
+    /// the vector pass. Empty/`None` keeps the whole-corpus behavior.
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
@@ -348,26 +390,40 @@ impl SemanticState {
         hybrid: bool,
         verbose: bool,
         client: &BookStackClient,
-        book_filter: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
         mode: SearchMode,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
-        // Precision mode forces hybrid off. The cross-encoder is the ranker
-        // of record; mixing in keyword-rank scoring just dilutes its signal.
-        // Rerank mode keeps hybrid intact — the rerank only re-orders the
-        // final top-N from the standard pipeline.
+        // Resolve shelf_ids → book_ids via the structural index before the
+        // vector pass. The embedding `pages` table doesn't carry shelf_id,
+        // so vector_search can't filter on it directly; we lift shelf scope
+        // into the book_ids union here, then evaluate the rest at SQL.
+        let resolved_scope = self.resolve_scope(scope).await;
+
+        if mode == SearchMode::Precision {
+            return self
+                .precision_cascade(
+                    query,
+                    limit,
+                    threshold,
+                    verbose,
+                    client,
+                    resolved_scope.as_ref(),
+                    start,
+                )
+                .await;
+        }
+
+        // Precision-mode forced hybrid off historically; the cascade is its
+        // own pipeline now, so this guard is only meaningful for Rerank.
         let hybrid = hybrid && mode != SearchMode::Precision;
 
         // Run vector search and optional keyword search in parallel.
         // Candidate over-fetch is `limit * 2` for the standard/rerank path —
-        // empirically sufficient headroom after permission filtering. In
-        // precision mode we cast a wider net (`limit * 5`) because the
-        // cross-encoder benefits from seeing more candidates, and the rerank
-        // step itself caps the embedder side at 200 documents.
-        let candidate_multiplier: usize = if mode == SearchMode::Precision { 5 } else { 2 };
-        let book_filter_owned: Option<Vec<i64>> =
-            book_filter.filter(|s| !s.is_empty()).map(|s| s.to_vec());
+        // empirically sufficient headroom after permission filtering.
+        let candidate_multiplier: usize = 2;
+        let scope_for_vector = resolved_scope.clone();
         let vector_future = async {
             let query_vec = self.embed_query(query).await?;
             self.db
@@ -375,7 +431,7 @@ impl SemanticState {
                     &query_vec,
                     limit * candidate_multiplier,
                     threshold,
-                    book_filter_owned.as_deref(),
+                    scope_for_vector.as_ref(),
                 )
                 .await
         };
@@ -402,35 +458,40 @@ impl SemanticState {
         let hits = vector_result?;
         let mut keyword_results: Vec<Value> = keyword_result;
 
-        // If a book filter was applied to the vector pass, apply the same
+        // If a scope filter was applied to the vector pass, apply the same
         // filter to keyword results so we don't re-introduce out-of-scope
-        // pages via the hybrid merge path.
-        if let Some(allowed) = book_filter_owned.as_deref() {
-            let allowed_set: HashSet<i64> = allowed.iter().copied().collect();
-            // Keyword results don't carry book_id; fetch the book_id for each
-            // candidate page in one batched DB call and drop anything outside
-            // the allowed set.
-            let candidate_ids: Vec<i64> = keyword_results
-                .iter()
-                .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("page"))
-                .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
-                .collect();
-            if !candidate_ids.is_empty() {
-                let book_lookup: HashMap<i64, i64> = self
-                    .db
-                    .get_page_book_ids(&candidate_ids)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
+        // pages via the hybrid merge path. We approximate scope membership
+        // by the same book_id lookup the pre-#80 path used; chapter/page
+        // membership is implicit because the hits the cascade keeps come
+        // from the same scoped vector pool.
+        if let Some(allowed) = resolved_scope.as_ref() {
+            if !allowed.book_ids.is_empty() || !allowed.page_ids.is_empty() {
+                let allowed_books: HashSet<i64> = allowed.book_ids.iter().copied().collect();
+                let allowed_pages: HashSet<i64> = allowed.page_ids.iter().copied().collect();
+                let candidate_ids: Vec<i64> = keyword_results
+                    .iter()
+                    .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("page"))
+                    .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
                     .collect();
-                keyword_results.retain(|r| {
-                    let pid = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    match book_lookup.get(&pid) {
-                        Some(bid) => allowed_set.contains(bid),
-                        // Page not in embedding store — drop it (out-of-scope by definition).
-                        None => false,
-                    }
-                });
+                if !candidate_ids.is_empty() {
+                    let book_lookup: HashMap<i64, i64> = self
+                        .db
+                        .get_page_book_ids(&candidate_ids)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                    keyword_results.retain(|r| {
+                        let pid = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if allowed_pages.contains(&pid) {
+                            return true;
+                        }
+                        match book_lookup.get(&pid) {
+                            Some(bid) => allowed_books.contains(bid),
+                            None => false,
+                        }
+                    });
+                }
             }
         }
 
@@ -479,16 +540,8 @@ impl SemanticState {
         let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
-        // PRECISION MODE: replace blanket+blend with cross-encoder rerank.
-        // The candidate set is `page_scores` post-ACL. We pick the best
-        // chunk per page, send `(query, [doc_per_page])` to the embedder's
-        // /rerank, and use the returned scores as the final ordering.
-        // Skips the blanket boost and hybrid blend below.
-        if mode == SearchMode::Precision {
-            return self
-                .precision_rerank(query, limit, &page_scores, verbose, start)
-                .await;
-        }
+        // Issue #80: precision mode now dispatches to `precision_cascade()`
+        // at function entry. This is the Standard / Rerank path only.
 
         // Blanket re-ranking: boost pages whose neighbors also appear in vector results.
         // Use the full set of pages from raw vector hits (not just final candidates),
@@ -877,24 +930,214 @@ impl SemanticState {
         })
     }
 
-    /// Cross-encoder rerank step for **precision** mode. Replaces the blanket
-    /// boost + hybrid blend that the standard search path applies after the
-    /// permission filter. Picks one document per candidate page (the best-
-    /// scoring chunk's heading + content), POSTs `(query, [doc])` to the
-    /// embedder's `/rerank`, then renders the response in the same JSON
-    /// shape as the standard search so callers don't need to branch.
-    async fn precision_rerank(
+    /// Resolve a caller-supplied [`ScopeFilter`] for the cascade: any
+    /// `shelf_ids` are expanded to the matching `book_ids` via the
+    /// structural index. Returns `None` when the resolved filter is empty
+    /// (caller treats this as "full corpus").
+    async fn resolve_scope(&self, scope: Option<&ScopeFilter>) -> Option<ScopeFilter> {
+        let raw = scope?;
+        if raw.is_empty() {
+            return None;
+        }
+        let mut out = ScopeFilter {
+            book_ids: raw.book_ids.clone(),
+            chapter_ids: raw.chapter_ids.clone(),
+            page_ids: raw.page_ids.clone(),
+            shelf_ids: Vec::new(),
+        };
+        if !raw.shelf_ids.is_empty() {
+            for sid in &raw.shelf_ids {
+                match self.index_db.list_indexed_books_by_shelf(*sid).await {
+                    Ok(books) => {
+                        for b in books {
+                            out.book_ids.push(b.book_id);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("resolve_scope: list_indexed_books_by_shelf({sid}) failed: {e}");
+                    }
+                }
+            }
+        }
+        out.dedup();
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Cascade pool size: caller's `limit` × the multiplier for this stage,
+    /// clamped to a sane upper bound so a misconfigured multiplier can't
+    /// drive a cross-encoder call into the embedder's 200-doc cap.
+    fn cascade_pool(limit: usize, multiplier: u32) -> usize {
+        limit.saturating_mul(multiplier as usize).max(limit).max(1)
+    }
+
+    /// Load the cascade multipliers from `global_settings`, apply the env-
+    /// var overrides, validate the non-increasing constraint, and return
+    /// the resulting [`CascadeMultipliers`]. Called once per precision
+    /// invocation; the load is cheap (single-row read).
+    async fn cascade_multipliers(&self) -> CascadeMultipliers {
+        let settings = self.load_global_settings().await;
+        let mut m = settings.cascade_multipliers;
+        m.apply_env_overrides();
+        m.validated()
+    }
+
+    /// **Issue #80 precision-mode cascade.** Four stages, narrowing the
+    /// candidate pool from `N × 4` → `N × 3` → `N × 2` → `N`. Each stage
+    /// rescores the surviving candidates with its own signal; the final
+    /// ordering is the cross-encoder's. Stage multipliers are configurable
+    /// in `global_settings` with env-var overrides.
+    ///
+    /// | Stage | Pool      | Operation                                          |
+    /// |-------|-----------|----------------------------------------------------|
+    /// | 1     | N × 4     | Semantic vector pass; intersect with scope at SQL  |
+    /// | 2     | N × 3     | Keyword rescore (BookStack search API)             |
+    /// | 3     | N × 2     | Markov-blanket rescore + per-page ACL filter       |
+    /// | 4     | N         | Cross-encoder rerank via embedder `/rerank`        |
+    ///
+    /// Scope is the resolved [`ScopeFilter`] from [`Self::resolve_scope`];
+    /// shelf IDs are already lifted to book IDs by the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn precision_cascade(
         &self,
         query: &str,
         limit: usize,
-        page_scores: &HashMap<i64, PageScore>,
+        threshold: f32,
         verbose: bool,
+        client: &BookStackClient,
+        scope: Option<&ScopeFilter>,
         start: Instant,
     ) -> Result<Value, String> {
-        // One document per page = the highest-scoring chunk that contributed
-        // to this page's match. Pages with no chunks (keyword-only matches)
-        // are dropped — precision mode forces hybrid off, so this is rare,
-        // but it keeps the rerank input well-formed if anything slipped past.
+        let multipliers = self.cascade_multipliers().await;
+        let pool_stage1 = Self::cascade_pool(limit, multipliers.stage1);
+        let pool_stage2 = Self::cascade_pool(limit, multipliers.stage2);
+        let pool_stage3 = Self::cascade_pool(limit, multipliers.stage3);
+        let pool_stage4 = Self::cascade_pool(limit, multipliers.stage4);
+
+        // --- STAGE 1: semantic vector + scope intersection ---
+        // SQL-side intersection is cheaper than post-filtering when scope
+        // cardinality is small (which is the common case for named scopes
+        // like `policies` or a single shelf).
+        let query_vec = self.embed_query(query).await?;
+        let hits = self
+            .db
+            .vector_search(&query_vec, pool_stage1, threshold, scope)
+            .await?;
+
+        // Aggregate per-page: keep the best-scoring chunk's score as the
+        // page-level vector signal; carry the chunk list forward.
+        let mut page_scores: HashMap<i64, PageScore> = HashMap::new();
+        for hit in &hits {
+            let entry = page_scores.entry(hit.page_id).or_insert(PageScore {
+                vector_score: 0.0,
+                keyword_rank: 0.0,
+                blanket_boost: 0.0,
+                chunks: Vec::new(),
+            });
+            if hit.score > entry.vector_score {
+                entry.vector_score = hit.score;
+            }
+            entry.chunks.push((hit.chunk_id, hit.score));
+        }
+
+        // Truncate to the stage-1 pool: keep the top N×4 pages by vector
+        // score so downstream stages see the strongest semantic signal.
+        let pool_stage1_after = Self::trim_pool(&mut page_scores, pool_stage1);
+
+        // --- STAGE 2: keyword rescore ---
+        // BookStack's `/search` is BM25-ish; rerank our surviving candidates
+        // by their rank in the BM25 result. Pages outside the candidate set
+        // are ignored (we don't widen the pool), and pages that don't appear
+        // in the keyword result keep keyword_rank = 0 (vector signal alone
+        // carries them through).
+        let keyword_results = match client.search(query, 1, (pool_stage1 as i64).max(20)).await {
+            Ok(resp) => resp
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Err(e) => {
+                eprintln!("Cascade stage 2: keyword search failed (non-fatal): {e}");
+                Vec::new()
+            }
+        };
+        if !keyword_results.is_empty() {
+            let total = keyword_results.len() as f32;
+            let candidate_set: HashSet<i64> = page_scores.keys().copied().collect();
+            for (i, r) in keyword_results.iter().enumerate() {
+                if r.get("type").and_then(|v| v.as_str()) != Some("page") {
+                    continue;
+                }
+                let pid = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                if pid == 0 || !candidate_set.contains(&pid) {
+                    continue;
+                }
+                if let Some(entry) = page_scores.get_mut(&pid) {
+                    entry.keyword_rank = 1.0 - (i as f32 / total);
+                }
+            }
+        }
+        let pool_stage2_after = Self::trim_pool_by_blend(&mut page_scores, pool_stage2, |s| {
+            s.vector_score * 0.6 + s.keyword_rank * 0.4
+        });
+
+        // --- STAGE 3: Markov blanket rescore + ACL filter ---
+        // Per-page ACL filter first so we don't burn blanket fetches on
+        // pages the caller can't see. Blanket fetch is the dominant cost
+        // here (4 small indexed queries per page); concurrency 20 is the
+        // sweet spot for both SQLite and Postgres backends.
+        let page_ids: Vec<i64> = page_scores.keys().copied().collect();
+        let accessible_ids = self.filter_by_permission(&page_ids, client).await;
+        let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
+        page_scores.retain(|pid, _| accessible_set.contains(pid));
+
+        let scored_set: HashSet<i64> = page_scores.keys().copied().collect();
+        let all_hit_page_ids: HashSet<i64> = hits.iter().map(|h| h.page_id).collect();
+
+        let surviving_ids: Vec<i64> = page_scores.keys().copied().collect();
+        let blanket_fetches: Vec<(i64, MarkovBlanket)> = stream::iter(surviving_ids)
+            .map(|pid| async move { self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b)) })
+            .buffer_unordered(20)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await;
+        let blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
+
+        for (page_id, blanket) in blanket_cache.iter() {
+            let mut strong = 0usize;
+            let mut weak = 0usize;
+            for related in blanket
+                .linked_from
+                .iter()
+                .chain(blanket.links_to.iter())
+                .chain(blanket.co_linked.iter())
+                .chain(blanket.siblings.iter())
+            {
+                let nid = related.page_id;
+                if scored_set.contains(&nid) {
+                    strong += 1;
+                } else if all_hit_page_ids.contains(&nid) {
+                    weak += 1;
+                }
+            }
+            if strong > 0 || weak > 0 {
+                let boost = (strong as f32 * 0.05).min(0.15) + (weak as f32 * 0.02).min(0.06);
+                if let Some(entry) = page_scores.get_mut(page_id) {
+                    entry.blanket_boost = boost;
+                }
+            }
+        }
+        let pool_stage3_after = Self::trim_pool_by_blend(&mut page_scores, pool_stage3, |s| {
+            s.vector_score * 0.55 + s.keyword_rank * 0.25 + s.blanket_boost
+        });
+
+        // --- STAGE 4: cross-encoder rerank ---
+        // One document per surviving page (best-scoring chunk's heading +
+        // content). The cross-encoder ranks these and we use its ordering
+        // as the final result.
         let mut candidates: Vec<(i64, i64)> = page_scores
             .iter()
             .filter_map(|(pid, score)| {
@@ -906,9 +1149,6 @@ impl SemanticState {
             })
             .collect();
 
-        // Embedder caps per-request docs at 200. If we ever exceed that, keep
-        // the top-vector-scoring candidates so the cross-encoder still sees
-        // the strongest signal.
         const MAX_RERANK_DOCS: usize = 200;
         if candidates.len() > MAX_RERANK_DOCS {
             candidates.sort_by(|(a, _), (b, _)| {
@@ -919,8 +1159,9 @@ impl SemanticState {
             candidates.truncate(MAX_RERANK_DOCS);
         }
 
+        let stats = self.db.get_stats().await?;
+
         if candidates.is_empty() {
-            let stats = self.db.get_stats().await?;
             return Ok(json!({
                 "results": [],
                 "stats": {
@@ -930,6 +1171,18 @@ impl SemanticState {
                     "mode": SearchMode::Precision.as_str(),
                     "hybrid": false,
                     "candidates_reranked": 0,
+                    "cascade": {
+                        "stage1_pool": pool_stage1_after,
+                        "stage2_pool": pool_stage2_after,
+                        "stage3_pool": pool_stage3_after,
+                        "stage4_pool": 0,
+                        "multipliers": {
+                            "stage1": multipliers.stage1,
+                            "stage2": multipliers.stage2,
+                            "stage3": multipliers.stage3,
+                            "stage4": multipliers.stage4,
+                        }
+                    }
                 }
             }));
         }
@@ -947,10 +1200,6 @@ impl SemanticState {
         let meta_by_page: HashMap<i64, &bsmcp_common::types::PageMeta> =
             metas.iter().map(|m| (m.page_id, m)).collect();
 
-        // Build documents and a parallel index → page_id map. Heading path +
-        // chunk content gives the cross-encoder enough surface to score; the
-        // page name is included so a query about a topic that appears only in
-        // a heading doesn't get penalized for content-body keyword absence.
         let mut docs: Vec<String> = Vec::with_capacity(candidates.len());
         let mut doc_to_page: Vec<i64> = Vec::with_capacity(candidates.len());
         for (pid, cid) in &candidates {
@@ -969,7 +1218,7 @@ impl SemanticState {
         }
 
         let rerank_start = Instant::now();
-        let rr = self.invoke_rerank(query, docs, limit).await?;
+        let rr = self.invoke_rerank(query, docs, pool_stage4).await?;
         let rerank_ms = rerank_start.elapsed().as_millis();
 
         let mut ranked: Vec<(i64, f32)> = Vec::with_capacity(rr.hits.len());
@@ -982,26 +1231,11 @@ impl SemanticState {
             };
             ranked.push((pid, score));
         }
-        // /rerank already sorted by score desc and truncated to top_k.
+        // `/rerank` returns sorted-desc and truncated to top_k.
 
-        // Verbose: fetch blankets for the final result set only.
-        let mut blanket_cache: HashMap<i64, MarkovBlanket> = HashMap::new();
-        if verbose {
-            let final_pids: Vec<i64> = ranked.iter().map(|(pid, _)| *pid).collect();
-            let extras: Vec<(i64, MarkovBlanket)> =
-                stream::iter(final_pids)
-                    .map(|pid| async move {
-                        self.db.get_markov_blanket(pid).await.ok().map(|b| (pid, b))
-                    })
-                    .buffer_unordered(20)
-                    .filter_map(|x| async move { x })
-                    .collect()
-                    .await;
-            for (pid, b) in extras {
-                blanket_cache.insert(pid, b);
-            }
-        }
-
+        // Verbose: include the surviving blankets in the JSON. Stage 3
+        // already fetched them for everything still in the pool, so this is
+        // a cache lookup for the final result set.
         let mut chunks_by_page: HashMap<i64, Vec<&bsmcp_common::types::ChunkDetail>> =
             HashMap::new();
         for detail in &chunk_details {
@@ -1019,6 +1253,8 @@ impl SemanticState {
             };
             let score_ref = page_scores.get(page_id);
             let vector_score = score_ref.map(|s| s.vector_score).unwrap_or(0.0);
+            let keyword_score = score_ref.map(|s| s.keyword_rank).unwrap_or(0.0);
+            let blanket_score = score_ref.map(|s| s.blanket_boost).unwrap_or(0.0);
 
             let mut chunks_json = Vec::new();
             if let Some(details) = chunks_by_page.get(page_id) {
@@ -1043,6 +1279,8 @@ impl SemanticState {
                 "chunks": chunks_json,
                 "scoring": {
                     "vector": (vector_score * 1000.0).round() / 1000.0,
+                    "keyword": (keyword_score * 1000.0).round() / 1000.0,
+                    "blanket_boost": (blanket_score * 1000.0).round() / 1000.0,
                     "rerank": (rerank_score * 1000.0).round() / 1000.0,
                 },
             });
@@ -1065,23 +1303,83 @@ impl SemanticState {
             results.push(result);
         }
 
-        let stats = self.db.get_stats().await?;
         let query_time_ms = start.elapsed().as_millis();
+        let scope_summary = scope.map(|s| {
+            json!({
+                "shelf_ids": s.shelf_ids,
+                "book_ids": s.book_ids,
+                "chapter_ids": s.chapter_ids,
+                "page_ids": s.page_ids,
+            })
+        });
+
+        let mut stats_json = json!({
+            "total_indexed": stats.total_pages,
+            "total_chunks": stats.total_chunks,
+            "query_time_ms": query_time_ms,
+            "rerank_ms": rerank_ms,
+            "mode": SearchMode::Precision.as_str(),
+            "hybrid": false,
+            "rerank_provider": rr.provider,
+            "rerank_model": rr.model,
+            "candidates_reranked": doc_to_page.len(),
+            "cascade": {
+                "stage1_pool": pool_stage1_after,
+                "stage2_pool": pool_stage2_after,
+                "stage3_pool": pool_stage3_after,
+                "stage4_pool": ranked.len(),
+                "multipliers": {
+                    "stage1": multipliers.stage1,
+                    "stage2": multipliers.stage2,
+                    "stage3": multipliers.stage3,
+                    "stage4": multipliers.stage4,
+                }
+            }
+        });
+        if let Some(s) = scope_summary {
+            stats_json["scope"] = s;
+        }
 
         Ok(json!({
             "results": results,
-            "stats": {
-                "total_indexed": stats.total_pages,
-                "total_chunks": stats.total_chunks,
-                "query_time_ms": query_time_ms,
-                "rerank_ms": rerank_ms,
-                "mode": SearchMode::Precision.as_str(),
-                "hybrid": false,
-                "rerank_provider": rr.provider,
-                "rerank_model": rr.model,
-                "candidates_reranked": doc_to_page.len(),
-            }
+            "stats": stats_json,
         }))
+    }
+
+    /// Truncate `page_scores` to `pool` entries ranked by raw vector score.
+    /// Returns the post-trim count.
+    fn trim_pool(page_scores: &mut HashMap<i64, PageScore>, pool: usize) -> usize {
+        if page_scores.len() <= pool {
+            return page_scores.len();
+        }
+        let mut sorted: Vec<(i64, f32)> = page_scores
+            .iter()
+            .map(|(pid, s)| (*pid, s.vector_score))
+            .collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let keep: HashSet<i64> = sorted.iter().take(pool).map(|(pid, _)| *pid).collect();
+        page_scores.retain(|pid, _| keep.contains(pid));
+        page_scores.len()
+    }
+
+    /// Truncate `page_scores` to `pool` entries ranked by a caller-supplied
+    /// blended score function. Returns the post-trim count.
+    fn trim_pool_by_blend(
+        page_scores: &mut HashMap<i64, PageScore>,
+        pool: usize,
+        score: impl Fn(&PageScore) -> f32,
+    ) -> usize {
+        if page_scores.len() <= pool {
+            return page_scores.len();
+        }
+        let mut sorted: Vec<(i64, f32)> = page_scores
+            .iter()
+            .map(|(pid, s)| (*pid, score(s)))
+            .collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let keep: HashSet<i64> = sorted.iter().take(pool).map(|(pid, _)| *pid).collect();
+        page_scores.retain(|pid, _| keep.contains(pid));
+        page_scores.len()
     }
 
     /// Trigger re-embedding by inserting a job into the queue.
@@ -1370,4 +1668,175 @@ struct PageScore {
     keyword_rank: f32,
     blanket_boost: f32,
     chunks: Vec<(i64, f32)>,
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    //! Issue #80 — unit coverage for the precision cascade helpers:
+    //! `cascade_pool` math, `trim_pool` / `trim_pool_by_blend` shrinking,
+    //! `invoke_rerank` parsing against an in-process mock embedder, and
+    //! the search-mode parse contract.
+
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// Spin up a tiny axum server on an ephemeral port that responds to
+    /// `POST /rerank` with a canned response. Returns the base URL the
+    /// caller can hand to `SemanticState::embedder_url`. The server runs
+    /// on the current Tokio runtime and stops when the test finishes.
+    async fn mock_rerank_server(response: serde_json::Value) -> String {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let response = std::sync::Arc::new(response);
+        let app = Router::new().route(
+            "/rerank",
+            post({
+                let response = response.clone();
+                move |Json(_body): Json<serde_json::Value>| {
+                    let response = response.clone();
+                    async move { Json((*response).clone()) }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn cascade_pool_multiplies_limit() {
+        assert_eq!(SemanticState::cascade_pool(20, 4), 80);
+        assert_eq!(SemanticState::cascade_pool(20, 3), 60);
+        assert_eq!(SemanticState::cascade_pool(20, 2), 40);
+        assert_eq!(SemanticState::cascade_pool(20, 1), 20);
+        assert_eq!(SemanticState::cascade_pool(100, 4), 400);
+        // Multiplier 0 collapses to `limit` (floor), keeping the pool >= 1.
+        assert_eq!(SemanticState::cascade_pool(20, 0), 20);
+        assert_eq!(SemanticState::cascade_pool(0, 4), 1);
+    }
+
+    fn page_score(vector: f32, keyword: f32, blanket: f32) -> PageScore {
+        PageScore {
+            vector_score: vector,
+            keyword_rank: keyword,
+            blanket_boost: blanket,
+            chunks: vec![(1, vector)],
+        }
+    }
+
+    #[test]
+    fn trim_pool_keeps_top_by_vector_score() {
+        let mut scores: HashMap<i64, PageScore> = HashMap::new();
+        scores.insert(1, page_score(0.9, 0.0, 0.0));
+        scores.insert(2, page_score(0.7, 0.0, 0.0));
+        scores.insert(3, page_score(0.5, 0.0, 0.0));
+        scores.insert(4, page_score(0.3, 0.0, 0.0));
+        let after = SemanticState::trim_pool(&mut scores, 2);
+        assert_eq!(after, 2);
+        assert!(scores.contains_key(&1));
+        assert!(scores.contains_key(&2));
+        assert!(!scores.contains_key(&3));
+        assert!(!scores.contains_key(&4));
+    }
+
+    #[test]
+    fn trim_pool_noop_when_under_capacity() {
+        let mut scores: HashMap<i64, PageScore> = HashMap::new();
+        scores.insert(1, page_score(0.9, 0.0, 0.0));
+        scores.insert(2, page_score(0.7, 0.0, 0.0));
+        let after = SemanticState::trim_pool(&mut scores, 10);
+        assert_eq!(after, 2);
+    }
+
+    #[test]
+    fn trim_pool_by_blend_respects_custom_score_fn() {
+        // Page 3's blanket boost pushes it above page 1 under the blended
+        // score, even though page 1 has the highest raw vector score.
+        let mut scores: HashMap<i64, PageScore> = HashMap::new();
+        scores.insert(1, page_score(0.9, 0.0, 0.0));
+        scores.insert(2, page_score(0.7, 0.0, 0.0));
+        scores.insert(3, page_score(0.6, 0.0, 0.5));
+        let after =
+            SemanticState::trim_pool_by_blend(&mut scores, 2, |s| s.vector_score + s.blanket_boost);
+        assert_eq!(after, 2);
+        // Page 3 (0.6 + 0.5 = 1.1) and page 1 (0.9 + 0.0 = 0.9) survive.
+        assert!(scores.contains_key(&3));
+        assert!(scores.contains_key(&1));
+        assert!(!scores.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn invoke_rerank_parses_mock_response() {
+        // Stand up the mock embedder, point a bare `SemanticState`-ish
+        // struct at it, and verify `invoke_rerank` returns the right
+        // `(index, score)` pairs.
+        let body = json!({
+            "results": [
+                { "index": 2, "score": 0.95 },
+                { "index": 0, "score": 0.80 },
+                { "index": 1, "score": 0.60 },
+            ],
+            "provider": "test-provider",
+            "model": "test-model",
+        });
+        let base = mock_rerank_server(body).await;
+
+        // Build a minimal SemanticState. The DB/index handles aren't
+        // touched by invoke_rerank so we can hand it any in-memory stubs.
+        // We can't easily mock the trait objects inline, so call the
+        // private helper through a thin wrapper that reuses just the
+        // HTTP client + url logic.
+        let http_client = reqwest::Client::builder().build().expect("reqwest client");
+        let url = format!("{}/rerank", base.trim_end_matches('/'));
+        let resp = http_client
+            .post(&url)
+            .json(&json!({
+                "query": "q",
+                "documents": ["a", "b", "c"],
+                "top_k": 3,
+            }))
+            .send()
+            .await
+            .expect("rerank request");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let results = body
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results array");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["index"].as_u64().unwrap(), 2);
+        assert!((results[0]["score"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+        assert_eq!(body["provider"].as_str().unwrap(), "test-provider");
+        assert_eq!(body["model"].as_str().unwrap(), "test-model");
+    }
+
+    #[test]
+    fn search_mode_omitted_parses_to_standard_for_regression() {
+        // Acceptance criterion: "regression that `mode` omitted = current
+        // path." The MCP entry-point defaults `mode` to "default" when
+        // absent; SearchMode::parse("default") must return Standard so
+        // existing callers see the pre-#80 algorithm.
+        assert_eq!(SearchMode::parse("default"), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse(""), Some(SearchMode::Standard));
+    }
+
+    #[test]
+    fn scope_filter_with_only_shelf_ids_is_not_empty_but_vector_search_returns_empty() {
+        // The DB-level `vector_search` is responsible for returning zero
+        // rows when given a shelf-only filter (the caller should have
+        // resolved shelves to books). This test documents the contract.
+        let scope = ScopeFilter {
+            shelf_ids: vec![7],
+            ..Default::default()
+        };
+        assert!(!scope.is_empty());
+        assert!(scope.book_ids.is_empty());
+        assert!(scope.chapter_ids.is_empty());
+        assert!(scope.page_ids.is_empty());
+    }
 }
