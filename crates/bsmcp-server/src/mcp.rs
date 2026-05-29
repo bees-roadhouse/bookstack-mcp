@@ -2434,8 +2434,8 @@ mod tests {
     use std::collections::HashSet;
 
     /// v0.10.0 surface lock + issue #69: 59 BookStack CRUD + 1 directory tool
-    /// + 3 semantic tools = 63. Anything extra means a briefing-era surface
-    /// leaked back in.
+    ///   + 3 semantic tools = 63. Anything extra means a briefing-era surface
+    ///   leaked back in.
     #[test]
     fn tools_list_count_is_63_with_semantic() {
         let tools = tool_definitions(true);
