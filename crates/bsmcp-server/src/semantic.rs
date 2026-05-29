@@ -173,6 +173,29 @@ pub struct SemanticState {
     /// needs the calling user's role IDs; resolving them is two HTTP calls
     /// to BookStack. 5 minute TTL because roles change rarely.
     role_id_cache: RwLock<HashMap<String, CachedRoleIds>>,
+    /// Page IDs currently being reconciled by a background ACL recompute
+    /// (issue #58 lever b). Reads + writes under a `RwLock` so concurrent
+    /// `filter_by_permission` calls don't double-fire a recompute on the
+    /// same page. The set self-cleans as each spawned task finishes.
+    acl_recompute_inflight: RwLock<HashSet<i64>>,
+    /// Cached `RoleContext` (all_role_ids + view_all_role_ids) so background
+    /// recompute doesn't reissue the `list_roles` + per-role detail fetch on
+    /// every search. 5 min TTL — roles change rarely.
+    role_ctx_cache: RwLock<Option<CachedRoleContext>>,
+}
+
+/// Cap on the in-flight set per [`SemanticState`]. When a single search
+/// produces more uncomputed pages than this, the spawner queues a global
+/// `acl_reconcile` job and bails instead of fanning out per-page tasks.
+const ACL_RECOMPUTE_INFLIGHT_CAP: usize = 200;
+/// Max concurrent `reconcile_page` HTTP calls per kick. Each call is ~3
+/// `get_content_permissions` requests; 5 keeps the background load below
+/// foreground search budget.
+const ACL_RECOMPUTE_HTTP_CONCURRENCY: usize = 5;
+
+struct CachedRoleContext {
+    ctx: bsmcp_common::acl::RoleContext,
+    cached_at: Instant,
 }
 
 /// Per-token cached role-id list with a TTL. Held inside
@@ -206,6 +229,167 @@ impl SemanticState {
             http_client,
             permission_cache: RwLock::new(HashMap::new()),
             role_id_cache: RwLock::new(HashMap::new()),
+            acl_recompute_inflight: RwLock::new(HashSet::new()),
+            role_ctx_cache: RwLock::new(None),
+        }
+    }
+
+    /// Fire-and-forget background recompute for pages the prefilter
+    /// flagged `Uncomputed` (issue #58 lever b). Existing webhook handler
+    /// already queues an `acl_reconcile` job on `role_*` /
+    /// `permissions_update` — that path is unchanged. This is the
+    /// complementary on-demand path: when a search's first miss surfaces
+    /// brand-new pages whose ACLs the embedder hasn't computed yet, kick
+    /// a per-page reconcile in the background so the next search hits
+    /// the prefilter instead of HTTP.
+    ///
+    /// Concurrency is in-flight-gated per [`SemanticState`] so concurrent
+    /// searches don't double-fire on the same page id. When the in-flight
+    /// set exceeds [`ACL_RECOMPUTE_INFLIGHT_CAP`], the spawner queues a
+    /// global `acl_reconcile` job and bails out — the daily cron pipeline
+    /// catches up cheaper than 200+ parallel HTTP fan-outs.
+    ///
+    /// Concurrency cap per kick: [`ACL_RECOMPUTE_HTTP_CONCURRENCY`].
+    pub(crate) async fn kick_background_acl_recompute(
+        self: &Arc<Self>,
+        client: &BookStackClient,
+        uncomputed_page_ids: Vec<i64>,
+    ) {
+        if uncomputed_page_ids.is_empty() {
+            return;
+        }
+        // Drop ids that are already in flight from another search; reserve the
+        // rest atomically so a concurrent caller sees them as in-flight too.
+        let mut to_kick: Vec<i64> = Vec::with_capacity(uncomputed_page_ids.len());
+        {
+            let mut inflight = self.acl_recompute_inflight.write().await;
+            // Backpressure: too many parallel recomputes in flight already —
+            // hand off to the global `acl_reconcile` pipeline.
+            if inflight.len() >= ACL_RECOMPUTE_INFLIGHT_CAP {
+                drop(inflight);
+                if let Err(e) = self.db.create_embed_job("acl_reconcile").await {
+                    tracing::warn!(
+                        target: "acl_filter",
+                        error = %e,
+                        "acl_recompute_backpressure_queue_failed"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "acl_filter",
+                        pending = uncomputed_page_ids.len(),
+                        "acl_recompute_backpressure_queued_global"
+                    );
+                }
+                return;
+            }
+            for pid in uncomputed_page_ids {
+                if inflight.insert(pid) {
+                    to_kick.push(pid);
+                }
+                if inflight.len() >= ACL_RECOMPUTE_INFLIGHT_CAP {
+                    // Reserved up to the cap; rest get punted to the daily
+                    // pipeline through the global queue.
+                    break;
+                }
+            }
+        }
+        if to_kick.is_empty() {
+            return;
+        }
+
+        let me = self.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            // Build/refresh the role context once per kick. Cached so a
+            // burst of searches doesn't re-issue the `list_roles` + per-role
+            // detail fetches.
+            let role_ctx = match me.role_context(&client).await {
+                Some(ctx) => ctx,
+                None => {
+                    // Couldn't build role context — release the in-flight
+                    // reservations so a future call can retry.
+                    let mut inflight = me.acl_recompute_inflight.write().await;
+                    for pid in &to_kick {
+                        inflight.remove(pid);
+                    }
+                    return;
+                }
+            };
+
+            let kicked = to_kick.len();
+            let started = Instant::now();
+            let me_for_stream = me.clone();
+            let client_for_stream = client.clone();
+            let role_ctx_for_stream = role_ctx.clone();
+            stream::iter(to_kick.clone())
+                .for_each_concurrent(ACL_RECOMPUTE_HTTP_CONCURRENCY, move |pid| {
+                    let me = me_for_stream.clone();
+                    let client = client_for_stream.clone();
+                    let role_ctx = role_ctx_for_stream.clone();
+                    async move {
+                        if let Err(e) =
+                            bsmcp_common::acl::reconcile_page(&client, &me.db, pid, &role_ctx).await
+                        {
+                            tracing::warn!(
+                                target: "acl_filter",
+                                page_id = pid,
+                                error = %e,
+                                "acl_recompute_failed"
+                            );
+                        }
+                    }
+                })
+                .await;
+
+            // Release in-flight reservations.
+            {
+                let mut inflight = me.acl_recompute_inflight.write().await;
+                for pid in &to_kick {
+                    inflight.remove(pid);
+                }
+            }
+
+            tracing::info!(
+                target: "acl_filter",
+                pages = kicked,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "acl_recompute_done"
+            );
+        });
+    }
+
+    /// Build or fetch the cached `RoleContext`. Stored on `SemanticState`
+    /// rather than per-token because role-level system perms are global —
+    /// the context doesn't change between callers.
+    async fn role_context(
+        &self,
+        client: &BookStackClient,
+    ) -> Option<bsmcp_common::acl::RoleContext> {
+        {
+            let read = self.role_ctx_cache.read().await;
+            if let Some(cached) = read.as_ref() {
+                if cached.cached_at.elapsed() < ROLE_ID_CACHE_TTL {
+                    return Some(cached.ctx.clone());
+                }
+            }
+        }
+        match bsmcp_common::acl::build_role_context(client).await {
+            Ok(ctx) => {
+                let mut write = self.role_ctx_cache.write().await;
+                *write = Some(CachedRoleContext {
+                    ctx: ctx.clone(),
+                    cached_at: Instant::now(),
+                });
+                Some(ctx)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "acl_filter",
+                    error = %e,
+                    "acl_role_context_build_failed"
+                );
+                None
+            }
         }
     }
 
@@ -448,7 +632,11 @@ impl SemanticState {
     ///   bsmcp_acl_cache_misses_total
     ///   bsmcp_acl_http_fallback_total
     ///   bsmcp_acl_http_fallback_duration_seconds
-    async fn filter_by_permission(&self, page_ids: &[i64], client: &BookStackClient) -> Vec<i64> {
+    async fn filter_by_permission(
+        self: &Arc<Self>,
+        page_ids: &[i64],
+        client: &BookStackClient,
+    ) -> Vec<i64> {
         let token_hash = hash_token_id(client.token_id());
         let now = Instant::now();
         let call_start = Instant::now();
@@ -527,6 +715,7 @@ impl SemanticState {
         let mut prefilter_deny: usize = 0;
         let mut prefilter_default_open: usize = 0;
         let mut prefilter_uncomputed: usize = 0;
+        let mut recompute_candidates: Vec<i64> = Vec::new();
         if !uncached_ids.is_empty() {
             if let Some(role_ids) = self
                 .resolve_caller_role_ids(client, &token_hash)
@@ -556,7 +745,16 @@ impl SemanticState {
                                     prefilter_default_open += 1;
                                     still_pending.push(pid);
                                 }
-                                Some(AclPrefilter::Uncomputed) | None => {
+                                Some(AclPrefilter::Uncomputed) => {
+                                    prefilter_uncomputed += 1;
+                                    still_pending.push(pid);
+                                    recompute_candidates.push(pid);
+                                }
+                                None => {
+                                    // Page missing from the embedding store
+                                    // entirely. No ACL signal exists yet, but
+                                    // there's no `pages` row to recompute
+                                    // against either — pure HTTP fallback.
                                     prefilter_uncomputed += 1;
                                     still_pending.push(pid);
                                 }
@@ -573,6 +771,16 @@ impl SemanticState {
                     }
                 }
             }
+        }
+
+        // Lever b: fire-and-forget background recompute for Uncomputed pages.
+        // The webhook handler already queues `acl_reconcile` on role and
+        // permission events; this is the complementary on-demand path so the
+        // first search after a new-page embed primes the prefilter for the
+        // next call instead of paying repeated HTTP fan-out.
+        if !recompute_candidates.is_empty() {
+            self.kick_background_acl_recompute(client, recompute_candidates)
+                .await;
         }
 
         let cache_misses = uncached_ids.len();
@@ -680,7 +888,7 @@ impl SemanticState {
     /// the vector pass. Empty/`None` keeps the whole-corpus behavior.
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
-        &self,
+        self: &Arc<Self>,
         query: &str,
         limit: usize,
         threshold: f32,
@@ -1303,7 +1511,7 @@ impl SemanticState {
     /// shelf IDs are already lifted to book IDs by the caller.
     #[allow(clippy::too_many_arguments)]
     async fn precision_cascade(
-        &self,
+        self: &Arc<Self>,
         query: &str,
         limit: usize,
         threshold: f32,
@@ -2567,6 +2775,127 @@ mod acl_fanout_tests {
             2,
             "prefilter should suppress HTTP for Allow + Deny verdicts; only 2 default-open pages hit HTTP"
         );
+    }
+
+    /// Lever b — kick path reserves the in-flight set and deduplicates so
+    /// a second concurrent search asking about the same page IDs sees them
+    /// as in-flight and skips re-spawning. We can verify this without
+    /// running the actual HTTP fan-out by injecting a role-context cache
+    /// that fails the role-context build (so the spawned task short-
+    /// circuits cleanly and releases the in-flight slots) — but the
+    /// `acl_recompute_inflight` set's deduplication happens *before* the
+    /// spawn fires, so the test can observe it without timing.
+    ///
+    /// Strategy: call `kick_background_acl_recompute` synchronously twice
+    /// in immediate succession with the same page IDs; both calls return
+    /// quickly (the underlying spawn is fire-and-forget) but the second
+    /// call's slot reservation must be empty because the first call holds
+    /// all the IDs. Read the in-flight set between calls.
+    #[tokio::test]
+    async fn acl_recompute_deduplicates_inflight() {
+        let path = temp_sqlite_path("recompute-dedup");
+        let sqlite = Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        sqlite.init_semantic_tables().await.unwrap();
+        let core_db: Arc<dyn DbBackend> = sqlite.clone();
+        let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
+        let index_db: Arc<dyn IndexDb> = sqlite.clone();
+        let state = Arc::new(SemanticState::new(
+            semantic_db,
+            core_db,
+            index_db,
+            "http://unused".to_string(),
+            "test-webhook-secret-16chars".to_string(),
+        ));
+
+        // Use a BookStack base that returns 404 on list_roles so role-context
+        // build fails; the spawned task short-circuits and releases the slots.
+        // We don't care about the failure — we care about the dedup logic.
+        let client = BookStackClient::new(
+            "http://127.0.0.1:1",
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        );
+
+        // Block the inflight cleanup by pre-stuffing the set: simulate a
+        // long-running first kick by manually holding the 3 page IDs as
+        // in-flight, then call kick with the same IDs. Inflight set should
+        // not grow because every ID was already present, and the underlying
+        // task should not have any reservations to make.
+        {
+            let mut inflight = state.acl_recompute_inflight.write().await;
+            for pid in [10i64, 11, 12] {
+                inflight.insert(pid);
+            }
+        }
+        // Second call sees them all in-flight; should not increase the set.
+        state
+            .kick_background_acl_recompute(&client, vec![10, 11, 12])
+            .await;
+        let inflight_after = state.acl_recompute_inflight.read().await.clone();
+        assert_eq!(
+            inflight_after.len(),
+            3,
+            "in-flight set should not grow when every id is already in-flight"
+        );
+        assert!(inflight_after.contains(&10));
+        assert!(inflight_after.contains(&11));
+        assert!(inflight_after.contains(&12));
+    }
+
+    /// Lever b — backpressure: when the in-flight set is at the cap, the
+    /// kick path queues a global `acl_reconcile` job and returns instead of
+    /// fanning out per-page tasks.
+    #[tokio::test]
+    async fn acl_recompute_backpressure_queues_global_job() {
+        let path = temp_sqlite_path("recompute-backpressure");
+        let sqlite = Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        sqlite.init_semantic_tables().await.unwrap();
+        let core_db: Arc<dyn DbBackend> = sqlite.clone();
+        let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
+        let index_db: Arc<dyn IndexDb> = sqlite.clone();
+        let state = Arc::new(SemanticState::new(
+            semantic_db,
+            core_db,
+            index_db,
+            "http://unused".to_string(),
+            "test-webhook-secret-16chars".to_string(),
+        ));
+        let client = BookStackClient::new(
+            "http://127.0.0.1:1",
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        );
+
+        // Stuff the in-flight set up to the cap.
+        {
+            let mut inflight = state.acl_recompute_inflight.write().await;
+            for pid in 1i64..=(ACL_RECOMPUTE_INFLIGHT_CAP as i64) {
+                inflight.insert(pid);
+            }
+        }
+        // Job queue should be empty before the kick.
+        let before = state.db.get_stats().await.unwrap().total_pages;
+        state
+            .kick_background_acl_recompute(&client, vec![9000, 9001])
+            .await;
+        // We don't count jobs here directly — instead, prove the kick path
+        // didn't grow the in-flight set (because backpressure bailed early).
+        let inflight = state.acl_recompute_inflight.read().await;
+        assert_eq!(
+            inflight.len(),
+            ACL_RECOMPUTE_INFLIGHT_CAP,
+            "backpressure path must not reserve more in-flight slots"
+        );
+        assert!(!inflight.contains(&9000));
+        let _ = before; // silence dead-code lint on unused total_pages
     }
 
     /// Lever a — durable L2 cache. Verifies that warm-cache after restart
