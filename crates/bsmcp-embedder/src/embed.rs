@@ -73,7 +73,8 @@ impl OpenAIEmbedder {
             .map_err(|e| format!("OpenAI dim detection parse failed: {e}"))?;
 
         if !status.is_success() {
-            let msg = json.get("error")
+            let msg = json
+                .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
@@ -107,8 +108,11 @@ impl Embedder for OpenAIEmbedder {
             .await
             .map_err(|e| {
                 let url = format!("{}/v1/embeddings", self.base_url);
-                format!("OpenAI embed request failed: {e:?} (url={url}, key_len={}, model={})",
-                    self.api_key.len(), self.model)
+                format!(
+                    "OpenAI embed request failed: {e:?} (url={url}, key_len={}, model={})",
+                    self.api_key.len(),
+                    self.model
+                )
             })?;
 
         let status = resp.status();
@@ -326,7 +330,8 @@ impl VoyageEmbedder {
             .map_err(|e| format!("Voyage dim detection parse failed: {e}"))?;
 
         if !status.is_success() {
-            let msg = json.get("detail")
+            let msg = json
+                .get("detail")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
             return Err(format!("Voyage dim detection error {status}: {msg}"));
@@ -359,8 +364,11 @@ impl Embedder for VoyageEmbedder {
             .await
             .map_err(|e| {
                 let url = format!("{}/v1/embeddings", self.base_url);
-                format!("Voyage embed request failed: {e:?} (url={url}, key_len={}, model={})",
-                    self.api_key.len(), self.model)
+                format!(
+                    "Voyage embed request failed: {e:?} (url={url}, key_len={}, model={})",
+                    self.api_key.len(),
+                    self.model
+                )
             })?;
 
         let status = resp.status();

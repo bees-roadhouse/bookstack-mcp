@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json};
-use axum::{Router, routing::get};
+use axum::{routing::get, Router};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -75,8 +75,8 @@ struct RerankRequest {
 async fn main() {
     eprintln!("BookStack MCP Embedder v{}", env!("CARGO_PKG_VERSION"));
 
-    let encryption_key = env::var("BSMCP_ENCRYPTION_KEY")
-        .expect("BSMCP_ENCRYPTION_KEY is required");
+    let encryption_key =
+        env::var("BSMCP_ENCRYPTION_KEY").expect("BSMCP_ENCRYPTION_KEY is required");
     if encryption_key.len() < 32 {
         panic!("BSMCP_ENCRYPTION_KEY must be at least 32 characters");
     }
@@ -107,7 +107,9 @@ async fn main() {
     };
 
     // Initialize semantic tables
-    db.init_semantic_tables().await.expect("Failed to initialize semantic tables");
+    db.init_semantic_tables()
+        .await
+        .expect("Failed to initialize semantic tables");
 
     // Select embedding provider
     let provider = env::var("BSMCP_EMBED_PROVIDER")
@@ -118,28 +120,29 @@ async fn main() {
         "openai" => {
             let api_key = env::var("BSMCP_EMBED_API_KEY")
                 .expect("BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=openai");
-            let model = env::var("BSMCP_EMBED_MODEL")
-                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
+            let model =
+                env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
             let base_url = env::var("BSMCP_EMBED_API_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "https://api.openai.com".into());
 
             // Auto-detect dimensions unless explicitly set
-            let dims: usize = if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
-                d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
-            } else {
-                eprintln!("Embedder: detecting {model} dimensions from OpenAI...");
-                match embed::OpenAIEmbedder::detect_dims(&api_key, &model, &base_url).await {
-                    Ok(d) => {
-                        eprintln!("Embedder: detected {d} dimensions");
-                        d
+            let dims: usize =
+                if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
+                    d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
+                } else {
+                    eprintln!("Embedder: detecting {model} dimensions from OpenAI...");
+                    match embed::OpenAIEmbedder::detect_dims(&api_key, &model, &base_url).await {
+                        Ok(d) => {
+                            eprintln!("Embedder: detected {d} dimensions");
+                            d
+                        }
+                        Err(e) => {
+                            panic!("Embedder: OpenAI dimension detection failed: {e}");
+                        }
                     }
-                    Err(e) => {
-                        panic!("Embedder: OpenAI dimension detection failed: {e}");
-                    }
-                }
-            };
+                };
 
             eprintln!("Embedder: OpenAI provider (model={model}, dims={dims}, url={base_url})");
             let e = embed::OpenAIEmbedder::new(&api_key, &model, &base_url, dims);
@@ -148,41 +151,44 @@ async fn main() {
         "voyage" => {
             let api_key = env::var("BSMCP_EMBED_API_KEY")
                 .expect("BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=voyage");
-            let model = env::var("BSMCP_EMBED_MODEL")
-                .unwrap_or_else(|_| DEFAULT_VOYAGE_MODEL.into());
+            let model =
+                env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_VOYAGE_MODEL.into());
             let base_url = env::var("BSMCP_EMBED_API_URL")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "https://api.voyageai.com".into());
 
             // Auto-detect dimensions unless explicitly set
-            let dims: usize = if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
-                d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
-            } else {
-                eprintln!("Embedder: detecting {model} dimensions from Voyage AI...");
-                match embed::VoyageEmbedder::detect_dims(&api_key, &model, &base_url).await {
-                    Ok(d) => {
-                        eprintln!("Embedder: detected {d} dimensions");
-                        d
+            let dims: usize =
+                if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
+                    d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
+                } else {
+                    eprintln!("Embedder: detecting {model} dimensions from Voyage AI...");
+                    match embed::VoyageEmbedder::detect_dims(&api_key, &model, &base_url).await {
+                        Ok(d) => {
+                            eprintln!("Embedder: detected {d} dimensions");
+                            d
+                        }
+                        Err(e) => {
+                            panic!("Embedder: Voyage dimension detection failed: {e}");
+                        }
                     }
-                    Err(e) => {
-                        panic!("Embedder: Voyage dimension detection failed: {e}");
-                    }
-                }
-            };
+                };
 
             eprintln!("Embedder: Voyage AI provider (model={model}, dims={dims}, url={base_url})");
             let e = embed::VoyageEmbedder::new(&api_key, &model, &base_url, dims);
             (Arc::new(e), model, dims)
         }
         "ollama" => {
-            let model = env::var("BSMCP_EMBED_MODEL")
-                .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.into());
-            let base_url = env::var("BSMCP_EMBED_API_URL")
-                .unwrap_or_else(|_| "http://localhost:11434".into());
+            let model =
+                env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.into());
+            let base_url =
+                env::var("BSMCP_EMBED_API_URL").unwrap_or_else(|_| "http://localhost:11434".into());
 
             // Auto-detect dimensions unless explicitly set
-            let dims: usize = if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
+            let dims: usize = if let Some(d) =
+                env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty())
+            {
                 d.parse().expect("BSMCP_EMBED_DIMS must be a valid number")
             } else {
                 eprintln!("Embedder: detecting {model} dimensions from Ollama...");
@@ -205,8 +211,8 @@ async fn main() {
         _ => {
             // Local fastembed/ONNX model
             let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
-            let model_name = env::var("BSMCP_EMBED_MODEL")
-                .unwrap_or_else(|_| DEFAULT_LOCAL_MODEL.into());
+            let model_name =
+                env::var("BSMCP_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_LOCAL_MODEL.into());
 
             eprintln!("Embedder: loading local model {model_name} (cache={model_path})...");
             let local = pipeline::EmbedModel::new(&model_name, &model_path)
@@ -249,9 +255,7 @@ async fn main() {
 
     // Worker identity — persistent UUID for job ownership
     let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
-    let worker_data_dir = PathBuf::from(
-        env::var("BSMCP_EMBED_DATA_DIR").unwrap_or(model_path)
-    );
+    let worker_data_dir = PathBuf::from(env::var("BSMCP_EMBED_DATA_DIR").unwrap_or(model_path));
     let worker_id = load_or_create_worker_id(&worker_data_dir);
     eprintln!("Embedder: worker_id={worker_id}");
 
@@ -268,7 +272,14 @@ async fn main() {
     let worker_model_name = model_name;
     let worker_dims = dims;
     tokio::spawn(async move {
-        job_queue_worker(worker_db, worker_embedder, worker_id, worker_model_name, worker_dims).await;
+        job_queue_worker(
+            worker_db,
+            worker_embedder,
+            worker_id,
+            worker_model_name,
+            worker_dims,
+        )
+        .await;
     });
 
     eprintln!("Embedder: HTTP server listening on {addr}");
@@ -297,22 +308,16 @@ async fn handle_embed(
     }
 
     match state.embedder.embed(req.texts).await {
-        Ok(embeddings) => {
-            Json(json!({ "embeddings": embeddings })).into_response()
-        }
-        Err(e) => {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Embedding failed: {e}")})),
-            )
-                .into_response()
-        }
+        Ok(embeddings) => Json(json!({ "embeddings": embeddings })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Embedding failed: {e}")})),
+        )
+            .into_response(),
     }
 }
 
-async fn handle_health(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let dims = state.embedder.dims();
     let stats = state.db.get_stats().await.ok();
     let reranker = state.reranker.as_ref().map(|r| {
@@ -414,8 +419,7 @@ async fn init_reranker() -> Option<Arc<dyn Reranker>> {
 
     match provider.as_str() {
         "local" => {
-            let model_path =
-                env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
+            let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
             let model_name = env::var("BSMCP_RERANK_MODEL")
                 .unwrap_or_else(|_| DEFAULT_LOCAL_RERANK_MODEL.into());
             eprintln!("Reranker: loading local cross-encoder {model_name} (cache={model_path})...");
@@ -434,7 +438,9 @@ async fn init_reranker() -> Option<Arc<dyn Reranker>> {
             let api_key = match env::var("BSMCP_RERANK_API_KEY") {
                 Ok(k) if !k.is_empty() => k,
                 _ => {
-                    eprintln!("Reranker: BSMCP_RERANK_API_KEY required for voyage — /rerank disabled");
+                    eprintln!(
+                        "Reranker: BSMCP_RERANK_API_KEY required for voyage — /rerank disabled"
+                    );
                     return None;
                 }
             };
@@ -445,14 +451,18 @@ async fn init_reranker() -> Option<Arc<dyn Reranker>> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "https://api.voyageai.com".into());
             eprintln!("Reranker: Voyage AI provider (model={model}, url={base_url})");
-            Some(Arc::new(rerank::VoyageReranker::new(&api_key, &model, &base_url))
-                as Arc<dyn Reranker>)
+            Some(
+                Arc::new(rerank::VoyageReranker::new(&api_key, &model, &base_url))
+                    as Arc<dyn Reranker>,
+            )
         }
         "openai" => {
             let api_key = match env::var("BSMCP_RERANK_API_KEY") {
                 Ok(k) if !k.is_empty() => k,
                 _ => {
-                    eprintln!("Reranker: BSMCP_RERANK_API_KEY required for openai — /rerank disabled");
+                    eprintln!(
+                        "Reranker: BSMCP_RERANK_API_KEY required for openai — /rerank disabled"
+                    );
                     return None;
                 }
             };
@@ -476,8 +486,10 @@ async fn init_reranker() -> Option<Arc<dyn Reranker>> {
                 }
             };
             eprintln!("Reranker: OpenAI-compatible provider (model={model}, url={base_url})");
-            Some(Arc::new(rerank::OpenAIReranker::new(&api_key, &model, &base_url))
-                as Arc<dyn Reranker>)
+            Some(
+                Arc::new(rerank::OpenAIReranker::new(&api_key, &model, &base_url))
+                    as Arc<dyn Reranker>,
+            )
         }
         other => {
             eprintln!(
@@ -514,7 +526,11 @@ async fn job_queue_worker(
     let job_timeout: i64 = env::var("BSMCP_JOB_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .or_else(|| env::var("BSMCP_EMBED_JOB_TIMEOUT").ok().and_then(|v| v.parse().ok()))
+        .or_else(|| {
+            env::var("BSMCP_EMBED_JOB_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(3600);
     let failure_threshold: usize = env::var("BSMCP_EMBED_FAILURE_THRESHOLD")
         .ok()
@@ -525,12 +541,11 @@ async fn job_queue_worker(
         .and_then(|v| v.parse().ok())
         .unwrap_or(pipeline::DEFAULT_CONSECUTIVE_ABORT);
 
-    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL")
-        .expect("BSMCP_BOOKSTACK_URL is required");
-    let embed_token_id = env::var("BSMCP_EMBED_TOKEN_ID")
-        .expect("BSMCP_EMBED_TOKEN_ID is required");
-    let embed_token_secret = env::var("BSMCP_EMBED_TOKEN_SECRET")
-        .expect("BSMCP_EMBED_TOKEN_SECRET is required");
+    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
+    let embed_token_id =
+        env::var("BSMCP_EMBED_TOKEN_ID").expect("BSMCP_EMBED_TOKEN_ID is required");
+    let embed_token_secret =
+        env::var("BSMCP_EMBED_TOKEN_SECRET").expect("BSMCP_EMBED_TOKEN_SECRET is required");
 
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -555,10 +570,15 @@ async fn job_queue_worker(
     let current_chunk_version = bsmcp_common::chunking::CHUNK_VERSION.to_string();
     let stored_version = db.get_meta("chunk_version").await.unwrap_or(None);
     if stored_version.as_deref() != Some(&current_chunk_version) {
-        eprintln!("Embedder: chunk version changed ({} → {}) — triggering clean re-index",
-            stored_version.as_deref().unwrap_or("none"), current_chunk_version);
+        eprintln!(
+            "Embedder: chunk version changed ({} → {}) — triggering clean re-index",
+            stored_version.as_deref().unwrap_or("none"),
+            current_chunk_version
+        );
         trigger_clean_reindex(&db, dims).await;
-        db.set_meta("chunk_version", &current_chunk_version).await.ok();
+        db.set_meta("chunk_version", &current_chunk_version)
+            .await
+            .ok();
         reindex_triggered = true;
     }
 
@@ -570,11 +590,17 @@ async fn job_queue_worker(
     let dims_changed = stored_dims.as_deref().is_some_and(|d| d != dims_str);
     if !reindex_triggered && (model_changed || dims_changed) {
         if model_changed {
-            eprintln!("Embedder: model changed ({} → {}) — triggering clean re-index",
-                stored_model.as_deref().unwrap_or("none"), model_name);
+            eprintln!(
+                "Embedder: model changed ({} → {}) — triggering clean re-index",
+                stored_model.as_deref().unwrap_or("none"),
+                model_name
+            );
         } else {
-            eprintln!("Embedder: dimensions changed ({} → {}) — triggering clean re-index",
-                stored_dims.as_deref().unwrap_or("?"), dims);
+            eprintln!(
+                "Embedder: dimensions changed ({} → {}) — triggering clean re-index",
+                stored_dims.as_deref().unwrap_or("?"),
+                dims
+            );
         }
         trigger_clean_reindex(&db, dims).await;
         reindex_triggered = true;
@@ -606,7 +632,10 @@ async fn job_queue_worker(
         // Expire stale jobs before claiming
         if let Ok(expired) = db.expire_stale_jobs(job_timeout).await {
             if expired > 0 {
-                eprintln!("Embedder: expired {expired} stale job(s) (timeout={}s)", job_timeout);
+                eprintln!(
+                    "Embedder: expired {expired} stale job(s) (timeout={}s)",
+                    job_timeout
+                );
             }
         }
 
@@ -614,18 +643,25 @@ async fn job_queue_worker(
             Ok(Some(job)) => {
                 eprintln!("Embedder: claimed job {} (scope={})", job.id, job.scope);
                 let result = pipeline::run_pipeline(
-                    &db, &embedder, &client,
-                    job.id, &job.scope,
-                    delay_ms, batch_size,
+                    &db,
+                    &embedder,
+                    &client,
+                    job.id,
+                    &job.scope,
+                    delay_ms,
+                    batch_size,
                     consecutive_abort,
-                ).await;
+                )
+                .await;
                 match result {
                     Ok(pr) => {
                         let failed_count = pr.failed_pages.len();
 
                         if failed_count >= failure_threshold || pr.aborted {
                             // Systemic failure — mark job as failed, don't auto-requeue
-                            let sample_errors: Vec<String> = pr.failed_pages.iter()
+                            let sample_errors: Vec<String> = pr
+                                .failed_pages
+                                .iter()
                                 .take(3)
                                 .map(|(pid, e)| format!("page {pid}: {e}"))
                                 .collect();
@@ -655,7 +691,9 @@ async fn job_queue_worker(
                                         eprintln!("Embedder: queued retry job {retry_id} for page {page_id} (error: {err})");
                                     }
                                     Ok((_, false)) => {
-                                        eprintln!("Embedder: retry for page {page_id} already queued");
+                                        eprintln!(
+                                            "Embedder: retry for page {page_id} already queued"
+                                        );
                                     }
                                     Err(e) => {
                                         eprintln!("Embedder: failed to queue retry for page {page_id}: {e}");
@@ -667,8 +705,12 @@ async fn job_queue_worker(
                             if pr.succeeded > 0 {
                                 eprintln!("Embedder: computing similar-page relationships...");
                                 match db.compute_similar_pages(5, 0.65).await {
-                                    Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
-                                    Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
+                                    Ok(n) => {
+                                        eprintln!("Embedder: stored {n} similar-page relationships")
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Embedder: similar-page computation failed: {e}")
+                                    }
                                 }
                             }
                         } else {
@@ -676,13 +718,20 @@ async fn job_queue_worker(
                             if let Err(e) = db.complete_job(job.id, None).await {
                                 eprintln!("Embedder: failed to mark job {} complete: {e}", job.id);
                             }
-                            eprintln!("Embedder: job {} completed ({} pages)", job.id, pr.succeeded);
+                            eprintln!(
+                                "Embedder: job {} completed ({} pages)",
+                                job.id, pr.succeeded
+                            );
 
                             // Recompute similar-page relationships after any embedding job
                             eprintln!("Embedder: computing similar-page relationships...");
                             match db.compute_similar_pages(5, 0.65).await {
-                                Ok(n) => eprintln!("Embedder: stored {n} similar-page relationships"),
-                                Err(e) => eprintln!("Embedder: similar-page computation failed: {e}"),
+                                Ok(n) => {
+                                    eprintln!("Embedder: stored {n} similar-page relationships")
+                                }
+                                Err(e) => {
+                                    eprintln!("Embedder: similar-page computation failed: {e}")
+                                }
                             }
                         }
                     }

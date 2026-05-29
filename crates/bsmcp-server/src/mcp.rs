@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 
 use pulldown_cmark::{html, Options, Parser};
 
-use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 use crate::semantic::{trim_match, SearchMode, SemanticState};
+use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -21,7 +21,11 @@ pub async fn handle_request(
     match request.get("jsonrpc").and_then(|v| v.as_str()) {
         Some("2.0") => {}
         _ => {
-            return Some(json_rpc_error(id, -32600, "Invalid Request: missing or wrong jsonrpc version (must be \"2.0\")"));
+            return Some(json_rpc_error(
+                id,
+                -32600,
+                "Invalid Request: missing or wrong jsonrpc version (must be \"2.0\")",
+            ));
         }
     }
 
@@ -31,18 +35,24 @@ pub async fn handle_request(
     match method {
         "initialize" => {
             let instructions = build_instructions(client, semantic.is_some()).await;
-            Some(json_rpc_result(id, json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": "BookStack MCP",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "instructions": instructions,
-            })))
+            Some(json_rpc_result(
+                id,
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "BookStack MCP",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "instructions": instructions,
+                }),
+            ))
         }
         "notifications/initialized" => None,
-        "tools/list" => Some(json_rpc_result(id, json!({ "tools": tool_definitions(semantic.is_some()) }))),
+        "tools/list" => Some(json_rpc_result(
+            id,
+            json!({ "tools": tool_definitions(semantic.is_some()) }),
+        )),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -95,21 +105,27 @@ async fn execute_tool(
             let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
             let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
-            let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(default_threshold) as f32;
-            let verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
+            let threshold = args
+                .get("threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(default_threshold) as f32;
+            let verbose = args
+                .get("verbose")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let mode_str = args
                 .get("mode")
                 .and_then(|v| v.as_str())
                 .unwrap_or("standard");
             let mode = SearchMode::parse(mode_str).ok_or_else(|| {
-                format!(
-                    "invalid mode '{mode_str}' (expected: standard, rerank, precision)"
-                )
+                format!("invalid mode '{mode_str}' (expected: standard, rerank, precision)")
             })?;
             // The HTTP `filter_by_permission` fallback inside `sem.search`
             // enforces per-page access control via BookStack's API.
             let mut result = sem
-                .search(&query, limit, threshold, hybrid, verbose, client, None, mode)
+                .search(
+                    &query, limit, threshold, hybrid, verbose, client, None, mode,
+                )
                 .await?;
             trim_semantic_search_payload(&mut result);
             format_json(&result)
@@ -149,7 +165,11 @@ async fn execute_tool(
             let name = arg_str(args, "name")?;
             let desc = require_description(args, "shelf")?;
             let result = client.create_shelf(&name, &desc).await?;
-            Ok(format_shelf_success("Shelf created successfully.", &result, client.base_url()))
+            Ok(format_shelf_success(
+                "Shelf created successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "update_shelf" => {
             let id = arg_i64_required(args, "shelf_id")?;
@@ -158,7 +178,11 @@ async fn execute_tool(
                 data["books"] = json!(books.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>());
             }
             let result = client.update_shelf(id, &data).await?;
-            Ok(format_shelf_success("Shelf updated successfully.", &result, client.base_url()))
+            Ok(format_shelf_success(
+                "Shelf updated successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "delete_shelf" => {
             let id = arg_i64_required(args, "shelf_id")?;
@@ -180,13 +204,21 @@ async fn execute_tool(
             let name = arg_str(args, "name")?;
             let desc = require_description(args, "book")?;
             let result = client.create_book(&name, &desc).await?;
-            Ok(format_book_success("Book created successfully.", &result, client.base_url()))
+            Ok(format_book_success(
+                "Book created successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "update_book" => {
             let id = arg_i64_required(args, "book_id")?;
             let data = filter_string_update_fields(args, &["name", "description"]);
             let result = client.update_book(id, &data).await?;
-            Ok(format_book_success("Book updated successfully.", &result, client.base_url()))
+            Ok(format_book_success(
+                "Book updated successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "delete_book" => {
             let id = arg_i64_required(args, "book_id")?;
@@ -209,7 +241,11 @@ async fn execute_tool(
             let name = arg_str(args, "name")?;
             let desc = require_description(args, "chapter")?;
             let result = client.create_chapter(book_id, &name, &desc).await?;
-            Ok(format_chapter_success("Chapter created successfully.", &result, client.base_url()))
+            Ok(format_chapter_success(
+                "Chapter created successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "update_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
@@ -218,7 +254,11 @@ async fn execute_tool(
                 data["book_id"] = json!(v);
             }
             let result = client.update_chapter(id, &data).await?;
-            Ok(format_chapter_success("Chapter updated successfully.", &result, client.base_url()))
+            Ok(format_chapter_success(
+                "Chapter updated successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "delete_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
@@ -246,35 +286,68 @@ async fn execute_tool(
                 return Err("Either book_id or chapter_id is required".to_string());
             }
             let page_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(md) = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["markdown"] = json!(strip_duplicate_title(md, page_name));
-            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            } else if let Some(v) = args
+                .get("html")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["html"] = json!(strip_duplicate_title(v, page_name));
             }
             let result = client.create_page(&data).await?;
-            Ok(format_page_success("Page created successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Page created successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "update_page" => {
             let id = arg_i64_required(args, "page_id")?;
             let mut data = json!({});
-            let has_content = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some()
-                || args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some();
+            let has_content = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .is_some()
+                || args
+                    .get("html")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .is_some();
             // Get the page name for duplicate title stripping
             let page_name = if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
                 n.to_string()
             } else if has_content {
                 // Fetch current name so we can strip duplicate H1
-                client.get_page(id).await?
-                    .get("name").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                client
+                    .get_page(id)
+                    .await?
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
             } else {
                 String::new()
             };
             if let Some(v) = args.get("name").and_then(|v| v.as_str()) {
                 data["name"] = json!(v);
             }
-            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(md) = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["markdown"] = json!(strip_duplicate_title(md, &page_name));
-            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            } else if let Some(v) = args
+                .get("html")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["html"] = json!(strip_duplicate_title(v, &page_name));
             }
             let move_chapter_id = arg_i64_opt(args, "chapter_id");
@@ -289,15 +362,26 @@ async fn execute_tool(
                 data["book_id"] = json!(v);
             }
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Page updated successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Page updated successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "edit_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let old_text = args.get("old_text").and_then(|v| v.as_str())
+            let old_text = args
+                .get("old_text")
+                .and_then(|v| v.as_str())
                 .ok_or("old_text is required")?;
-            let new_text = args.get("new_text").and_then(|v| v.as_str())
+            let new_text = args
+                .get("new_text")
+                .and_then(|v| v.as_str())
                 .ok_or("new_text is required")?;
-            let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // Fetch page in its native format
             let (editor, native_content) = get_page_content(client, id).await?;
@@ -324,11 +408,17 @@ async fn execute_tool(
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Page updated successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Page updated successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "append_to_page" => {
             let id = arg_i64_required(args, "page_id")?;
-            let content = args.get("markdown").and_then(|v| v.as_str())
+            let content = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
             let (editor, existing) = get_page_content(client, id).await?;
 
@@ -341,13 +431,21 @@ async fn execute_tool(
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Content appended successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Content appended successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "replace_section" => {
             let id = arg_i64_required(args, "page_id")?;
-            let heading = args.get("heading").and_then(|v| v.as_str())
+            let heading = args
+                .get("heading")
+                .and_then(|v| v.as_str())
                 .ok_or("heading is required")?;
-            let content = args.get("markdown").and_then(|v| v.as_str())
+            let content = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
             let (editor, existing) = get_page_content(client, id).await?;
 
@@ -360,13 +458,21 @@ async fn execute_tool(
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Section replaced successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Section replaced successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "insert_after" => {
             let id = arg_i64_required(args, "page_id")?;
-            let after = args.get("after").and_then(|v| v.as_str())
+            let after = args
+                .get("after")
+                .and_then(|v| v.as_str())
                 .ok_or("after is required")?;
-            let content = args.get("markdown").and_then(|v| v.as_str())
+            let content = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
             let (editor, existing) = get_page_content(client, id).await?;
 
@@ -396,7 +502,11 @@ async fn execute_tool(
                 json!({ "html": updated })
             };
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Content inserted successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Content inserted successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "delete_page" => {
             let id = arg_i64_required(args, "page_id")?;
@@ -423,14 +533,22 @@ async fn execute_tool(
                 data["book_id"] = json!(v);
             }
             let result = client.update_page(id, &data).await?;
-            Ok(format_page_success("Page moved successfully.", &result, client.base_url()))
+            Ok(format_page_success(
+                "Page moved successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         "move_chapter" => {
             let id = arg_i64_required(args, "chapter_id")?;
             let book_id = arg_i64_required(args, "target_book_id")?;
             let data = json!({ "book_id": book_id });
             let result = client.update_chapter(id, &data).await?;
-            Ok(format_chapter_success("Chapter moved successfully.", &result, client.base_url()))
+            Ok(format_chapter_success(
+                "Chapter moved successfully.",
+                &result,
+                client.base_url(),
+            ))
         }
         // Note: This uses a GET-modify-PUT pattern which has a TOCTOU race if multiple
         // concurrent sessions modify the same shelf simultaneously. Acceptable for
@@ -442,36 +560,56 @@ async fn execute_tool(
 
             // Add book to target shelf
             let target_shelf = client.get_shelf(target_shelf_id).await?;
-            let mut target_books: Vec<i64> = target_shelf.get("books")
+            let mut target_books: Vec<i64> = target_shelf
+                .get("books")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|id| id.as_i64())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|b| b.get("id").and_then(|id| id.as_i64()))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !target_books.contains(&book_id) {
                 target_books.push(book_id);
             }
-            client.update_shelf(target_shelf_id, &json!({ "books": target_books })).await?;
+            client
+                .update_shelf(target_shelf_id, &json!({ "books": target_books }))
+                .await?;
 
             // Remove from source shelf if specified
             let mut removed_from = String::new();
             if let Some(source_id) = remove_from_shelf_id {
                 let source_shelf = client.get_shelf(source_id).await?;
-                let source_name = source_shelf.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let source_books: Vec<i64> = source_shelf.get("books")
+                let source_name = source_shelf
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let source_books: Vec<i64> = source_shelf
+                    .get("books")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|b| b.get("id").and_then(|id| id.as_i64())).filter(|&id| id != book_id).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| b.get("id").and_then(|id| id.as_i64()))
+                            .filter(|&id| id != book_id)
+                            .collect()
+                    })
                     .unwrap_or_default();
-                client.update_shelf(source_id, &json!({ "books": source_books })).await?;
+                client
+                    .update_shelf(source_id, &json!({ "books": source_books }))
+                    .await?;
                 removed_from = format!("\nRemoved from shelf: {} (ID: {})", source_name, source_id);
             }
 
-            let target_name = target_shelf.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let target_name = target_shelf
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             Ok(format!("Book {book_id} moved to shelf \"{target_name}\" (ID: {target_shelf_id}).{removed_from}"))
         }
 
         // Attachments
-        "list_attachments" => {
-            format_json(&client.list_attachments().await?)
-        }
+        "list_attachments" => format_json(&client.list_attachments().await?),
         "get_attachment" => {
             let id = arg_i64_required(args, "attachment_id")?;
             format_json(&client.get_attachment(id).await?)
@@ -481,7 +619,11 @@ async fn execute_tool(
                 "name": arg_str(args, "name")?,
                 "uploaded_to": arg_i64_required(args, "uploaded_to")?,
             });
-            if let Some(v) = args.get("link").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(v) = args
+                .get("link")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["link"] = json!(v);
             }
             format_json(&client.create_attachment(&data).await?)
@@ -506,7 +648,8 @@ async fn execute_tool(
                     .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
                 (entry.bytes, entry.filename, entry.mime_type)
             } else if let Some(u) = url {
-                let (b, f) = bookstack::resolve_file_content(None, Some(u)).await
+                let (b, f) = bookstack::resolve_file_content(None, Some(u))
+                    .await
                     .map_err(|e| e.to_string())?;
                 (b, f, "application/octet-stream".to_string())
             } else {
@@ -517,7 +660,11 @@ async fn execute_tool(
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
             };
-            format_json(&client.create_file_attachment(&name, uploaded_to, &filename, bytes, &mime_type).await?)
+            format_json(
+                &client
+                    .create_file_attachment(&name, uploaded_to, &filename, bytes, &mime_type)
+                    .await?,
+            )
         }
 
         // Exports
@@ -555,9 +702,17 @@ async fn execute_tool(
             let mut data = json!({
                 "page_id": arg_i64_required(args, "page_id")?,
             });
-            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(md) = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["html"] = json!(markdown_to_html(md));
-            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            } else if let Some(v) = args
+                .get("html")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["html"] = json!(v);
             }
             if let Some(v) = arg_i64_opt(args, "parent_id") {
@@ -568,9 +723,17 @@ async fn execute_tool(
         "update_comment" => {
             let id = arg_i64_required(args, "comment_id")?;
             let mut data = json!({});
-            if let Some(md) = args.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(md) = args
+                .get("markdown")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["html"] = json!(markdown_to_html(md));
-            } else if let Some(v) = args.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            } else if let Some(v) = args
+                .get("html")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 data["html"] = json!(v);
             }
             format_json(&client.update_comment(id, &data).await?)
@@ -616,9 +779,7 @@ async fn execute_tool(
         }
 
         // System
-        "get_system_info" => {
-            format_json(&client.get_system_info().await?)
-        }
+        "get_system_info" => format_json(&client.get_system_info().await?),
 
         // Image Gallery
         "list_images" => {
@@ -665,7 +826,8 @@ async fn execute_tool(
                     .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
                 (entry.bytes, entry.filename, entry.mime_type)
             } else if let Some(u) = url {
-                let (b, f) = bookstack::resolve_file_content(None, Some(u)).await
+                let (b, f) = bookstack::resolve_file_content(None, Some(u))
+                    .await
                     .map_err(|e| e.to_string())?;
                 (b, f, "image/png".to_string())
             } else {
@@ -676,10 +838,20 @@ async fn execute_tool(
                 Some(f) if !f.is_empty() => f.to_string(),
                 _ => auto_filename,
             };
-            let result = client.upload_image(&name, &image_type, uploaded_to, &filename, bytes, &mime_type).await?;
+            let result = client
+                .upload_image(
+                    &name,
+                    &image_type,
+                    uploaded_to,
+                    &filename,
+                    bytes,
+                    &mime_type,
+                )
+                .await?;
 
             if embed {
-                let display_url = result.get("thumbs")
+                let display_url = result
+                    .get("thumbs")
                     .and_then(|t| t.get("display"))
                     .and_then(|v| v.as_str())
                     .or_else(|| result.get("url").and_then(|v| v.as_str()))
@@ -716,12 +888,15 @@ async fn execute_tool(
             // Pre-register the slot so the staging_id acts as auth
             {
                 let mut store = staging.write().await;
-                store.insert(staging_id.clone(), crate::staging::StagingEntry {
-                    bytes: Vec::new(),
-                    filename: String::new(),
-                    mime_type: String::new(),
-                    created_at: std::time::Instant::now(),
-                });
+                store.insert(
+                    staging_id.clone(),
+                    crate::staging::StagingEntry {
+                        bytes: Vec::new(),
+                        filename: String::new(),
+                        mime_type: String::new(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
             }
             format_json(&json!({
                 "staging_id": staging_id,
@@ -735,13 +910,24 @@ async fn execute_tool(
         "get_content_permissions" => {
             let content_type = ContentType::parse_str(&arg_str(args, "content_type")?)?;
             let content_id = arg_i64_required(args, "content_id")?;
-            format_json(&client.get_content_permissions(content_type, content_id).await?)
+            format_json(
+                &client
+                    .get_content_permissions(content_type, content_id)
+                    .await?,
+            )
         }
         "update_content_permissions" => {
             let content_type = ContentType::parse_str(&arg_str(args, "content_type")?)?;
             let content_id = arg_i64_required(args, "content_id")?;
-            let data = filter_update_fields(args, &["owner_id", "role_permissions", "fallback_permissions"]);
-            format_json(&client.update_content_permissions(content_type, content_id, &data).await?)
+            let data = filter_update_fields(
+                args,
+                &["owner_id", "role_permissions", "fallback_permissions"],
+            );
+            format_json(
+                &client
+                    .update_content_permissions(content_type, content_id, &data)
+                    .await?,
+            )
         }
 
         // Roles
@@ -805,8 +991,7 @@ fn arg_offset(args: &Value) -> i64 {
 }
 
 fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
-    arg_i64_opt(args, key)
-        .ok_or_else(|| format!("Missing required argument: {key}"))
+    arg_i64_opt(args, key).ok_or_else(|| format!("Missing required argument: {key}"))
 }
 
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
@@ -828,7 +1013,11 @@ fn join_base_url(base_url: &str, path: &str) -> String {
 /// Descriptions are surfaced to AI clients in the server's structure listing on connect,
 /// so missing or placeholder descriptions actively degrade future routing decisions.
 fn require_description(args: &Value, kind: &str) -> Result<String, String> {
-    let raw = args.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let raw = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if raw.is_empty() {
         return Err(format!(
             "description is required when creating a {kind}. \
@@ -846,8 +1035,19 @@ fn require_description(args: &Value, kind: &str) -> Result<String, String> {
         ));
     }
     let lowered = raw.to_lowercase();
-    let placeholders = ["todo", "tbd", "placeholder", "description", "xxx", "fixme", "n/a"];
-    if placeholders.iter().any(|p| lowered == *p || lowered.starts_with(&format!("{p} "))) {
+    let placeholders = [
+        "todo",
+        "tbd",
+        "placeholder",
+        "description",
+        "xxx",
+        "fixme",
+        "n/a",
+    ];
+    if placeholders
+        .iter()
+        .any(|p| lowered == *p || lowered.starts_with(&format!("{p} ")))
+    {
         return Err(format!(
             "description looks like a placeholder ('{raw}'). Write a real description that \
              describes the {kind}'s purpose and contents — it will be shown to every future \
@@ -861,7 +1061,10 @@ fn validate_enum(value: &str, allowed: &[&str], name: &str) -> Result<(), String
     if allowed.contains(&value) {
         Ok(())
     } else {
-        Err(format!("Invalid {name}: '{value}'. Must be one of: {}", allowed.join(", ")))
+        Err(format!(
+            "Invalid {name}: '{value}'. Must be one of: {}",
+            allowed.join(", ")
+        ))
     }
 }
 
@@ -909,17 +1112,26 @@ const SEMANTIC_SEARCH_HINT: &str =
      These are search-result previews, not full page content — call `get_page(page_id)` to read the full markdown when a match looks relevant.";
 
 fn trim_semantic_search_payload(payload: &mut Value) {
-    let Some(obj) = payload.as_object_mut() else { return; };
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
     if let Some(results) = obj.get_mut("results").and_then(|v| v.as_array_mut()) {
         for result in results.iter_mut() {
             // Drop into the shared helper. take() leaves Value::Null in the slot;
             // we immediately overwrite it with the trimmed result so no consumer
             // ever sees the placeholder.
             let owned = std::mem::take(result);
-            *result = trim_match(owned, SEMANTIC_SEARCH_CHUNK_LIMIT, SEMANTIC_SEARCH_CHUNK_CHARS);
+            *result = trim_match(
+                owned,
+                SEMANTIC_SEARCH_CHUNK_LIMIT,
+                SEMANTIC_SEARCH_CHUNK_CHARS,
+            );
         }
     }
-    obj.insert("hint".to_string(), Value::String(SEMANTIC_SEARCH_HINT.to_string()));
+    obj.insert(
+        "hint".to_string(),
+        Value::String(SEMANTIC_SEARCH_HINT.to_string()),
+    );
 }
 
 fn format_search_results(data: &Value, base_url: &str) -> String {
@@ -936,10 +1148,15 @@ fn format_search_results(data: &Value, base_url: &str) -> String {
 
     let mut lines = vec![format!("Found {total} results:\n")];
     for item in results {
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let item_type = item
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let id = item.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        let url = item.get("url").and_then(|v| v.as_str())
+        let url = item
+            .get("url")
+            .and_then(|v| v.as_str())
             .map(|u| join_base_url(base_url, u))
             .unwrap_or_default();
         if url.is_empty() {
@@ -998,7 +1215,10 @@ fn strip_duplicate_title(content: &str, page_name: &str) -> String {
             if first_line.trim().eq_ignore_ascii_case(page_name.trim()) {
                 // Remove the H1 line and any immediately following blank lines
                 let after_heading = heading_text.strip_prefix(first_line).unwrap_or("");
-                return after_heading.trim_start_matches('\n').trim_start_matches('\r').to_string();
+                return after_heading
+                    .trim_start_matches('\n')
+                    .trim_start_matches('\r')
+                    .to_string();
             }
         }
     }
@@ -1010,7 +1230,10 @@ fn strip_duplicate_title(content: &str, page_name: &str) -> String {
             let text = strip_html_tags(tag_content);
             if text.trim().eq_ignore_ascii_case(page_name.trim()) {
                 let after = &trimmed[close_pos + 5..];
-                return after.trim_start_matches('\n').trim_start_matches('\r').to_string();
+                return after
+                    .trim_start_matches('\n')
+                    .trim_start_matches('\r')
+                    .to_string();
             }
         }
     }
@@ -1048,19 +1271,19 @@ fn markdown_to_html(md: &str) -> String {
 /// For WYSIWYG pages: returns ("wysiwyg", html_content).
 async fn get_page_content(client: &BookStackClient, id: i64) -> Result<(String, String), String> {
     let page = client.get_page(id).await?;
-    let editor = page.get("editor")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let editor = page.get("editor").and_then(|v| v.as_str()).unwrap_or("");
 
     if editor == "markdown" {
-        let content = page.get("markdown")
+        let content = page
+            .get("markdown")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         Ok(("markdown".to_string(), content))
     } else {
         // "wysiwyg" or "" (system default) — use HTML
-        let content = page.get("html")
+        let content = page
+            .get("html")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -1073,13 +1296,22 @@ fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-    let editor = result.get("editor").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let editor = result
+        .get("editor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let revision = result.get("revision_count").and_then(|v| v.as_i64()).unwrap_or(0);
+    let revision = result
+        .get("revision_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let url = if let Some(rel) = result.get("url").and_then(|v| v.as_str()) {
         join_base_url(base_url, rel)
     } else {
-        let book_slug = result.get("book_slug").and_then(|v| v.as_str()).unwrap_or("");
+        let book_slug = result
+            .get("book_slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if !book_slug.is_empty() && !slug.is_empty() {
             format!("{base_url}/books/{book_slug}/page/{slug}")
         } else {
@@ -1099,7 +1331,10 @@ fn format_shelf_success(action: &str, result: &Value, base_url: &str) -> String 
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-    let desc = result.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let desc = result
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let url = format!("{base_url}/shelves/{slug}");
     let desc_line = if desc.is_empty() {
         String::new()
@@ -1114,7 +1349,10 @@ fn format_book_success(action: &str, result: &Value, base_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-    let desc = result.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let desc = result
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let url = format!("{base_url}/books/{slug}");
     let desc_line = if desc.is_empty() {
         String::new()
@@ -1130,8 +1368,14 @@ fn format_chapter_success(action: &str, result: &Value, base_url: &str) -> Strin
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
     let book_id = result.get("book_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let desc = result.get("description").and_then(|v| v.as_str()).unwrap_or("");
-    let book_slug = result.get("book_slug").and_then(|v| v.as_str()).unwrap_or("");
+    let desc = result
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let book_slug = result
+        .get("book_slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let url = if !book_slug.is_empty() && !slug.is_empty() {
         format!("{base_url}/books/{book_slug}/chapter/{slug}")
     } else {
@@ -1151,21 +1395,33 @@ fn format_chapter_success(action: &str, result: &Value, base_url: &str) -> Strin
 }
 
 /// Replace a section in markdown content by heading.
-fn replace_section_markdown(md: &str, heading: &str, content: &str, page_id: i64) -> Result<String, String> {
+fn replace_section_markdown(
+    md: &str,
+    heading: &str,
+    content: &str,
+    page_id: i64,
+) -> Result<String, String> {
     let lines: Vec<&str> = md.lines().collect();
     let heading_pattern = heading.trim_start_matches('#').trim();
 
-    let start = lines.iter().position(|line| {
-        let trimmed = line.trim_start_matches('#').trim();
-        trimmed.eq_ignore_ascii_case(heading_pattern)
-    }).ok_or(format!("Heading '{}' not found in page {page_id}", heading))?;
+    let start = lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim_start_matches('#').trim();
+            trimmed.eq_ignore_ascii_case(heading_pattern)
+        })
+        .ok_or(format!("Heading '{}' not found in page {page_id}", heading))?;
 
     let level = lines[start].chars().take_while(|c| *c == '#').count();
 
-    let end = lines[start + 1..].iter().position(|line| {
-        let l = line.chars().take_while(|c| *c == '#').count();
-        l > 0 && l <= level
-    }).map(|p| p + start + 1).unwrap_or(lines.len());
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| {
+            let l = line.chars().take_while(|c| *c == '#').count();
+            l > 0 && l <= level
+        })
+        .map(|p| p + start + 1)
+        .unwrap_or(lines.len());
 
     let mut updated = lines[..=start].join("\n");
     updated.push('\n');
@@ -1181,7 +1437,12 @@ fn replace_section_markdown(md: &str, heading: &str, content: &str, page_id: i64
 
 /// Replace a section in HTML content by heading.
 /// Finds <hN>heading</hN> and replaces content up to the next heading of same or higher level.
-fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i64) -> Result<String, String> {
+fn replace_section_html(
+    html: &str,
+    heading: &str,
+    new_content: &str,
+    page_id: i64,
+) -> Result<String, String> {
     let heading_pattern = heading.trim_start_matches('#').trim();
 
     // Find the heading element
@@ -1190,7 +1451,9 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
     let mut search_from = 0;
 
     while search_from < html.len() {
-        let Some(h_pos) = html[search_from..].find("<h") else { break };
+        let Some(h_pos) = html[search_from..].find("<h") else {
+            break;
+        };
         let abs_pos = search_from + h_pos;
         let rest = &html[abs_pos..];
 
@@ -1217,7 +1480,8 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
 
     // Find end of the heading tag
     let close_tag = format!("</h{}>", heading_level);
-    let heading_end = html[start..].find(&close_tag)
+    let heading_end = html[start..]
+        .find(&close_tag)
         .map(|p| start + p + close_tag.len())
         .ok_or("Malformed heading HTML".to_string())?;
 
@@ -1226,7 +1490,9 @@ fn replace_section_html(html: &str, heading: &str, new_content: &str, page_id: i
     let mut search_from = heading_end;
 
     while search_from < html.len() {
-        let Some(h_pos) = html[search_from..].find("<h") else { break };
+        let Some(h_pos) = html[search_from..].find("<h") else {
+            break;
+        };
         let abs_pos = search_from + h_pos;
         let rest = &html[abs_pos..];
 
@@ -1361,8 +1627,7 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
             instructions.push_str(&structure);
         }
         None => {
-            instructions
-                .push_str("Use list_shelves and list_books to explore the structure.");
+            instructions.push_str("Use list_shelves and list_books to explore the structure.");
         }
     }
 
@@ -1443,7 +1708,8 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
                         if cdesc.is_empty() {
                             output.push_str(&format!("    Chapter: {cname} (ID: {cid})\n"));
                         } else {
-                            output.push_str(&format!("    Chapter: {cname} (ID: {cid}) — {cdesc}\n"));
+                            output
+                                .push_str(&format!("    Chapter: {cname} (ID: {cid}) — {cdesc}\n"));
                         }
                     }
                 }
@@ -1892,7 +2158,8 @@ fn name_desc_schema() -> Value {
 }
 
 fn update_schema(id_name: &str, fields: &[&str]) -> Value {
-    let mut props = json!({ id_name: { "type": "integer", "description": format!("The {id_name}") } });
+    let mut props =
+        json!({ id_name: { "type": "integer", "description": format!("The {id_name}") } });
     for &field in fields {
         props[field] = json!({ "type": "string", "description": format!("New {field}") });
     }
@@ -2000,8 +2267,14 @@ mod tests {
         .collect();
 
         let extra: Vec<&String> = names.difference(&expected).collect();
-        assert!(extra.is_empty(), "unexpected tools in tools/list: {extra:?}");
+        assert!(
+            extra.is_empty(),
+            "unexpected tools in tools/list: {extra:?}"
+        );
         let missing: Vec<&String> = expected.difference(&names).collect();
-        assert!(missing.is_empty(), "missing tools from tools/list: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "missing tools from tools/list: {missing:?}"
+        );
     }
 }

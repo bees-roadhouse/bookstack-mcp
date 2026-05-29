@@ -24,11 +24,8 @@ pub struct RerankHit {
 pub trait Reranker: Send + Sync + 'static {
     /// Score `documents` against `query`. Returns one hit per document, in
     /// input order. The caller does any sort / top-k cut.
-    async fn rerank(
-        &self,
-        query: String,
-        documents: Vec<String>,
-    ) -> Result<Vec<RerankHit>, String>;
+    async fn rerank(&self, query: String, documents: Vec<String>)
+        -> Result<Vec<RerankHit>, String>;
 
     fn provider_name(&self) -> &str;
 
