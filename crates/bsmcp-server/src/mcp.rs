@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -7,6 +8,8 @@ use pulldown_cmark::{html, Options, Parser};
 
 use crate::semantic::{trim_match, SearchMode, SemanticState};
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::db::IndexDb;
+use bsmcp_common::index::{DirectoryNode, DirectoryNodeKind, DirectoryScope};
 use bsmcp_common::time::TimezoneConfig;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -15,6 +18,7 @@ pub async fn handle_request(
     request: &Value,
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
+    index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
     tz: &TimezoneConfig,
 ) -> Option<Value> {
@@ -58,7 +62,7 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging).await;
+            let result = execute_tool(name, &args, client, semantic, index_db, staging).await;
 
             // Every tools/call result carries `_meta.time` (issue #67) so a
             // session can reason about "today / yesterday / this morning"
@@ -106,9 +110,40 @@ async fn execute_tool(
     args: &Value,
     client: &BookStackClient,
     semantic: Option<&SemanticState>,
+    index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
 ) -> Result<String, String> {
     match name {
+        // Directory tree (issue #69) — scoped, depth-limited tree from the
+        // bookstack_* index tables. Page-level ACL filter via BookStack's
+        // can_access_page; empty chapters/books/shelves are pruned.
+        "directory" => {
+            let scope = parse_directory_scope(args)?;
+            let depth =
+                arg_i64_opt(args, "depth").and_then(|d| if d < 0 { None } else { Some(d as u32) });
+            // The "include" knob is accepted today for forward compatibility
+            // with the issue's "summary" / "full" tiers. The current shape
+            // returns meta only (id + name + slug + kind + children). Summary
+            // and full are reserved for a follow-up that pulls page_cache
+            // descriptions / bodies.
+            let include = arg_str_default(args, "include", "meta");
+            validate_enum(&include, &["meta", "summary", "full"], "include")?;
+            let tree = index_db
+                .read_directory_tree(scope, depth)
+                .await
+                .map_err(|e| format!("directory: {e}"))?;
+            let filtered = filter_directory_tree_by_acl(tree, client).await;
+            let payload = json!({
+                "scope": directory_scope_payload(scope),
+                "depth": depth,
+                "include": include,
+                "tree": filtered
+                    .iter()
+                    .map(directory_node_to_json)
+                    .collect::<Vec<_>>(),
+            });
+            format_json(&payload)
+        }
         // Semantic Search (conditional)
         "semantic_search" => {
             let sem = semantic.ok_or("Semantic search is not enabled")?;
@@ -1107,6 +1142,185 @@ fn format_json(v: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(v).map_err(|e| e.to_string())
 }
 
+// --- directory tool helpers (issue #69) ---
+
+/// Parse the `scope` argument. Accepts:
+/// - omitted / `"all"` / `null` → `DirectoryScope::All`
+/// - object form `{ "shelf": <id> }`, `{ "book": <id> }`, `{ "chapter": <id> }`
+///
+/// Rejects ambiguous combinations (e.g. both `shelf` and `book`).
+fn parse_directory_scope(args: &Value) -> Result<DirectoryScope, String> {
+    let scope = args.get("scope");
+    let scope = match scope {
+        None | Some(Value::Null) => return Ok(DirectoryScope::All),
+        Some(s) => s,
+    };
+    if let Some(s) = scope.as_str() {
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(DirectoryScope::All);
+        }
+        return Err(format!(
+            "invalid scope string '{s}' — expected \"all\" or an object \
+             like {{\"shelf\": ID}} / {{\"book\": ID}} / {{\"chapter\": ID}}"
+        ));
+    }
+    if let Some(obj) = scope.as_object() {
+        let shelf = obj.get("shelf").and_then(value_as_i64);
+        let book = obj.get("book").and_then(value_as_i64);
+        let chapter = obj.get("chapter").and_then(value_as_i64);
+        let count = [shelf, book, chapter]
+            .iter()
+            .filter(|v| v.is_some())
+            .count();
+        if count > 1 {
+            return Err(
+                "scope object must specify exactly one of {shelf, book, chapter}".to_string(),
+            );
+        }
+        if let Some(id) = shelf {
+            return Ok(DirectoryScope::Shelf(id));
+        }
+        if let Some(id) = book {
+            return Ok(DirectoryScope::Book(id));
+        }
+        if let Some(id) = chapter {
+            return Ok(DirectoryScope::Chapter(id));
+        }
+        return Err(
+            "scope object must specify one of {shelf, book, chapter} with an integer id"
+                .to_string(),
+        );
+    }
+    Err("scope must be \"all\" or an object — see tool description".to_string())
+}
+
+fn directory_scope_payload(scope: DirectoryScope) -> Value {
+    match scope {
+        DirectoryScope::All => json!("all"),
+        DirectoryScope::Shelf(id) => json!({ "shelf": id }),
+        DirectoryScope::Book(id) => json!({ "book": id }),
+        DirectoryScope::Chapter(id) => json!({ "chapter": id }),
+    }
+}
+
+fn directory_node_to_json(node: &DirectoryNode) -> Value {
+    let mut obj = json!({
+        "type": node.kind.as_str(),
+        "id": node.id,
+        "name": node.name,
+        "slug": node.slug,
+    });
+    if let Some(pk) = &node.page_kind {
+        obj["page_kind"] = json!(pk);
+    }
+    if !node.children.is_empty() {
+        obj["children"] = Value::Array(node.children.iter().map(directory_node_to_json).collect());
+    } else if matches!(
+        node.kind,
+        DirectoryNodeKind::Shelf | DirectoryNodeKind::Book | DirectoryNodeKind::Chapter
+    ) {
+        // Empty children on a container — emit `[]` so the client doesn't
+        // have to special-case "missing" vs "empty". Pages omit it.
+        obj["children"] = Value::Array(Vec::new());
+    }
+    obj
+}
+
+/// Filter the candidate tree by per-page ACL.
+///
+/// Walks the tree, collects every page id, asks BookStack which ones the
+/// caller can see (in parallel with a small concurrency cap), then prunes
+/// pages the caller can't see plus any chapter/book/shelf that ended up
+/// with no surviving descendants. Containers explicitly trimmed to depth=0
+/// are NOT considered empty — they have no children because the caller
+/// asked us not to walk them, not because the content is hidden.
+async fn filter_directory_tree_by_acl(
+    tree: Vec<DirectoryNode>,
+    client: &BookStackClient,
+) -> Vec<DirectoryNode> {
+    let mut page_ids: Vec<i64> = Vec::new();
+    collect_page_ids(&tree, &mut page_ids);
+    if page_ids.is_empty() {
+        // No pages anywhere in the candidate tree — nothing to filter against.
+        // Containers (shelves/books/chapters) with no page descendants stay
+        // visible as-is; emptiness is the caller's signal.
+        return tree;
+    }
+    page_ids.sort_unstable();
+    page_ids.dedup();
+
+    // Concurrency cap matches semantic_search's filter_by_permission (25).
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(25));
+    let mut handles = Vec::with_capacity(page_ids.len());
+    for pid in page_ids.iter().copied() {
+        let client = client.clone();
+        let sem = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            (pid, client.can_access_page(pid).await)
+        }));
+    }
+    let mut allowed: std::collections::HashSet<i64> =
+        std::collections::HashSet::with_capacity(page_ids.len());
+    for h in handles {
+        if let Ok((pid, ok)) = h.await {
+            if ok {
+                allowed.insert(pid);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(tree.len());
+    for node in tree {
+        if let Some(filtered) = filter_node(node, &allowed) {
+            out.push(filtered);
+        }
+    }
+    out
+}
+
+fn collect_page_ids(nodes: &[DirectoryNode], out: &mut Vec<i64>) {
+    for n in nodes {
+        if matches!(n.kind, DirectoryNodeKind::Page) {
+            out.push(n.id);
+        } else {
+            collect_page_ids(&n.children, out);
+        }
+    }
+}
+
+/// Recursive prune. Pages stay iff their id is in `allowed`. Containers stay
+/// iff at least one descendant page survives — except when the container
+/// reached the tree with an empty children list (a depth=0 cut by the
+/// caller); we can't tell visibility from emptiness in that case, so we
+/// keep it.
+fn filter_node(
+    node: DirectoryNode,
+    allowed: &std::collections::HashSet<i64>,
+) -> Option<DirectoryNode> {
+    if matches!(node.kind, DirectoryNodeKind::Page) {
+        if allowed.contains(&node.id) {
+            return Some(node);
+        }
+        return None;
+    }
+    let had_children = !node.children.is_empty();
+    let mut kept = Vec::with_capacity(node.children.len());
+    for child in node.children {
+        if let Some(c) = filter_node(child, allowed) {
+            kept.push(c);
+        }
+    }
+    if had_children && kept.is_empty() {
+        // Every descendant was a forbidden page → drop the container.
+        return None;
+    }
+    Some(DirectoryNode {
+        children: kept,
+        ..node
+    })
+}
+
 /// `semantic_search` MCP-tool payload trim. Caps each result's chunks and
 /// truncates each chunk's content so a wide query doesn't blow past Claude
 /// Code's response-size budget (which would force the response to spill to a
@@ -1752,6 +1966,39 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                 "required": ["query"]
             })),
 
+        // Directory tree (issue #69) — one-shot scoped tree from the bookstack_* index.
+        tool("directory",
+            "Return a scoped, depth-limited tree of BookStack content (shelves → books → chapters → pages). \
+             Reads from the internal structural index — NOT live BookStack — so it's fast (~10ms warm) and consistent with the indexer's view. \
+             Replaces the assemble-it-yourself pattern of calling list_shelves + list_books + list_chapters + list_pages. \
+             Pages are ACL-filtered against the calling token; chapters/books/shelves with no surviving pages are pruned. \
+             \n\nScope: omit (or `\"all\"`) for the full tree, or pass `{\"shelf\": ID}` / `{\"book\": ID}` / `{\"chapter\": ID}` to root the walk. \
+             Depth: max levels to descend (0 = roots only, omit for unbounded). \
+             Include: `\"meta\"` (id + name + slug + page_kind, default), `\"summary\"` and `\"full\"` are accepted for forward compat and currently behave like `meta`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "description": "Root of the walk. Omit or pass \"all\" for the full tree. Object form: exactly one of {\"shelf\": ID}, {\"book\": ID}, {\"chapter\": ID}.",
+                        "oneOf": [
+                            { "type": "string", "enum": ["all"] },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "shelf":   { "type": "integer", "description": "Shelf ID to root the walk at" },
+                                    "book":    { "type": "integer", "description": "Book ID to root the walk at" },
+                                    "chapter": { "type": "integer", "description": "Chapter ID to root the walk at" }
+                                },
+                                "additionalProperties": false
+                            },
+                            { "type": "null" }
+                        ]
+                    },
+                    "depth": { "type": "integer", "description": "Max depth to descend (0 = roots only). Omit for unbounded." },
+                    "include": { "type": "string", "enum": ["meta", "summary", "full"], "description": "Per-node detail level. `meta` returns id + name + slug + page_kind. `summary` and `full` reserved for follow-up.", "default": "meta" }
+                }
+            })),
+
         // Shelves
         tool("list_shelves", "List all shelves.", paginated_schema()),
         tool("get_shelf", "Get a shelf by ID, including its books.",
@@ -2186,18 +2433,23 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// v0.10.0 surface lock: 59 BookStack CRUD tools + 3 semantic tools = 62.
-    /// Anything extra means a briefing-era surface leaked back in.
+    /// v0.10.0 surface lock + issue #69: 59 BookStack CRUD plus 1 directory
+    /// tool plus 3 semantic tools equals 63. Anything extra means a
+    /// briefing-era surface leaked back in.
     #[test]
-    fn tools_list_count_is_62_with_semantic() {
+    fn tools_list_count_is_63_with_semantic() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 62, "expected 59 CRUD + 3 semantic = 62 tools");
+        assert_eq!(
+            tools.len(),
+            63,
+            "expected 59 CRUD + 1 directory + 3 semantic = 63 tools"
+        );
     }
 
     #[test]
-    fn tools_list_count_is_59_without_semantic() {
+    fn tools_list_count_is_60_without_semantic() {
         let tools = tool_definitions(false);
-        assert_eq!(tools.len(), 59, "expected 59 CRUD tools");
+        assert_eq!(tools.len(), 60, "expected 59 CRUD + 1 directory = 60 tools");
     }
 
     /// Locks the precise tool name set so a briefing/session/dismiss-style
@@ -2211,6 +2463,7 @@ mod tests {
             .collect();
         let expected: HashSet<String> = [
             "search_content",
+            "directory",
             "list_shelves",
             "get_shelf",
             "create_shelf",
@@ -2287,5 +2540,255 @@ mod tests {
             missing.is_empty(),
             "missing tools from tools/list: {missing:?}"
         );
+    }
+
+    // --- directory tool helpers (issue #69) ---
+
+    #[test]
+    fn parse_directory_scope_defaults_to_all() {
+        assert_eq!(
+            parse_directory_scope(&json!({})).unwrap(),
+            DirectoryScope::All
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": null })).unwrap(),
+            DirectoryScope::All
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": "all" })).unwrap(),
+            DirectoryScope::All
+        );
+    }
+
+    #[test]
+    fn parse_directory_scope_picks_one_root() {
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "shelf": 42 } })).unwrap(),
+            DirectoryScope::Shelf(42)
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "book": 7 } })).unwrap(),
+            DirectoryScope::Book(7)
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "chapter": 99 } })).unwrap(),
+            DirectoryScope::Chapter(99)
+        );
+        // Accept stringified ids — AI clients sometimes ship strings.
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "book": "12" } })).unwrap(),
+            DirectoryScope::Book(12)
+        );
+    }
+
+    #[test]
+    fn parse_directory_scope_rejects_ambiguity() {
+        let err =
+            parse_directory_scope(&json!({ "scope": { "shelf": 1, "book": 2 } })).unwrap_err();
+        assert!(err.contains("exactly one"));
+
+        let err = parse_directory_scope(&json!({ "scope": {} })).unwrap_err();
+        assert!(err.contains("one of"));
+
+        let err = parse_directory_scope(&json!({ "scope": "bogus" })).unwrap_err();
+        assert!(err.contains("scope"));
+    }
+
+    #[test]
+    fn directory_node_to_json_renders_meta_shape() {
+        let leaf = DirectoryNode {
+            kind: DirectoryNodeKind::Page,
+            id: 5,
+            name: "p".to_string(),
+            slug: "p".to_string(),
+            page_kind: Some("manifest".to_string()),
+            children: Vec::new(),
+        };
+        let chap = DirectoryNode {
+            kind: DirectoryNodeKind::Chapter,
+            id: 3,
+            name: "c".to_string(),
+            slug: "c".to_string(),
+            page_kind: None,
+            children: vec![leaf.clone()],
+        };
+
+        let v_leaf = directory_node_to_json(&leaf);
+        assert_eq!(v_leaf["type"], "page");
+        assert_eq!(v_leaf["id"], 5);
+        assert_eq!(v_leaf["page_kind"], "manifest");
+        // Pages have no children field in the meta shape.
+        assert!(v_leaf.get("children").is_none());
+
+        let v_chap = directory_node_to_json(&chap);
+        assert_eq!(v_chap["type"], "chapter");
+        assert_eq!(v_chap["children"].as_array().unwrap().len(), 1);
+
+        // Empty containers still emit an empty children array — clients
+        // shouldn't have to special-case "missing" vs "empty".
+        let empty_book = DirectoryNode {
+            kind: DirectoryNodeKind::Book,
+            id: 1,
+            name: "b".to_string(),
+            slug: "b".to_string(),
+            page_kind: None,
+            children: Vec::new(),
+        };
+        let v = directory_node_to_json(&empty_book);
+        assert_eq!(v["children"], json!([]));
+    }
+
+    #[test]
+    fn filter_directory_drops_forbidden_pages_and_empty_chapters() {
+        // Tree: shelf → book → chapter(allowed-page, forbidden-page) +
+        // chapter(only-forbidden) + book-root forbidden-page.
+        let tree = vec![DirectoryNode {
+            kind: DirectoryNodeKind::Shelf,
+            id: 100,
+            name: "s".to_string(),
+            slug: "s".to_string(),
+            page_kind: None,
+            children: vec![DirectoryNode {
+                kind: DirectoryNodeKind::Book,
+                id: 200,
+                name: "b".to_string(),
+                slug: "b".to_string(),
+                page_kind: None,
+                children: vec![
+                    DirectoryNode {
+                        kind: DirectoryNodeKind::Chapter,
+                        id: 300,
+                        name: "c1".to_string(),
+                        slug: "c1".to_string(),
+                        page_kind: None,
+                        children: vec![
+                            DirectoryNode {
+                                kind: DirectoryNodeKind::Page,
+                                id: 1,
+                                name: "ok".to_string(),
+                                slug: "ok".to_string(),
+                                page_kind: Some("unclassified".to_string()),
+                                children: vec![],
+                            },
+                            DirectoryNode {
+                                kind: DirectoryNodeKind::Page,
+                                id: 2,
+                                name: "forbidden".to_string(),
+                                slug: "forbidden".to_string(),
+                                page_kind: Some("unclassified".to_string()),
+                                children: vec![],
+                            },
+                        ],
+                    },
+                    DirectoryNode {
+                        kind: DirectoryNodeKind::Chapter,
+                        id: 301,
+                        name: "c2".to_string(),
+                        slug: "c2".to_string(),
+                        page_kind: None,
+                        children: vec![DirectoryNode {
+                            kind: DirectoryNodeKind::Page,
+                            id: 3,
+                            name: "forbidden2".to_string(),
+                            slug: "forbidden2".to_string(),
+                            page_kind: Some("unclassified".to_string()),
+                            children: vec![],
+                        }],
+                    },
+                    DirectoryNode {
+                        kind: DirectoryNodeKind::Page,
+                        id: 4,
+                        name: "root-forbidden".to_string(),
+                        slug: "root-forbidden".to_string(),
+                        page_kind: Some("unclassified".to_string()),
+                        children: vec![],
+                    },
+                ],
+            }],
+        }];
+
+        // Allow only page 1.
+        let allowed: std::collections::HashSet<i64> = [1].into_iter().collect();
+        let mut out = Vec::new();
+        for node in tree {
+            if let Some(n) = filter_node(node, &allowed) {
+                out.push(n);
+            }
+        }
+        // The whole shelf survives (one page chain stayed); but c2 dropped
+        // because every descendant was forbidden, and the root-forbidden
+        // page is gone too.
+        assert_eq!(out.len(), 1);
+        let shelf = &out[0];
+        let book = &shelf.children[0];
+        // Only c1 should remain in the book — c2 and the forbidden root
+        // page get pruned.
+        assert_eq!(book.children.len(), 1);
+        let c1 = &book.children[0];
+        assert_eq!(c1.id, 300);
+        assert_eq!(c1.children.len(), 1);
+        assert_eq!(c1.children[0].id, 1);
+    }
+
+    #[test]
+    fn filter_directory_keeps_container_when_caller_cut_depth() {
+        // A book with no children (caller asked depth=0). We can't tell
+        // whether it's "really empty" or "depth-cut", so we keep it.
+        let tree = vec![DirectoryNode {
+            kind: DirectoryNodeKind::Book,
+            id: 200,
+            name: "b".to_string(),
+            slug: "b".to_string(),
+            page_kind: None,
+            children: vec![],
+        }];
+        let allowed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for node in tree {
+            if let Some(n) = filter_node(node, &allowed) {
+                out.push(n);
+            }
+        }
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn collect_page_ids_walks_full_tree() {
+        let tree = vec![DirectoryNode {
+            kind: DirectoryNodeKind::Shelf,
+            id: 1,
+            name: "s".to_string(),
+            slug: "s".to_string(),
+            page_kind: None,
+            children: vec![
+                DirectoryNode {
+                    kind: DirectoryNodeKind::Page,
+                    id: 10,
+                    name: "p10".to_string(),
+                    slug: "p10".to_string(),
+                    page_kind: None,
+                    children: vec![],
+                },
+                DirectoryNode {
+                    kind: DirectoryNodeKind::Book,
+                    id: 2,
+                    name: "b".to_string(),
+                    slug: "b".to_string(),
+                    page_kind: None,
+                    children: vec![DirectoryNode {
+                        kind: DirectoryNodeKind::Page,
+                        id: 20,
+                        name: "p20".to_string(),
+                        slug: "p20".to_string(),
+                        page_kind: None,
+                        children: vec![],
+                    }],
+                },
+            ],
+        }];
+        let mut ids = Vec::new();
+        collect_page_ids(&tree, &mut ids);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![10, 20]);
     }
 }

@@ -2803,6 +2803,86 @@ impl IndexDb for SqliteDb {
         .await
         .map_err(|e| format!("Task failed: {e}"))?
     }
+
+    // --- Directory tree (issue #69) ---
+
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+                     FROM bookstack_shelves WHERE deleted = 0
+                     ORDER BY name",
+                )
+                .map_err(|e| format!("list_indexed_shelves prepare: {e}"))?;
+            let rows = stmt
+                .query_map(params![], |r| {
+                    let kind_str: String = r.get(3)?;
+                    Ok(IndexedShelf {
+                        shelf_id: r.get(0)?,
+                        name: r.get(1)?,
+                        slug: r.get(2)?,
+                        shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                        indexed_at: r.get(4)?,
+                        deleted: r.get::<_, i64>(5)? != 0,
+                    })
+                })
+                .map_err(|e| format!("list_indexed_shelves query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("list_indexed_shelves collect: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_books_unshelved(&self) -> Result<Vec<IndexedBook>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+                     FROM bookstack_books WHERE shelf_id IS NULL AND deleted = 0
+                     ORDER BY name",
+                )
+                .map_err(|e| format!("list_indexed_books_unshelved prepare: {e}"))?;
+            let rows = stmt
+                .query_map(params![], |r| {
+                    let kind_str: String = r.get(5)?;
+                    Ok(IndexedBook {
+                        book_id: r.get(0)?,
+                        name: r.get(1)?,
+                        slug: r.get(2)?,
+                        shelf_id: r.get(3)?,
+                        identity_ouid: r.get(4)?,
+                        book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+                        indexed_at: r.get(6)?,
+                        deleted: r.get::<_, i64>(7)? != 0,
+                    })
+                })
+                .map_err(|e| format!("list_indexed_books_unshelved query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("list_indexed_books_unshelved collect: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn read_directory_tree(
+        &self,
+        scope: DirectoryScope,
+        depth: Option<u32>,
+    ) -> Result<Vec<DirectoryNode>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            read_directory_tree_sync(&conn, scope, depth)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
 }
 
 // --- Helpers shared across IndexDb impl methods ---
@@ -2867,6 +2947,381 @@ fn indexed_pages_by_predicate(
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("indexed_pages_by_predicate collect: {e}"))
 }
+
+// --- read_directory_tree (issue #69) ---
+//
+// The whole walk runs inside one `spawn_blocking` + one connection lock, so
+// we keep it synchronous and chase the parent → children relation with three
+// prepared statements (books by shelf, chapters by book, pages by chapter +
+// pages at book root). Depth is decremented on each descent; `Some(0)` cuts
+// children off at that level, `None` walks all the way down.
+
+const SHELF_NAME_UNSHELVED: &str = "Unshelved";
+
+fn read_directory_tree_sync(
+    conn: &rusqlite::Connection,
+    scope: DirectoryScope,
+    depth: Option<u32>,
+) -> Result<Vec<DirectoryNode>, String> {
+    match scope {
+        DirectoryScope::All => {
+            let mut shelves_stmt = conn
+                .prepare(
+                    "SELECT shelf_id, name, slug FROM bookstack_shelves
+                     WHERE deleted = 0 ORDER BY name",
+                )
+                .map_err(|e| format!("read_directory_tree shelves: {e}"))?;
+            let shelf_rows: Vec<(i64, String, String)> = shelves_stmt
+                .query_map(params![], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("read_directory_tree shelves query: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read_directory_tree shelves collect: {e}"))?;
+
+            let mut out: Vec<DirectoryNode> = Vec::with_capacity(shelf_rows.len() + 1);
+            for (shelf_id, name, slug) in shelf_rows {
+                let children = if depth_allows_descent(depth) {
+                    list_books_in_shelf(conn, shelf_id)?
+                        .into_iter()
+                        .map(|b| book_node(conn, b, decrement_depth(depth)))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    Vec::new()
+                };
+                out.push(DirectoryNode {
+                    kind: DirectoryNodeKind::Shelf,
+                    id: shelf_id,
+                    name,
+                    slug,
+                    page_kind: None,
+                    children,
+                });
+            }
+
+            // Synthetic "Unshelved" pseudo-shelf so books without a shelf
+            // assignment aren't invisible in the All view. Only emitted when
+            // there's at least one such book.
+            let unshelved = list_books_unshelved(conn)?;
+            if !unshelved.is_empty() {
+                let children = if depth_allows_descent(depth) {
+                    unshelved
+                        .into_iter()
+                        .map(|b| book_node(conn, b, decrement_depth(depth)))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    Vec::new()
+                };
+                out.push(DirectoryNode {
+                    kind: DirectoryNodeKind::Shelf,
+                    id: 0,
+                    name: SHELF_NAME_UNSHELVED.to_string(),
+                    slug: "unshelved".to_string(),
+                    page_kind: None,
+                    children,
+                });
+            }
+            Ok(out)
+        }
+        DirectoryScope::Shelf(shelf_id) => {
+            let (name, slug) = shelf_name_slug(conn, shelf_id)?
+                .ok_or_else(|| format!("shelf {shelf_id} not found"))?;
+            let children = if depth_allows_descent(depth) {
+                list_books_in_shelf(conn, shelf_id)?
+                    .into_iter()
+                    .map(|b| book_node(conn, b, decrement_depth(depth)))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            Ok(vec![DirectoryNode {
+                kind: DirectoryNodeKind::Shelf,
+                id: shelf_id,
+                name,
+                slug,
+                page_kind: None,
+                children,
+            }])
+        }
+        DirectoryScope::Book(book_id) => {
+            let book =
+                get_book_row(conn, book_id)?.ok_or_else(|| format!("book {book_id} not found"))?;
+            Ok(vec![book_node(conn, book, depth)?])
+        }
+        DirectoryScope::Chapter(chapter_id) => {
+            let chap = get_chapter_row(conn, chapter_id)?
+                .ok_or_else(|| format!("chapter {chapter_id} not found"))?;
+            Ok(vec![chapter_node(conn, chap, depth)?])
+        }
+    }
+}
+
+fn depth_allows_descent(depth: Option<u32>) -> bool {
+    match depth {
+        None => true,
+        Some(0) => false,
+        Some(_) => true,
+    }
+}
+
+fn decrement_depth(depth: Option<u32>) -> Option<u32> {
+    depth.map(|d| d.saturating_sub(1))
+}
+
+fn list_books_in_shelf(
+    conn: &rusqlite::Connection,
+    shelf_id: i64,
+) -> Result<Vec<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT book_id, name, slug FROM bookstack_books
+             WHERE shelf_id = ?1 AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_books_in_shelf prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![shelf_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("list_books_in_shelf query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_books_in_shelf collect: {e}"))
+}
+
+fn list_books_unshelved(conn: &rusqlite::Connection) -> Result<Vec<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT book_id, name, slug FROM bookstack_books
+             WHERE shelf_id IS NULL AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_books_unshelved prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("list_books_unshelved query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_books_unshelved collect: {e}"))
+}
+
+fn shelf_name_slug(
+    conn: &rusqlite::Connection,
+    shelf_id: i64,
+) -> Result<Option<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name, slug FROM bookstack_shelves WHERE shelf_id = ?1 AND deleted = 0")
+        .map_err(|e| format!("shelf_name_slug prepare: {e}"))?;
+    let row = stmt.query_row(params![shelf_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    });
+    match row {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("shelf_name_slug: {e}")),
+    }
+}
+
+fn get_book_row(
+    conn: &rusqlite::Connection,
+    book_id: i64,
+) -> Result<Option<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT book_id, name, slug FROM bookstack_books WHERE book_id = ?1 AND deleted = 0",
+        )
+        .map_err(|e| format!("get_book_row prepare: {e}"))?;
+    let row = stmt.query_row(params![book_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    });
+    match row {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("get_book_row: {e}")),
+    }
+}
+
+fn get_chapter_row(
+    conn: &rusqlite::Connection,
+    chapter_id: i64,
+) -> Result<Option<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT chapter_id, name, slug FROM bookstack_chapters
+             WHERE chapter_id = ?1 AND deleted = 0",
+        )
+        .map_err(|e| format!("get_chapter_row prepare: {e}"))?;
+    let row = stmt.query_row(params![chapter_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    });
+    match row {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("get_chapter_row: {e}")),
+    }
+}
+
+fn book_node(
+    conn: &rusqlite::Connection,
+    book: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (book_id, name, slug) = book;
+    let children = if depth_allows_descent(depth) {
+        let child_depth = decrement_depth(depth);
+
+        // Chapters
+        let mut chap_stmt = conn
+            .prepare(
+                "SELECT chapter_id, name, slug FROM bookstack_chapters
+                 WHERE book_id = ?1 AND deleted = 0 ORDER BY name",
+            )
+            .map_err(|e| format!("book_node chapters prepare: {e}"))?;
+        let chap_rows: Vec<(i64, String, String)> = chap_stmt
+            .query_map(params![book_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("book_node chapters query: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("book_node chapters collect: {e}"))?;
+
+        let mut children: Vec<DirectoryNode> = Vec::with_capacity(chap_rows.len());
+        for c in chap_rows {
+            children.push(chapter_node(conn, c, child_depth)?);
+        }
+
+        // Book-root (chapter-less) pages
+        for p in list_pages_at_book_root(conn, book_id)? {
+            children.push(page_node(p));
+        }
+
+        children
+    } else {
+        Vec::new()
+    };
+
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Book,
+        id: book_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+fn chapter_node(
+    conn: &rusqlite::Connection,
+    chap: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (chapter_id, name, slug) = chap;
+    let children = if depth_allows_descent(depth) {
+        list_pages_in_chapter(conn, chapter_id)?
+            .into_iter()
+            .map(page_node)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Chapter,
+        id: chapter_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+fn page_node(p: (i64, String, String, String)) -> DirectoryNode {
+    let (id, name, slug, page_kind) = p;
+    DirectoryNode {
+        kind: DirectoryNodeKind::Page,
+        id,
+        name,
+        slug,
+        page_kind: Some(page_kind),
+        children: Vec::new(),
+    }
+}
+
+fn list_pages_at_book_root(
+    conn: &rusqlite::Connection,
+    book_id: i64,
+) -> Result<Vec<(i64, String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE book_id = ?1 AND chapter_id IS NULL AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_pages_at_book_root prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![book_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| format!("list_pages_at_book_root query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_pages_at_book_root collect: {e}"))
+}
+
+fn list_pages_in_chapter(
+    conn: &rusqlite::Connection,
+    chapter_id: i64,
+) -> Result<Vec<(i64, String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE chapter_id = ?1 AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_pages_in_chapter prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![chapter_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| format!("list_pages_in_chapter query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_pages_in_chapter collect: {e}"))
+}
+
+// Note: `list_books_in_shelf`/`list_books_unshelved`/`get_book_row` above
+// return condensed (id, name, slug) tuples — that's all the tree node needs.
+// The `IndexedBook` / `IndexedChapter` / `IndexedPage` types carry more data
+// (identity_ouid, kind, archive_year, ...) which isn't used by the directory
+// surface today; if a caller needs that downstream, the existing
+// `get_indexed_book` / `get_indexed_chapter` lookups remain available.
 
 fn index_job_from_row(r: &rusqlite::Row) -> rusqlite::Result<IndexJob> {
     Ok(IndexJob {
@@ -3372,5 +3827,265 @@ mod lifecycle_tests {
             .expect("job should still exist");
         assert_eq!(job.status, "cancelled");
         assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    // --- read_directory_tree (issue #69) ---
+
+    /// Build a small fixture: one shelf, two books on it (one with a chapter
+    /// and two pages, one book-root page), and one unshelved book. Returns
+    /// the populated db plus a handful of ids we lean on in assertions.
+    async fn populate_fixture(db: &SqliteDb) -> DirectoryFixtureIds {
+        // Shelf
+        let shelf = IndexedShelf {
+            shelf_id: 100,
+            name: "Personal".to_string(),
+            slug: "personal".to_string(),
+            shelf_kind: ShelfKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_shelf(db, &shelf).await.unwrap();
+
+        // Book A on shelf 100: has one chapter (with 2 pages) + 1 book-root page.
+        let book_a = IndexedBook {
+            book_id: 200,
+            name: "Household".to_string(),
+            slug: "household".to_string(),
+            shelf_id: Some(100),
+            identity_ouid: None,
+            book_kind: BookKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_book(db, &book_a).await.unwrap();
+
+        // Book B on shelf 100: empty (no chapters, no pages).
+        let book_b = IndexedBook {
+            book_id: 201,
+            name: "Finance".to_string(),
+            slug: "finance".to_string(),
+            shelf_id: Some(100),
+            identity_ouid: None,
+            book_kind: BookKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_book(db, &book_b).await.unwrap();
+
+        // Unshelved book C.
+        let book_c = IndexedBook {
+            book_id: 202,
+            name: "Drafts".to_string(),
+            slug: "drafts".to_string(),
+            shelf_id: None,
+            identity_ouid: None,
+            book_kind: BookKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_book(db, &book_c).await.unwrap();
+
+        // Chapter inside book A.
+        let chap = IndexedChapter {
+            chapter_id: 300,
+            book_id: 200,
+            name: "Routines".to_string(),
+            slug: "routines".to_string(),
+            identity_ouid: None,
+            chapter_kind: ChapterKind::Unclassified,
+            archive_year: None,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_chapter(db, &chap).await.unwrap();
+
+        // Pages: two in the chapter, one at book A root.
+        for (pid, name, chapter_id) in [
+            (400, "Morning", Some(300)),
+            (401, "Evening", Some(300)),
+            (402, "Pinned Note", None),
+        ] {
+            let page = IndexedPage {
+                page_id: pid,
+                book_id: 200,
+                chapter_id,
+                name: name.to_string(),
+                slug: name.to_lowercase().replace(' ', "-"),
+                url: None,
+                page_created_at: None,
+                page_updated_at: None,
+                identity_ouid: None,
+                page_kind: PageKind::Unclassified,
+                page_key: None,
+                archive_year: None,
+                indexed_at: 1,
+                deleted: false,
+            };
+            IndexDb::upsert_indexed_page(db, &page, None).await.unwrap();
+        }
+
+        DirectoryFixtureIds {
+            shelf_id: 100,
+            book_a: 200,
+            book_b: 201,
+            book_c: 202,
+            chapter_id: 300,
+            page_morning: 400,
+            page_evening: 401,
+            page_root: 402,
+        }
+    }
+
+    struct DirectoryFixtureIds {
+        shelf_id: i64,
+        book_a: i64,
+        book_b: i64,
+        book_c: i64,
+        chapter_id: i64,
+        page_morning: i64,
+        page_evening: i64,
+        page_root: i64,
+    }
+
+    #[tokio::test]
+    async fn directory_tree_all_scope_returns_full_shape() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::All, None)
+            .await
+            .unwrap();
+
+        // Two shelves at the top: the real one + synthetic "Unshelved".
+        assert_eq!(tree.len(), 2, "expected real shelf + Unshelved synthetic");
+        let real = tree.iter().find(|n| n.id == ids.shelf_id).unwrap();
+        assert_eq!(real.kind, DirectoryNodeKind::Shelf);
+        assert_eq!(real.children.len(), 2, "expected 2 books on shelf");
+
+        let book_a = real.children.iter().find(|b| b.id == ids.book_a).unwrap();
+        // Book A has 1 chapter + 1 book-root page → 2 immediate children.
+        assert_eq!(book_a.children.len(), 2);
+        let chap = book_a
+            .children
+            .iter()
+            .find(|c| c.kind == DirectoryNodeKind::Chapter)
+            .unwrap();
+        assert_eq!(chap.id, ids.chapter_id);
+        assert_eq!(chap.children.len(), 2, "expected 2 pages in chapter");
+        let root_page = book_a
+            .children
+            .iter()
+            .find(|c| c.kind == DirectoryNodeKind::Page)
+            .unwrap();
+        assert_eq!(root_page.id, ids.page_root);
+
+        // Book B is empty (no chapters or pages) — still present at this stage.
+        let book_b = real.children.iter().find(|b| b.id == ids.book_b).unwrap();
+        assert!(book_b.children.is_empty());
+
+        // Unshelved bucket carries Book C.
+        let unshelved = tree.iter().find(|n| n.id == 0).unwrap();
+        assert_eq!(unshelved.name, "Unshelved");
+        assert_eq!(unshelved.children.len(), 1);
+        assert_eq!(unshelved.children[0].id, ids.book_c);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_depth_zero_returns_roots_only() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::All, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 2);
+        for node in &tree {
+            assert!(
+                node.children.is_empty(),
+                "depth=0 must not expand children, got {node:?}"
+            );
+        }
+        // Roots still address the right entities.
+        assert!(tree.iter().any(|n| n.id == ids.shelf_id));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_depth_one_stops_at_books() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::All, Some(1))
+            .await
+            .unwrap();
+        let real = tree.iter().find(|n| n.id == ids.shelf_id).unwrap();
+        assert_eq!(real.children.len(), 2);
+        for book in &real.children {
+            assert_eq!(book.kind, DirectoryNodeKind::Book);
+            assert!(
+                book.children.is_empty(),
+                "depth=1 must stop at books, got {book:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_tree_scope_book_returns_just_that_book() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::Book(ids.book_a), None)
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 1);
+        let book = &tree[0];
+        assert_eq!(book.kind, DirectoryNodeKind::Book);
+        assert_eq!(book.id, ids.book_a);
+        // Chapter + root page.
+        assert_eq!(book.children.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_scope_chapter_returns_just_pages() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::Chapter(ids.chapter_id), None)
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 1);
+        let chap = &tree[0];
+        assert_eq!(chap.kind, DirectoryNodeKind::Chapter);
+        assert_eq!(chap.children.len(), 2);
+        let page_ids: Vec<i64> = chap.children.iter().map(|p| p.id).collect();
+        assert!(page_ids.contains(&ids.page_morning));
+        assert!(page_ids.contains(&ids.page_evening));
+        // The book-root page must NOT appear here.
+        assert!(!page_ids.contains(&ids.page_root));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_skips_soft_deleted_rows() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+        IndexDb::soft_delete_indexed_page(&db, ids.page_evening)
+            .await
+            .unwrap();
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::Chapter(ids.chapter_id), None)
+            .await
+            .unwrap();
+        let chap = &tree[0];
+        assert_eq!(chap.children.len(), 1);
+        assert_eq!(chap.children[0].id, ids.page_morning);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_unknown_scope_errors_clearly() {
+        let db = temp_db();
+        // No fixture — pure error path.
+        let err = IndexDb::read_directory_tree(&db, DirectoryScope::Book(9999), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("book 9999"));
     }
 }

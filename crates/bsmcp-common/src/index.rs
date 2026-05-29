@@ -233,6 +233,60 @@ pub struct PageCache {
     pub page_updated_at: Option<String>,
 }
 
+// --- Directory tree (issue #69) ---
+//
+// The `directory` MCP tool returns a scoped, depth-limited tree assembled
+// from the bookstack_* index tables. Replaces the assemble-it-yourself
+// pattern of calling list_shelves + list_books + list_chapters + list_pages
+// and stitching on the client. See `IndexDb::read_directory_tree`.
+
+/// Where to root the directory walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryScope {
+    /// Full tree: every shelf, plus shelf-less books grouped under a
+    /// synthetic "Unshelved" root.
+    All,
+    Shelf(i64),
+    Book(i64),
+    Chapter(i64),
+}
+
+/// What level a `DirectoryNode` sits at. The same struct is reused at every
+/// level — `node_type` says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryNodeKind {
+    Shelf,
+    Book,
+    Chapter,
+    Page,
+}
+
+impl DirectoryNodeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shelf => "shelf",
+            Self::Book => "book",
+            Self::Chapter => "chapter",
+            Self::Page => "page",
+        }
+    }
+}
+
+/// One node in the directory tree returned by `read_directory_tree`.
+/// `id` is the BookStack id of the underlying entity. `children` is empty
+/// for pages and for any node trimmed by `depth`. Page nodes carry
+/// `page_kind` since the structural index already classifies them.
+#[derive(Clone, Debug)]
+pub struct DirectoryNode {
+    pub kind: DirectoryNodeKind,
+    pub id: i64,
+    pub name: String,
+    pub slug: String,
+    /// Only set on `Page` nodes (mirrors `IndexedPage.page_kind.as_str()`).
+    pub page_kind: Option<String>,
+    pub children: Vec<DirectoryNode>,
+}
+
 #[derive(Clone, Debug)]
 pub struct IndexJob {
     pub id: i64,

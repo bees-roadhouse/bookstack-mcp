@@ -2354,6 +2354,351 @@ impl IndexDb for PostgresDb {
         .map_err(|e| format!("set_index_meta: {e}"))?;
         Ok(())
     }
+
+    // --- Directory tree (issue #69) ---
+
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let rows = sqlx::query(
+            "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+             FROM bookstack_shelves WHERE deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_shelves: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let kind_str: String = r.get("shelf_kind");
+                IndexedShelf {
+                    shelf_id: r.get("shelf_id"),
+                    name: r.get("name"),
+                    slug: r.get("slug"),
+                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                    indexed_at: r.get("indexed_at"),
+                    deleted: r.get("deleted"),
+                }
+            })
+            .collect())
+    }
+
+    async fn list_indexed_books_unshelved(&self) -> Result<Vec<IndexedBook>, String> {
+        let rows = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE shelf_id IS NULL AND deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_books_unshelved: {e}"))?;
+        Ok(rows.into_iter().map(book_from_row).collect())
+    }
+
+    async fn read_directory_tree(
+        &self,
+        scope: DirectoryScope,
+        depth: Option<u32>,
+    ) -> Result<Vec<DirectoryNode>, String> {
+        match scope {
+            DirectoryScope::All => {
+                let shelves: Vec<(i64, String, String)> = sqlx::query(
+                    "SELECT shelf_id, name, slug FROM bookstack_shelves
+                     WHERE deleted = FALSE ORDER BY name",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree shelves: {e}"))?
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<i64, _>("shelf_id"),
+                        r.get::<String, _>("name"),
+                        r.get::<String, _>("slug"),
+                    )
+                })
+                .collect();
+
+                let mut out: Vec<DirectoryNode> = Vec::with_capacity(shelves.len() + 1);
+                for (shelf_id, name, slug) in shelves {
+                    let children = if depth_allows_descent(depth) {
+                        build_shelf_children(&self.pool, shelf_id, decrement_depth(depth)).await?
+                    } else {
+                        Vec::new()
+                    };
+                    out.push(DirectoryNode {
+                        kind: DirectoryNodeKind::Shelf,
+                        id: shelf_id,
+                        name,
+                        slug,
+                        page_kind: None,
+                        children,
+                    });
+                }
+
+                let unshelved: Vec<(i64, String, String)> = sqlx::query(
+                    "SELECT book_id, name, slug FROM bookstack_books
+                     WHERE shelf_id IS NULL AND deleted = FALSE ORDER BY name",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree unshelved books: {e}"))?
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<i64, _>("book_id"),
+                        r.get::<String, _>("name"),
+                        r.get::<String, _>("slug"),
+                    )
+                })
+                .collect();
+
+                if !unshelved.is_empty() {
+                    let mut children: Vec<DirectoryNode> = Vec::with_capacity(unshelved.len());
+                    if depth_allows_descent(depth) {
+                        let child_depth = decrement_depth(depth);
+                        for b in unshelved {
+                            children.push(build_book_node(&self.pool, b, child_depth).await?);
+                        }
+                    }
+                    out.push(DirectoryNode {
+                        kind: DirectoryNodeKind::Shelf,
+                        id: 0,
+                        name: SHELF_NAME_UNSHELVED.to_string(),
+                        slug: "unshelved".to_string(),
+                        page_kind: None,
+                        children,
+                    });
+                }
+                Ok(out)
+            }
+            DirectoryScope::Shelf(shelf_id) => {
+                let shelf = sqlx::query(
+                    "SELECT name, slug FROM bookstack_shelves
+                     WHERE shelf_id = $1 AND deleted = FALSE",
+                )
+                .bind(shelf_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree shelf: {e}"))?;
+                let (name, slug) = match shelf {
+                    Some(r) => (r.get::<String, _>("name"), r.get::<String, _>("slug")),
+                    None => return Err(format!("shelf {shelf_id} not found")),
+                };
+                let children = if depth_allows_descent(depth) {
+                    build_shelf_children(&self.pool, shelf_id, decrement_depth(depth)).await?
+                } else {
+                    Vec::new()
+                };
+                Ok(vec![DirectoryNode {
+                    kind: DirectoryNodeKind::Shelf,
+                    id: shelf_id,
+                    name,
+                    slug,
+                    page_kind: None,
+                    children,
+                }])
+            }
+            DirectoryScope::Book(book_id) => {
+                let row = sqlx::query(
+                    "SELECT book_id, name, slug FROM bookstack_books
+                     WHERE book_id = $1 AND deleted = FALSE",
+                )
+                .bind(book_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree book: {e}"))?
+                .ok_or_else(|| format!("book {book_id} not found"))?;
+                let b = (
+                    row.get::<i64, _>("book_id"),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("slug"),
+                );
+                Ok(vec![build_book_node(&self.pool, b, depth).await?])
+            }
+            DirectoryScope::Chapter(chapter_id) => {
+                let row = sqlx::query(
+                    "SELECT chapter_id, name, slug FROM bookstack_chapters
+                     WHERE chapter_id = $1 AND deleted = FALSE",
+                )
+                .bind(chapter_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree chapter: {e}"))?
+                .ok_or_else(|| format!("chapter {chapter_id} not found"))?;
+                let c = (
+                    row.get::<i64, _>("chapter_id"),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("slug"),
+                );
+                Ok(vec![build_chapter_node(&self.pool, c, depth).await?])
+            }
+        }
+    }
+}
+
+// --- Directory tree helpers (issue #69) ---
+
+const SHELF_NAME_UNSHELVED: &str = "Unshelved";
+
+fn depth_allows_descent(depth: Option<u32>) -> bool {
+    match depth {
+        None => true,
+        Some(0) => false,
+        Some(_) => true,
+    }
+}
+
+fn decrement_depth(depth: Option<u32>) -> Option<u32> {
+    depth.map(|d| d.saturating_sub(1))
+}
+
+async fn build_shelf_children(
+    pool: &PgPool,
+    shelf_id: i64,
+    child_depth: Option<u32>,
+) -> Result<Vec<DirectoryNode>, String> {
+    let books: Vec<(i64, String, String)> = sqlx::query(
+        "SELECT book_id, name, slug FROM bookstack_books
+         WHERE shelf_id = $1 AND deleted = FALSE ORDER BY name",
+    )
+    .bind(shelf_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("build_shelf_children: {e}"))?
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<i64, _>("book_id"),
+            r.get::<String, _>("name"),
+            r.get::<String, _>("slug"),
+        )
+    })
+    .collect();
+    let mut out: Vec<DirectoryNode> = Vec::with_capacity(books.len());
+    for b in books {
+        out.push(build_book_node(pool, b, child_depth).await?);
+    }
+    Ok(out)
+}
+
+async fn build_book_node(
+    pool: &PgPool,
+    book: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (book_id, name, slug) = book;
+    let children = if depth_allows_descent(depth) {
+        let child_depth = decrement_depth(depth);
+
+        let chap_rows: Vec<(i64, String, String)> = sqlx::query(
+            "SELECT chapter_id, name, slug FROM bookstack_chapters
+             WHERE book_id = $1 AND deleted = FALSE ORDER BY name",
+        )
+        .bind(book_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("build_book_node chapters: {e}"))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("chapter_id"),
+                r.get::<String, _>("name"),
+                r.get::<String, _>("slug"),
+            )
+        })
+        .collect();
+
+        let mut children: Vec<DirectoryNode> = Vec::with_capacity(chap_rows.len());
+        for c in chap_rows {
+            children.push(build_chapter_node(pool, c, child_depth).await?);
+        }
+
+        // Book-root (chapter-less) pages.
+        let root_pages: Vec<(i64, String, String, String)> = sqlx::query(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE book_id = $1 AND chapter_id IS NULL AND deleted = FALSE ORDER BY name",
+        )
+        .bind(book_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("build_book_node root pages: {e}"))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("page_id"),
+                r.get::<String, _>("name"),
+                r.get::<String, _>("slug"),
+                r.get::<String, _>("page_kind"),
+            )
+        })
+        .collect();
+        for p in root_pages {
+            children.push(page_node(p));
+        }
+
+        children
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Book,
+        id: book_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+async fn build_chapter_node(
+    pool: &PgPool,
+    chap: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (chapter_id, name, slug) = chap;
+    let children = if depth_allows_descent(depth) {
+        let pages: Vec<(i64, String, String, String)> = sqlx::query(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE chapter_id = $1 AND deleted = FALSE ORDER BY name",
+        )
+        .bind(chapter_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("build_chapter_node pages: {e}"))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("page_id"),
+                r.get::<String, _>("name"),
+                r.get::<String, _>("slug"),
+                r.get::<String, _>("page_kind"),
+            )
+        })
+        .collect();
+        pages.into_iter().map(page_node).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Chapter,
+        id: chapter_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+fn page_node(p: (i64, String, String, String)) -> DirectoryNode {
+    let (id, name, slug, page_kind) = p;
+    DirectoryNode {
+        kind: DirectoryNodeKind::Page,
+        id,
+        name,
+        slug,
+        page_kind: Some(page_kind),
+        children: Vec::new(),
+    }
 }
 
 // --- Row → struct helpers (shared across IndexDb methods) ---
