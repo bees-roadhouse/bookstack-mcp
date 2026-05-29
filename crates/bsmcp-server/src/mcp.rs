@@ -18,7 +18,7 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 pub async fn handle_request(
     request: &Value,
     client: &BookStackClient,
-    semantic: Option<&SemanticState>,
+    semantic: Option<&Arc<SemanticState>>,
     index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
     tz: &TimezoneConfig,
@@ -110,7 +110,7 @@ async fn execute_tool(
     name: &str,
     args: &Value,
     client: &BookStackClient,
-    semantic: Option<&SemanticState>,
+    semantic: Option<&Arc<SemanticState>>,
     index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
 ) -> Result<String, String> {

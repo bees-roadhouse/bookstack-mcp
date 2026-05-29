@@ -547,6 +547,38 @@ impl BookStackClient {
         }
     }
 
+    /// Resolve the calling user's role IDs (issue #58 lever a.5).
+    ///
+    /// BookStack has no `/api/users/me` endpoint, so we reuse the same
+    /// search-by-`{created_by:me}` probe `whoami` uses to discover the
+    /// caller's user id, then fetch `/api/users/{id}` and extract the
+    /// `roles` array. Reading your own user row works for any
+    /// authenticated user; the public API contract documents `roles` as
+    /// part of the user-read response.
+    ///
+    /// Returns `Ok(None)` when the user has no created content yet
+    /// (brand-new accounts) — the caller should treat that as
+    /// "prefilter disabled, fall back to HTTP fan-out". Returns `Err`
+    /// only when BookStack is unreachable or rejects the call.
+    pub async fn list_my_roles(&self) -> Result<Option<Vec<i64>>, String> {
+        let ident = match self.whoami().await? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let user = self.get_user(ident.bookstack_user_id).await?;
+        let roles = match user.get("roles").and_then(|v| v.as_array()) {
+            Some(r) => r,
+            None => return Ok(Some(Vec::new())),
+        };
+        let mut ids: Vec<i64> = Vec::with_capacity(roles.len());
+        for role in roles {
+            if let Some(id) = role.get("id").and_then(|v| v.as_i64()) {
+                ids.push(id);
+            }
+        }
+        Ok(Some(ids))
+    }
+
     // --- Shelves ---
 
     pub async fn list_shelves(&self, count: i64, offset: i64) -> Result<Value, String> {
