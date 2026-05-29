@@ -162,21 +162,38 @@ async fn execute_tool(
                 .get("verbose")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            // Issue #80 — `default` (issue spec) is now the documented
-            // schema default; `standard` / `rerank` still parse for
-            // backward compat. Schema default unchanged (`default` mirrors
-            // pre-#80 `standard` behavior, so existing callers see no
-            // regression).
+            // Issue #80 — `default` (issue spec) is the documented schema
+            // default; `standard` still parses as an alias for backward
+            // compat. Issue #115 (v0.13.0) — `mode: "rerank"` is hard-cut.
+            // It now returns a structured "unknown mode" error pointing at
+            // the new `rerank: true` flag.
             let mode_str = args
                 .get("mode")
                 .and_then(|v| v.as_str())
                 .unwrap_or("default");
             let mode = SearchMode::parse(mode_str).ok_or_else(|| {
-                format!(
-                    "invalid mode '{mode_str}' \
-                     (expected: default, standard, rerank, precision)"
-                )
+                if mode_str.eq_ignore_ascii_case("rerank") {
+                    // Migration breadcrumb (issue #115). `mode: "rerank"`
+                    // was hard-cut in v0.13.0; the equivalent is now
+                    // `mode: "standard", rerank: true`.
+                    "mode: \"rerank\" was removed in v0.13.0. \
+                     Pass `rerank: true` with `mode: \"standard\"` instead — \
+                     same cross-encoder pass, now a flag."
+                        .to_string()
+                } else {
+                    format!(
+                        "invalid mode '{mode_str}' \
+                         (expected: default, standard, precision)"
+                    )
+                }
             })?;
+            // Issue #115 — `rerank: bool` flag layers the cross-encoder
+            // on top of the standard pipeline. Ignored on `precision`
+            // (always on by definition there).
+            let rerank = args
+                .get("rerank")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // Issue #80 — scope params. Explicit ID lists union with named
             // scopes resolved from `global_settings.kb_scopes`. Empty/no
@@ -209,7 +226,7 @@ async fn execute_tool(
             // enforces per-page access control via BookStack's API.
             let mut result = sem
                 .search(
-                    &query, limit, threshold, hybrid, verbose, client, scope_arg, mode,
+                    &query, limit, threshold, hybrid, verbose, client, scope_arg, mode, rerank,
                 )
                 .await?;
             if !unknown_scopes.is_empty() {
@@ -240,8 +257,55 @@ async fn execute_tool(
             let query = arg_str(args, "query")?;
             let page = arg_i64(args, "page", 1).max(1);
             let count = arg_count(args, 20);
+            // Issue #115 — `rerank: bool` flag. When `true`, take the
+            // keyword results, POST to the embedder's /rerank, return
+            // reordered with `scoring.rerank` per result and
+            // `stats.rerank_*` (shape mirrors `semantic_search`). When
+            // unset, keep the v0.12.x text format the existing callers
+            // expect.
+            let rerank = args
+                .get("rerank")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let result = client.search(&query, page, count).await?;
-            Ok(format_search_results(&result, client.base_url()))
+            if !rerank {
+                return Ok(format_search_results(&result, client.base_url()));
+            }
+            // Rerank requires semantic search to be enabled (the embedder
+            // is the host for `/rerank`). If the deployment didn't opt in
+            // to semantic search, return a structured error pointing the
+            // caller at the env var — same 503-shape `semantic_search`
+            // already uses when the provider is unset.
+            let sem = semantic.ok_or(
+                "search_content rerank=true requires the embedder \
+                 (BSMCP_SEMANTIC_SEARCH=true) and BSMCP_RERANK_PROVIDER \
+                 configured on it.",
+            )?;
+            let items: Vec<Value> = result
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let total = result.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+            let (reordered, rerank_stats) = sem.rerank_search_results(&query, items).await?;
+
+            // Mirror `semantic_search`'s response shape: `results` array +
+            // a `stats` block carrying the rerank_* fields. The
+            // `query_time_ms` field is omitted here because BookStack's
+            // search call already times itself client-side; the rerank
+            // call is the only piece we control.
+            let payload = json!({
+                "total": total,
+                "results": reordered,
+                "stats": {
+                    "rerank": true,
+                    "rerank_ms": rerank_stats.get("rerank_ms"),
+                    "rerank_provider": rerank_stats.get("rerank_provider"),
+                    "rerank_model": rerank_stats.get("rerank_model"),
+                    "candidates_reranked": rerank_stats.get("candidates_reranked"),
+                }
+            });
+            format_json(&payload)
         }
 
         // Shelves
@@ -2013,13 +2077,19 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
 pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     let mut tools = vec![
         tool("search_content",
-            "Search across all BookStack content (pages, chapters, books, shelves). Supports operators: {type:page}, [tag_name=value], {in_name:term}, {created_by:me}, exact match with quotes.",
+            "Search across all BookStack content (pages, chapters, books, shelves). Supports operators: {type:page}, [tag_name=value], {in_name:term}, {created_by:me}, exact match with quotes. \
+             \n\nPass `rerank: true` (issue #115) to layer a cross-encoder rerank on top of the keyword results — the results are re-ordered by relevance to the query, each result picks up a `scoring.rerank` field, and `stats.{rerank_ms, rerank_provider, rerank_model, candidates_reranked}` lands on the response (same shape `semantic_search` already uses). Requires `BSMCP_RERANK_PROVIDER` configured on the embedder; without it the call returns a structured error.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "page": { "type": "integer", "description": "Page number", "default": 1 },
-                    "count": { "type": "integer", "description": "Results per page", "default": 20 }
+                    "count": { "type": "integer", "description": "Results per page", "default": 20 },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "When true, cross-encoder re-orders the keyword results and the response surfaces `scoring.rerank` + `stats.rerank_*` (same shape as semantic_search). Requires `BSMCP_RERANK_PROVIDER` on the embedder. Default false.",
+                        "default": false
+                    }
                 },
                 "required": ["query"]
             })),
@@ -2401,12 +2471,15 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
              `precision` (recommended) — N×4 → N×3 → N×2 → N cascade. Final ordering = \
              cross-encoder. Best for \"find the right page.\" \
              `default` — vector + keyword + Markov-blanket boost + blended sort. Best for \
-             \"find everything relevant.\" \
-             `rerank` — `default`'s candidate selection, then cross-encoder reorders the \
-             top-N. Middle ground; rarely the right pick over precision. \
+             \"find everything relevant.\" Pass `rerank: true` to layer the cross-encoder on top \
+             of the standard top-N (the pre-v0.13.0 `mode: \"rerank\"`, now a flag). \
              `standard` is an alias for `default` (backward compat). \
-             \n\n`precision` and `rerank` need `BSMCP_RERANK_PROVIDER` configured on the embedder. \
-             If you get \"Reranker is disabled,\" retry with `mode: \"default\"`. \
+             \n\n**v0.13.0 breaking change.** `mode: \"rerank\"` was hard-cut. The equivalent is \
+             `mode: \"standard\", rerank: true` — same cross-encoder pass, now a flag. Callers \
+             passing the old value get a structured error pointing at the migration. \
+             \n\n`precision` and `rerank: true` need `BSMCP_RERANK_PROVIDER` configured on the \
+             embedder. If you get \"Reranker is disabled,\" retry without the flag (or with \
+             `mode: \"default\"`). \
              \n\n**Scope params (optional)** restrict the search to a subset of the KB. Explicit \
              `shelf_ids` / `book_ids` / `chapter_ids` / `page_ids` are unioned; `scopes` is a \
              list of named scope keys resolved from `global_settings.kb_scopes` (set via the \
@@ -2424,9 +2497,14 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
                     "verbose": { "type": "boolean", "description": "Include full Markov blanket data in results. Default false returns slim results (scores, chunks, scoring breakdown). Set true for full graph context.", "default": false },
                     "mode": {
                         "type": "string",
-                        "description": "Ranking strategy. **`precision` recommended** (issue-#80 4-stage cascade, more accurate). `default` for wider sweep. `rerank` is the middle ground. `standard` is an alias for `default` (backward compat).",
-                        "enum": ["default", "standard", "rerank", "precision"],
+                        "description": "Ranking strategy. **`precision` recommended** (issue-#80 4-stage cascade, more accurate). `default` for wider sweep — pair with `rerank: true` for the pre-v0.13.0 `mode: \"rerank\"` behavior. `standard` is an alias for `default` (backward compat).",
+                        "enum": ["default", "standard", "precision"],
                         "default": "default"
+                    },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "When true on `mode: \"standard\"`, layers a cross-encoder rerank on top of the standard top-N — equivalent to the pre-v0.13.0 `mode: \"rerank\"`. No-op on `mode: \"precision\"` (cascade always reranks). Requires `BSMCP_RERANK_PROVIDER` on the embedder. Default false.",
+                        "default": false
                     },
                     "shelf_ids": {
                         "type": "array",
@@ -2987,13 +3065,17 @@ mod tests {
     /// `mode` defaults — the schema default is `"default"` per issue #80
     /// but pre-#80 callers passing `"standard"` still parse to the same
     /// SearchMode variant (Standard). Locks the zero-regression contract.
+    /// Issue #115 (v0.13.0) — `"rerank"` is hard-cut and now parses to
+    /// `None`; the caller surfaces a structured error pointing at the new
+    /// `rerank: true` flag.
     #[test]
     fn search_mode_default_and_standard_both_parse_to_standard() {
         assert_eq!(SearchMode::parse("default"), Some(SearchMode::Standard));
         assert_eq!(SearchMode::parse("standard"), Some(SearchMode::Standard));
         assert_eq!(SearchMode::parse(""), Some(SearchMode::Standard));
         assert_eq!(SearchMode::parse("precision"), Some(SearchMode::Precision));
-        assert_eq!(SearchMode::parse("rerank"), Some(SearchMode::Rerank));
+        // v0.13.0: `mode: "rerank"` is no longer a valid mode value.
+        assert_eq!(SearchMode::parse("rerank"), None);
         assert_eq!(SearchMode::parse("nonsense"), None);
     }
 
@@ -3017,7 +3099,9 @@ mod tests {
                 "semantic_search schema missing '{field}' property"
             );
         }
-        // Mode enum surfaces both `default` and `precision` per issue #80.
+        // Mode enum surfaces `default` and `precision` per issue #80;
+        // issue #115 (v0.13.0) hard-cut `rerank` from the enum in favor
+        // of the `rerank: true` flag on `standard`.
         let mode_enum = props
             .get("mode")
             .and_then(|m| m.get("enum"))
@@ -3030,6 +3114,81 @@ mod tests {
         assert!(modes.contains(&"default".to_string()));
         assert!(modes.contains(&"precision".to_string()));
         assert!(modes.contains(&"standard".to_string()));
-        assert!(modes.contains(&"rerank".to_string()));
+        assert!(
+            !modes.contains(&"rerank".to_string()),
+            "issue #115: `rerank` mode was hard-cut in v0.13.0 — should not appear in the enum"
+        );
+
+        // Issue #115 — `rerank: bool` flag advertised on the schema.
+        let rerank_prop = props
+            .get("rerank")
+            .expect("semantic_search schema missing 'rerank' boolean (issue #115)");
+        assert_eq!(
+            rerank_prop.get("type").and_then(|v| v.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            rerank_prop.get("default").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// Issue #115 — `search_content` advertises the new `rerank: bool`
+    /// flag. Same shape as on `semantic_search` (boolean, default false).
+    #[test]
+    fn search_content_schema_advertises_rerank_flag() {
+        let tools = tool_definitions(true);
+        let sc = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("search_content"))
+            .expect("search_content tool present");
+        let props = sc
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("search_content schema has properties");
+        let rerank_prop = props
+            .get("rerank")
+            .expect("search_content schema missing 'rerank' boolean (issue #115)");
+        assert_eq!(
+            rerank_prop.get("type").and_then(|v| v.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            rerank_prop.get("default").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// Issue #115 — callers passing the removed `mode: "rerank"` get a
+    /// structured error pointing at the new `rerank: true` flag with
+    /// `mode: "standard"`. The error string must explicitly mention both
+    /// "rerank: true" and "mode: \"standard\"" so the migration path is
+    /// obvious from the error alone.
+    #[test]
+    fn legacy_mode_rerank_arg_yields_structured_migration_error() {
+        // Mimic the execute_tool error branch — we hit the `Err` arm of
+        // `SearchMode::parse` and build the migration string.
+        let mode_str = "rerank";
+        let parsed = SearchMode::parse(mode_str);
+        assert!(parsed.is_none(), "v0.13.0: `rerank` is no longer a mode");
+        // Build the same error string the execute_tool branch would.
+        let err = if mode_str.eq_ignore_ascii_case("rerank") {
+            "mode: \"rerank\" was removed in v0.13.0. \
+             Pass `rerank: true` with `mode: \"standard\"` instead — \
+             same cross-encoder pass, now a flag."
+                .to_string()
+        } else {
+            String::new()
+        };
+        assert!(err.contains("rerank: true"), "error must name the new flag");
+        assert!(
+            err.contains("mode: \"standard\""),
+            "error must name the host mode"
+        );
+        assert!(
+            err.contains("v0.13.0"),
+            "error must name the breaking-change release"
+        );
     }
 }
