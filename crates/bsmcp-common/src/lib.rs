@@ -6,5 +6,6 @@ pub mod db;
 pub mod index;
 pub mod rate_limit;
 pub mod settings;
+pub mod time;
 pub mod types;
 pub mod vector;
