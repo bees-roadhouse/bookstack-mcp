@@ -141,3 +141,29 @@ pub struct PageAcl {
     /// Unix epoch seconds the ACL was computed.
     pub computed_at: i64,
 }
+
+/// Verdict of the DB-side ACL prefilter (issue #58 lever a.5). Computed
+/// per candidate page against the calling user's role IDs by joining the
+/// `pages` table with `page_view_acl`. The prefilter sits before the HTTP
+/// fan-out in the semantic-search read path so non-default-open pages a
+/// user can't view get dropped without any BookStack round-trip.
+///
+/// Routing:
+/// - [`Allow`](Self::Allow): admit to results without HTTP. ACL was
+///   computed AND the user has a role match in `page_view_acl`.
+/// - [`Deny`](Self::Deny): drop without HTTP. ACL was computed AND no
+///   role match. The big win.
+/// - [`DefaultOpen`](Self::DefaultOpen): the all-inheriting case. Still
+///   send to HTTP because BookStack evaluates role-level system perms
+///   dynamically at the page-read endpoint (see `bsmcp_common::acl`
+///   docs lines 16-19).
+/// - [`Uncomputed`](Self::Uncomputed): ACL was never computed for this
+///   page (new page, embedder backlog). Falls through to HTTP AND
+///   triggers a background recompute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AclPrefilter {
+    Allow,
+    Deny,
+    DefaultOpen,
+    Uncomputed,
+}

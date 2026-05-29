@@ -1705,6 +1705,57 @@ impl SemanticDb for PostgresDb {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
+    async fn prefilter_pages_by_roles(
+        &self,
+        page_ids: &[i64],
+        role_ids: &[i64],
+    ) -> Result<Vec<(i64, AclPrefilter)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Single roundtrip via ANY(array). Postgres planner handles a
+        // 50-row IN list as efficiently as the SQL-IN form.
+        let rows: Vec<(i64, Option<i64>, Option<bool>, bool)> = if role_ids.is_empty() {
+            sqlx::query_as(
+                "SELECT page_id, acl_computed_at, acl_default_open, FALSE AS has_role_match \
+                 FROM pages WHERE page_id = ANY($1)",
+            )
+            .bind(page_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("prefilter_pages_by_roles: {e}"))?
+        } else {
+            sqlx::query_as(
+                "SELECT p.page_id, p.acl_computed_at, p.acl_default_open, \
+                        EXISTS ( \
+                            SELECT 1 FROM page_view_acl pva \
+                            WHERE pva.page_id = p.page_id \
+                              AND pva.role_id = ANY($2) \
+                        ) AS has_role_match \
+                 FROM pages p WHERE p.page_id = ANY($1)",
+            )
+            .bind(page_ids)
+            .bind(role_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("prefilter_pages_by_roles: {e}"))?
+        };
+        let mut out: Vec<(i64, AclPrefilter)> = Vec::with_capacity(rows.len());
+        for (pid, computed_at, default_open, has_match) in rows {
+            let verdict = if computed_at.is_none() {
+                AclPrefilter::Uncomputed
+            } else if default_open.unwrap_or(false) {
+                AclPrefilter::DefaultOpen
+            } else if has_match {
+                AclPrefilter::Allow
+            } else {
+                AclPrefilter::Deny
+            };
+            out.push((pid, verdict));
+        }
+        Ok(out)
+    }
+
     async fn get_permission_cache_batch(
         &self,
         token_hash: &str,

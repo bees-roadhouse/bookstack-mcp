@@ -1919,6 +1919,99 @@ impl SemanticDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn prefilter_pages_by_roles(
+        &self,
+        page_ids: &[i64],
+        role_ids: &[i64],
+    ) -> Result<Vec<(i64, AclPrefilter)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let page_ids = page_ids.to_vec();
+        let role_ids = role_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            const CHUNK: usize = 400;
+            let mut out: Vec<(i64, AclPrefilter)> = Vec::new();
+            for window in page_ids.chunks(CHUNK) {
+                // Build placeholder lists for both page_ids and role_ids.
+                // Page-id placeholders start at ?1 .. ?N. Role-id placeholders
+                // continue at ?N+1 .. ?N+M. Empty role list → the EXISTS clause
+                // evaluates false, which is the correct "no role match" state.
+                let page_ph: String = (1..=window.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut all_params: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(window.len() + role_ids.len());
+                for pid in window {
+                    all_params.push(pid);
+                }
+                let sql = if role_ids.is_empty() {
+                    format!(
+                        "SELECT page_id, acl_computed_at, acl_default_open, 0 AS has_role_match \
+                         FROM pages WHERE page_id IN ({page_ph})"
+                    )
+                } else {
+                    let role_ph: String = ((window.len() + 1)..=(window.len() + role_ids.len()))
+                        .map(|i| format!("?{i}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    for rid in &role_ids {
+                        all_params.push(rid);
+                    }
+                    format!(
+                        "SELECT p.page_id, p.acl_computed_at, p.acl_default_open, \
+                                EXISTS ( \
+                                    SELECT 1 FROM page_view_acl pva \
+                                    WHERE pva.page_id = p.page_id \
+                                      AND pva.role_id IN ({role_ph}) \
+                                ) AS has_role_match \
+                         FROM pages p WHERE p.page_id IN ({page_ph})"
+                    )
+                };
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("prefilter prepare: {e}"))?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(all_params.iter().copied()),
+                        |row| {
+                            let page_id: i64 = row.get(0)?;
+                            let acl_computed_at: Option<i64> = row.get(1)?;
+                            let acl_default_open: Option<i64> = row.get(2)?;
+                            let has_role_match: i64 = row.get(3)?;
+                            Ok((
+                                page_id,
+                                acl_computed_at,
+                                acl_default_open.unwrap_or(0) != 0,
+                                has_role_match != 0,
+                            ))
+                        },
+                    )
+                    .map_err(|e| format!("prefilter query: {e}"))?;
+                for r in rows {
+                    let (pid, computed_at, default_open, has_match) =
+                        r.map_err(|e| format!("prefilter row: {e}"))?;
+                    let verdict = if computed_at.is_none() {
+                        AclPrefilter::Uncomputed
+                    } else if default_open {
+                        AclPrefilter::DefaultOpen
+                    } else if has_match {
+                        AclPrefilter::Allow
+                    } else {
+                        AclPrefilter::Deny
+                    };
+                    out.push((pid, verdict));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
     async fn get_permission_cache_batch(
         &self,
         token_hash: &str,

@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::settings::{hash_token_id, CascadeMultipliers, GlobalSettings};
-use bsmcp_common::types::{MarkovBlanket, ScopeFilter};
+use bsmcp_common::types::{AclPrefilter, MarkovBlanket, ScopeFilter};
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
@@ -169,7 +169,20 @@ pub struct SemanticState {
     /// raw `token_id` is held only by the live `BookStackClient`; it never
     /// lands in our cache map.
     permission_cache: RwLock<HashMap<(String, i64), CachedAccess>>,
+    /// Per-token cached role-id list (issue #58 lever a.5). The DB prefilter
+    /// needs the calling user's role IDs; resolving them is two HTTP calls
+    /// to BookStack. 5 minute TTL because roles change rarely.
+    role_id_cache: RwLock<HashMap<String, CachedRoleIds>>,
 }
+
+/// Per-token cached role-id list with a TTL. Held inside
+/// [`SemanticState::role_id_cache`].
+struct CachedRoleIds {
+    role_ids: Vec<i64>,
+    cached_at: Instant,
+}
+
+const ROLE_ID_CACHE_TTL: Duration = Duration::from_secs(300);
 
 impl SemanticState {
     pub fn new(
@@ -192,6 +205,48 @@ impl SemanticState {
             webhook_secret,
             http_client,
             permission_cache: RwLock::new(HashMap::new()),
+            role_id_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve the calling user's role IDs, caching per `token_hash` with
+    /// [`ROLE_ID_CACHE_TTL`]. Returns `None` when `list_my_roles` declines
+    /// to identify the user (brand-new account with no content), in which
+    /// case the prefilter is bypassed — every page falls through to HTTP.
+    async fn resolve_caller_role_ids(
+        &self,
+        client: &BookStackClient,
+        token_hash: &str,
+    ) -> Option<Vec<i64>> {
+        {
+            let read = self.role_id_cache.read().await;
+            if let Some(entry) = read.get(token_hash) {
+                if entry.cached_at.elapsed() < ROLE_ID_CACHE_TTL {
+                    return Some(entry.role_ids.clone());
+                }
+            }
+        }
+        match client.list_my_roles().await {
+            Ok(Some(role_ids)) => {
+                let mut write = self.role_id_cache.write().await;
+                write.insert(
+                    token_hash.to_string(),
+                    CachedRoleIds {
+                        role_ids: role_ids.clone(),
+                        cached_at: Instant::now(),
+                    },
+                );
+                Some(role_ids)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target: "acl_filter",
+                    error = %e,
+                    "list_my_roles_failed"
+                );
+                None
+            }
         }
     }
 
@@ -372,12 +427,17 @@ impl SemanticState {
     /// accessible pages, 403/404 for restricted. This correctly handles custom
     /// entity permissions (unlike filter[id:in] on the list endpoint).
     ///
-    /// Three-tier cache (issue #58 lever a):
+    /// Four-tier filter (issue #58 levers a + a.5):
     ///   1. L1 — in-memory `HashMap<(token_hash, page_id), CachedAccess>`,
     ///      5 minute TTL. Same as before; rekeyed to `token_hash`.
     ///   2. L2 — durable `permission_cache` table, default 1h TTL
     ///      (`BSMCP_PERMISSION_CACHE_TTL_SECS`). Survives restart.
-    ///   3. HTTP fallback — `can_access_page` per remaining page.
+    ///   3. DB-side prefilter — joins `pages` against `page_view_acl` to
+    ///      drop denied pages and admit role-matched pages without HTTP.
+    ///      Big win on cold caches with heterogeneous role-restricted books.
+    ///   4. HTTP fallback — `can_access_page` per remaining page (uncomputed
+    ///      pages + default-open pages that still need the system-perm
+    ///      check). Uncomputed pages also trigger a background recompute.
     ///
     /// Per-call structured counters (issue #58 lever 0): cache_hits,
     /// cache_misses, http_fallback fan-out and wall-clock. Emitted as a
@@ -455,6 +515,62 @@ impl SemanticState {
                         error = %e,
                         "permission_cache_l2_lookup_failed"
                     );
+                }
+            }
+        }
+
+        // DB-side ACL prefilter (issue #58 lever a.5). Cuts the pool before
+        // HTTP fan-out. Each remaining candidate gets bucketed into
+        // {Allow, Deny, DefaultOpen, Uncomputed}; Allow → accessible, Deny
+        // → dropped, DefaultOpen + Uncomputed → HTTP fallback.
+        let mut prefilter_allow: usize = 0;
+        let mut prefilter_deny: usize = 0;
+        let mut prefilter_default_open: usize = 0;
+        let mut prefilter_uncomputed: usize = 0;
+        if !uncached_ids.is_empty() {
+            if let Some(role_ids) = self
+                .resolve_caller_role_ids(client, &token_hash)
+                .await
+            {
+                match self
+                    .db
+                    .prefilter_pages_by_roles(&uncached_ids, &role_ids)
+                    .await
+                {
+                    Ok(verdicts) => {
+                        let verdict_map: HashMap<i64, AclPrefilter> = verdicts.into_iter().collect();
+                        let mut still_pending: Vec<i64> = Vec::with_capacity(uncached_ids.len());
+                        // Note: pages missing from `pages` (not embedded) have
+                        // no verdict at all; default to Uncomputed (HTTP).
+                        for pid in uncached_ids.drain(..) {
+                            match verdict_map.get(&pid).copied() {
+                                Some(AclPrefilter::Allow) => {
+                                    prefilter_allow += 1;
+                                    accessible.push(pid);
+                                }
+                                Some(AclPrefilter::Deny) => {
+                                    prefilter_deny += 1;
+                                    // Dropped silently. No HTTP, no result.
+                                }
+                                Some(AclPrefilter::DefaultOpen) => {
+                                    prefilter_default_open += 1;
+                                    still_pending.push(pid);
+                                }
+                                Some(AclPrefilter::Uncomputed) | None => {
+                                    prefilter_uncomputed += 1;
+                                    still_pending.push(pid);
+                                }
+                            }
+                        }
+                        uncached_ids = still_pending;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "acl_filter",
+                            error = %e,
+                            "acl_prefilter_failed"
+                        );
+                    }
                 }
             }
         }
@@ -539,6 +655,10 @@ impl SemanticState {
             cache_misses = cache_misses,
             l1_hits = l1_hits,
             l2_hits = l2_hits,
+            prefilter_allow = prefilter_allow,
+            prefilter_deny = prefilter_deny,
+            prefilter_default_open = prefilter_default_open,
+            prefilter_uncomputed = prefilter_uncomputed,
             http_fallback = http_fallback_fired,
             http_fallback_ms = http_fallback_ms as u64,
             elapsed_ms = call_start.elapsed().as_millis() as u64,
@@ -2117,45 +2237,131 @@ mod acl_fanout_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
 
-    /// Spin a tiny mock BookStack server that:
-    ///   - GET /api/pages/{id}: 200 if `id` is in `allowed`, else 404.
-    ///   - GET /api/users/{id}: returns the configured user JSON.
-    /// Returns the base URL and a shared counter of `can_access_page` hits so
-    /// tests can assert on fan-out.
-    pub(crate) async fn mock_bookstack(allowed: Vec<i64>) -> (String, StdArc<AtomicUsize>) {
+    /// Knobs for the mock BookStack server. Keeps tests focused — each one
+    /// only sets the bits it cares about; the rest use sensible defaults.
+    #[derive(Clone, Default)]
+    pub(crate) struct MockBookStack {
+        /// Page IDs that `GET /api/pages/{id}` returns 200 for. Everything
+        /// else returns 404.
+        pub allowed_pages: Vec<i64>,
+        /// User ID the search probe returns as the calling user. None
+        /// makes the search probe return zero results, which the production
+        /// `whoami`/`list_my_roles` flow surfaces as "no identity yet".
+        pub caller_user_id: Option<i64>,
+        /// Roles attached to the caller user record. Only consulted when
+        /// `caller_user_id` is `Some`.
+        pub caller_roles: Vec<i64>,
+    }
+
+    /// Tracks how many times each endpoint was hit. Tests assert on this to
+    /// detect fan-out reduction.
+    pub(crate) struct MockCounters {
+        pub pages: StdArc<AtomicUsize>,
+        pub search: StdArc<AtomicUsize>,
+        pub users: StdArc<AtomicUsize>,
+    }
+
+    impl MockCounters {
+        fn new() -> Self {
+            Self {
+                pages: StdArc::new(AtomicUsize::new(0)),
+                search: StdArc::new(AtomicUsize::new(0)),
+                users: StdArc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    /// Spin a tiny mock BookStack server that handles enough of the API
+    /// surface for `filter_by_permission` + `list_my_roles` to roundtrip.
+    /// Returns the base URL and the per-endpoint counters.
+    pub(crate) async fn mock_bookstack_full(cfg: MockBookStack) -> (String, MockCounters) {
         use axum::extract::Path;
         use axum::http::StatusCode;
+        use axum::response::IntoResponse;
         use axum::routing::get;
         use axum::Router;
-        let allowed: StdArc<Vec<i64>> = StdArc::new(allowed);
-        let counter: StdArc<AtomicUsize> = StdArc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-        let app = Router::new().route(
-            "/api/pages/{id}",
-            get(move |Path(id): Path<i64>| {
-                let allowed = allowed.clone();
-                let counter = counter_clone.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    if allowed.contains(&id) {
-                        (StatusCode::OK, axum::Json(serde_json::json!({"id": id}))).into_response()
-                    } else {
-                        (
-                            StatusCode::NOT_FOUND,
-                            axum::Json(serde_json::json!({"error": "not found"})),
-                        )
-                            .into_response()
+        let counters = MockCounters::new();
+        let allowed: StdArc<Vec<i64>> = StdArc::new(cfg.allowed_pages.clone());
+        let caller_user_id = cfg.caller_user_id;
+        let caller_roles: StdArc<Vec<i64>> = StdArc::new(cfg.caller_roles.clone());
+        let pages_ctr = counters.pages.clone();
+        let search_ctr = counters.search.clone();
+        let users_ctr = counters.users.clone();
+        let app = Router::new()
+            .route(
+                "/api/pages/{id}",
+                get(move |Path(id): Path<i64>| {
+                    let allowed = allowed.clone();
+                    let ctr = pages_ctr.clone();
+                    async move {
+                        ctr.fetch_add(1, Ordering::SeqCst);
+                        if allowed.contains(&id) {
+                            (StatusCode::OK, axum::Json(serde_json::json!({"id": id})))
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"error": "not found"})),
+                            )
+                                .into_response()
+                        }
                     }
-                }
-            }),
-        );
-        use axum::response::IntoResponse;
+                }),
+            )
+            .route(
+                "/api/search",
+                get(move || {
+                    let ctr = search_ctr.clone();
+                    async move {
+                        ctr.fetch_add(1, Ordering::SeqCst);
+                        let data = match caller_user_id {
+                            Some(uid) => serde_json::json!([
+                                { "type": "page", "id": 1, "created_by": { "id": uid } }
+                            ]),
+                            None => serde_json::json!([]),
+                        };
+                        axum::Json(serde_json::json!({"data": data, "total": 1}))
+                    }
+                }),
+            )
+            .route(
+                "/api/users/{id}",
+                get(move |Path(id): Path<i64>| {
+                    let ctr = users_ctr.clone();
+                    let roles = caller_roles.clone();
+                    async move {
+                        ctr.fetch_add(1, Ordering::SeqCst);
+                        let role_objs: Vec<serde_json::Value> = roles
+                            .iter()
+                            .map(|r| serde_json::json!({"id": r, "display_name": format!("Role{r}")}))
+                            .collect();
+                        axum::Json(serde_json::json!({
+                            "id": id,
+                            "name": "Test User",
+                            "email": "test@example.com",
+                            "roles": role_objs,
+                        }))
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        (format!("http://{addr}"), counter)
+        (format!("http://{addr}"), counters)
+    }
+
+    /// Back-compat shim for the lever 0 tests. Default mock: pages-only,
+    /// no caller identity. Returns the URL + the page-hit counter.
+    pub(crate) async fn mock_bookstack(allowed: Vec<i64>) -> (String, StdArc<AtomicUsize>) {
+        let (url, counters) = mock_bookstack_full(MockBookStack {
+            allowed_pages: allowed,
+            caller_user_id: None,
+            caller_roles: Vec::new(),
+        })
+        .await;
+        (url, counters.pages)
     }
 
     pub(crate) fn temp_sqlite_path(label: &str) -> PathBuf {
@@ -2220,6 +2426,146 @@ mod acl_fanout_tests {
         assert_eq!(
             after_second, after_first,
             "cache hit should suppress further HTTP fan-out"
+        );
+    }
+
+    /// Helper: seed a sqlite db with pages + ACL rows so we can exercise
+    /// `prefilter_pages_by_roles` directly.
+    pub(crate) async fn seed_pages_with_acl(
+        sqlite: &Arc<SqliteDb>,
+        rows: &[(i64, bool, Vec<i64>)],
+    ) {
+        use bsmcp_common::types::{PageAcl, PageMeta};
+        for (pid, default_open, roles) in rows {
+            let meta = PageMeta {
+                page_id: *pid,
+                book_id: 100,
+                chapter_id: None,
+                name: format!("page-{pid}"),
+                slug: format!("page-{pid}"),
+                content_hash: "h".to_string(),
+                updated_at: None,
+            };
+            sqlite.upsert_page(&meta).await.unwrap();
+            let acl = PageAcl {
+                page_id: *pid,
+                view_roles: roles.clone(),
+                default_open: *default_open,
+                computed_at: 1,
+            };
+            sqlite.upsert_page_acl(&acl).await.unwrap();
+        }
+    }
+
+    /// Lever a.5 — DB-side prefilter buckets every candidate into
+    /// Allow/Deny/DefaultOpen/Uncomputed. Verified directly against the
+    /// sqlite impl so we know the SQL shape is correct before the higher-
+    /// level integration test exercises the search path.
+    #[tokio::test]
+    async fn prefilter_pages_by_roles_routes_correctly() {
+        let path = temp_sqlite_path("prefilter-routes");
+        let sqlite = Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        sqlite.init_semantic_tables().await.unwrap();
+        // Page 1: role-restricted to [10], default_open=false → Allow for caller_roles=[10]
+        // Page 2: role-restricted to [20], default_open=false → Deny for caller_roles=[10]
+        // Page 3: default_open=true → DefaultOpen
+        // Page 4: never embedded (no `pages` row) → not in the returned list
+        // Page 5: embedded but acl_computed_at IS NULL → Uncomputed
+        seed_pages_with_acl(
+            &sqlite,
+            &[
+                (1, false, vec![10]),
+                (2, false, vec![20]),
+                (3, true, vec![]),
+            ],
+        )
+        .await;
+        // Page 5 without ACL computed: insert page row but skip upsert_page_acl.
+        let meta = bsmcp_common::types::PageMeta {
+            page_id: 5,
+            book_id: 100,
+            chapter_id: None,
+            name: "page-5".to_string(),
+            slug: "page-5".to_string(),
+            content_hash: "h".to_string(),
+            updated_at: None,
+        };
+        sqlite.upsert_page(&meta).await.unwrap();
+
+        let verdicts = sqlite
+            .prefilter_pages_by_roles(&[1, 2, 3, 4, 5], &[10])
+            .await
+            .unwrap();
+        let by_pid: HashMap<i64, AclPrefilter> = verdicts.into_iter().collect();
+        assert_eq!(by_pid.get(&1), Some(&AclPrefilter::Allow));
+        assert_eq!(by_pid.get(&2), Some(&AclPrefilter::Deny));
+        assert_eq!(by_pid.get(&3), Some(&AclPrefilter::DefaultOpen));
+        assert!(!by_pid.contains_key(&4), "page 4 isn't in the embed store");
+        assert_eq!(by_pid.get(&5), Some(&AclPrefilter::Uncomputed));
+    }
+
+    /// Lever a.5 — end-to-end: a search-shaped call to `filter_by_permission`
+    /// with the prefilter populated should skip the HTTP fallback for both
+    /// Allow and Deny verdicts. Only DefaultOpen + Uncomputed reach BookStack.
+    #[tokio::test]
+    async fn filter_by_permission_uses_prefilter_to_skip_http() {
+        // Pages 1+2: Allow (role 10 matches). Page 3: Deny. Pages 4+5: DefaultOpen.
+        // The mock will count GET /api/pages/{id} hits — we expect exactly 2
+        // (the two default-open pages still need HTTP), not 5.
+        let path = temp_sqlite_path("prefilter-e2e");
+        let sqlite = Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        sqlite.init_semantic_tables().await.unwrap();
+        seed_pages_with_acl(
+            &sqlite,
+            &[
+                (1, false, vec![10]),
+                (2, false, vec![10]),
+                (3, false, vec![999]),
+                (4, true, vec![]),
+                (5, true, vec![]),
+            ],
+        )
+        .await;
+
+        // Allow pages 4+5 only — page 3 would 404 if it ever hit, which is fine
+        // (deny in both pathways), and the test cares about the *count* of HTTP
+        // calls, not the verdicts on default-open.
+        let (base, counters) = mock_bookstack_full(MockBookStack {
+            allowed_pages: vec![4, 5],
+            caller_user_id: Some(42),
+            caller_roles: vec![10],
+        })
+        .await;
+        let core_db: Arc<dyn DbBackend> = sqlite.clone();
+        let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
+        let index_db: Arc<dyn IndexDb> = sqlite.clone();
+        let state = Arc::new(SemanticState::new(
+            semantic_db,
+            core_db,
+            index_db,
+            "http://unused".to_string(),
+            "test-webhook-secret-16chars".to_string(),
+        ));
+        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+
+        let accessible = state
+            .filter_by_permission(&[1, 2, 3, 4, 5], &client)
+            .await;
+        let mut sorted = accessible;
+        sorted.sort();
+        // Page 1+2 allowed via prefilter, page 3 denied via prefilter,
+        // pages 4+5 admitted via HTTP fallback (default-open + mock allows).
+        assert_eq!(sorted, vec![1, 2, 4, 5]);
+        assert_eq!(
+            counters.pages.load(Ordering::SeqCst),
+            2,
+            "prefilter should suppress HTTP for Allow + Deny verdicts; only 2 default-open pages hit HTTP"
         );
     }
 

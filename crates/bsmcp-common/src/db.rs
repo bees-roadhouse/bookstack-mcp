@@ -226,6 +226,28 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// job to know which pages to refresh.
     async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String>;
 
+    /// DB-side ACL prefilter (issue #58 lever a.5). Single query joins
+    /// `pages` against `page_view_acl` to bucket each requested page into
+    /// [`AclPrefilter`]. Lets the semantic-search read path drop
+    /// definitely-denied pages and admit definitely-allowed pages without
+    /// any BookStack HTTP fan-out.
+    ///
+    /// Decision tree per page row:
+    /// - `acl_computed_at IS NULL` → `Uncomputed`
+    /// - `acl_default_open = true` → `DefaultOpen` (HTTP still required for
+    ///   system-perm check, but skipped from the deny short-circuit).
+    /// - any row in `page_view_acl` with `role_id IN role_ids` → `Allow`
+    /// - else → `Deny`
+    ///
+    /// Returns one verdict per requested page that exists in the
+    /// `pages` table. Pages missing from the embedding store are omitted
+    /// (they have no ACL signal yet — fall back to HTTP).
+    async fn prefilter_pages_by_roles(
+        &self,
+        page_ids: &[i64],
+        role_ids: &[i64],
+    ) -> Result<Vec<(i64, AclPrefilter)>, String>;
+
     // --- Permission cache (per-token, per-page) ---
     //
     // Issue #58 lever (a): durable L2 below the in-memory L1 in
