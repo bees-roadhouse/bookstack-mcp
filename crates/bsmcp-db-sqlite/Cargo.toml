@@ -7,6 +7,7 @@ version.workspace = true
 bsmcp-common = { path = "../bsmcp-common" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "sync"] }
+tracing = { workspace = true }
 aes-gcm = "0.10"
 base64 = "0.22"
 sha2 = "0.10"

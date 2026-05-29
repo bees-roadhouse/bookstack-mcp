@@ -36,7 +36,8 @@ use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 
 #[tokio::main]
 async fn main() {
-    eprintln!("BookStack MCP Worker v{}", env!("CARGO_PKG_VERSION"));
+    bsmcp_common::logging::init("bsmcp-worker");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "worker_starting");
 
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
 
@@ -69,7 +70,7 @@ async fn main() {
                 let db_path = env::var("BSMCP_DB_PATH")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/data/bookstack-mcp.db"));
-                eprintln!("Database: SQLite ({})", db_path.display());
+                tracing::info!(backend = "sqlite", path = %db_path.display(), "database_selected");
                 let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(&db_path, &encryption_key));
                 (
                     db.clone() as Arc<dyn DbBackend>,
@@ -80,7 +81,7 @@ async fn main() {
             DbBackendType::Postgres => {
                 let database_url = env::var("BSMCP_DATABASE_URL")
                     .expect("BSMCP_DATABASE_URL is required when BSMCP_DB_BACKEND=postgres");
-                eprintln!("Database: PostgreSQL");
+                tracing::info!(backend = "postgres", "database_selected");
                 let db = Arc::new(
                     bsmcp_db_postgres::PostgresDb::new(&database_url, &encryption_key)
                         .await
@@ -105,7 +106,7 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
-    eprintln!("Worker starting — delta interval: {delta_interval}s (0 = webhook-only)");
+    tracing::info!(delta_interval_s = delta_interval, "worker_delta_interval");
 
     let worker = bsmcp_worker::IndexWorker::new(bs_client, db, index_db);
     let handle = worker.spawn(delta_interval, Some(semantic_db));
@@ -114,7 +115,7 @@ async fn main() {
     // surface as a JoinError here so the container exits and the
     // orchestrator can restart us.
     if let Err(e) = handle.await {
-        eprintln!("Worker task exited unexpectedly: {e}");
+        tracing::error!(error = %e, "worker_task_exited_unexpectedly");
         std::process::exit(1);
     }
 }
