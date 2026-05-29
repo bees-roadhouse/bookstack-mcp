@@ -731,6 +731,25 @@ impl SemanticDb for SqliteDb {
                  );"
             ).map_err(|e| format!("Failed to create ACL tables: {e}"))?;
 
+            // Permission cache (issue #58 lever a): per-token, per-page
+            // viewable verdict. The in-memory cache in `SemanticState` is L1;
+            // this table is L2 so cold-cache after restart still skips the
+            // HTTP fan-out for known-cached tokens. `token_hash` is
+            // `SHA256(token_id)` so a raw credential identifier never lands
+            // on disk — same hygiene as `set_by_token_hash` on
+            // `global_settings`.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS permission_cache (
+                     token_hash TEXT NOT NULL,
+                     page_id    INTEGER NOT NULL,
+                     viewable   INTEGER NOT NULL,
+                     cached_at  INTEGER NOT NULL,
+                     PRIMARY KEY (token_hash, page_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_permission_cache_cached_at
+                     ON permission_cache(cached_at);"
+            ).map_err(|e| format!("Failed to create permission_cache: {e}"))?;
+
             tracing::info!(backend = "sqlite", "semantic_tables_initialized");
             Ok(())
         })
@@ -1895,6 +1914,114 @@ impl SemanticDb for SqliteDb {
                 .filter_map(|r| r.ok())
                 .collect();
             Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        page_ids: &[i64],
+        min_cached_at: i64,
+    ) -> Result<Vec<(i64, bool)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let token_hash = token_hash.to_string();
+        let page_ids = page_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // SQLite max host params default 32766; chunk just in case of
+            // very large candidate sets.
+            const CHUNK: usize = 500;
+            let mut out: Vec<(i64, bool)> = Vec::new();
+            for window in page_ids.chunks(CHUNK) {
+                let placeholders: String = (0..window.len())
+                    .map(|i| format!("?{}", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT page_id, viewable FROM permission_cache \
+                     WHERE token_hash = ?1 AND cached_at >= ?2 AND page_id IN ({placeholders})"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("permission_cache prepare: {e}"))?;
+                let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(window.len() + 2);
+                params.push(&token_hash);
+                params.push(&min_cached_at);
+                for pid in window {
+                    params.push(pid);
+                }
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params.iter().copied()), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0))
+                    })
+                    .map_err(|e| format!("permission_cache query: {e}"))?;
+                for r in rows {
+                    let row = r.map_err(|e| format!("permission_cache row: {e}"))?;
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn upsert_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        entries: &[(i64, bool)],
+        cached_at: i64,
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        let token_hash = token_hash.to_string();
+        let entries = entries.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("permission_cache upsert tx: {e}"))?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO permission_cache (token_hash, page_id, viewable, cached_at) \
+                         VALUES (?1, ?2, ?3, ?4) \
+                         ON CONFLICT(token_hash, page_id) DO UPDATE SET \
+                         viewable = excluded.viewable, cached_at = excluded.cached_at",
+                    )
+                    .map_err(|e| format!("permission_cache upsert prepare: {e}"))?;
+                for (pid, viewable) in &entries {
+                    let v: i64 = if *viewable { 1 } else { 0 };
+                    stmt.execute(params![token_hash, pid, v, cached_at])
+                        .map_err(|e| format!("permission_cache upsert exec: {e}"))?;
+                }
+            }
+            tx.commit()
+                .map_err(|e| format!("permission_cache upsert commit: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn evict_stale_permission_cache(&self, older_than: i64) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count = conn
+                .execute(
+                    "DELETE FROM permission_cache WHERE cached_at < ?1",
+                    params![older_than],
+                )
+                .map_err(|e| format!("permission_cache evict: {e}"))?;
+            Ok(count)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?

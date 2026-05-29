@@ -12,10 +12,19 @@ use tokio::sync::RwLock;
 
 use bsmcp_common::bookstack::BookStackClient;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
-use bsmcp_common::settings::{CascadeMultipliers, GlobalSettings};
+use bsmcp_common::settings::{hash_token_id, CascadeMultipliers, GlobalSettings};
 use bsmcp_common::types::{MarkovBlanket, ScopeFilter};
 
 const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Default TTL for the durable L2 permission cache (issue #58 lever a).
+/// Override via `BSMCP_PERMISSION_CACHE_TTL_SECS`. 1h is the safety-net
+/// window for missed `permissions_update` webhooks; on-event invalidation
+/// happens through the existing acl_reconcile pipeline.
+const PERMISSION_CACHE_L2_TTL_SECS_DEFAULT: i64 = 3600;
+
+/// How often the periodic eviction task sweeps the L2 cache.
+const PERMISSION_CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Search ranking strategy. Selected per-call via the `mode` argument on
 /// `semantic_search`. All modes return the same JSON shape so a caller can
@@ -113,6 +122,27 @@ struct CachedAccess {
     cached_at: Instant,
 }
 
+/// Wall-clock seconds since epoch. Used as the `cached_at` value for the L2
+/// permission cache rows.
+fn now_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Resolve the configured L2 cache TTL. Reads `BSMCP_PERMISSION_CACHE_TTL_SECS`
+/// at call time so an env override doesn't require a restart for the next
+/// call to pick up. Falls back to [`PERMISSION_CACHE_L2_TTL_SECS_DEFAULT`].
+fn permission_cache_l2_ttl_secs() -> i64 {
+    std::env::var("BSMCP_PERMISSION_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &i64| *v > 0)
+        .unwrap_or(PERMISSION_CACHE_L2_TTL_SECS_DEFAULT)
+}
+
 pub struct SemanticState {
     db: Arc<dyn SemanticDb>,
     /// Core backend — used to load `global_settings` for the cascade
@@ -133,7 +163,11 @@ pub struct SemanticState {
     embedder_url: String,
     webhook_secret: String,
     http_client: reqwest::Client,
-    /// Permission cache: (token_id, page_id) -> CachedAccess
+    /// L1 in-memory permission cache: `(token_hash, page_id) -> CachedAccess`.
+    /// Issue #58 lever a: rekeyed from raw `token_id` to `SHA256(token_id)` so
+    /// the in-memory shape matches the L2 (`permission_cache` table) key. The
+    /// raw `token_id` is held only by the live `BookStackClient`; it never
+    /// lands in our cache map.
     permission_cache: RwLock<HashMap<(String, i64), CachedAccess>>,
 }
 
@@ -192,6 +226,43 @@ impl SemanticState {
 
     pub fn webhook_secret(&self) -> &str {
         &self.webhook_secret
+    }
+
+    /// Spawn the L2 permission-cache eviction task (issue #58 lever a).
+    /// Wakes every [`PERMISSION_CACHE_EVICT_INTERVAL`] and deletes
+    /// `permission_cache` rows older than the configured TTL. Cheap: one
+    /// DELETE against an indexed `cached_at` column. Mirrors the
+    /// `cleanup_expired_tokens` lifecycle pattern.
+    pub fn spawn_permission_cache_evictor(self: Arc<Self>) {
+        tracing::info!(
+            interval_secs = PERMISSION_CACHE_EVICT_INTERVAL.as_secs(),
+            "permission_cache_evictor_active"
+        );
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PERMISSION_CACHE_EVICT_INTERVAL).await;
+                let ttl = permission_cache_l2_ttl_secs();
+                let older_than = now_unix_secs() - ttl;
+                match self.db.evict_stale_permission_cache(older_than).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(
+                            target: "acl_filter",
+                            removed,
+                            ttl_secs = ttl,
+                            "permission_cache_l2_evicted"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "acl_filter",
+                            error = %e,
+                            "permission_cache_l2_evict_failed"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Spawn the daily ACL reconciliation cron. Wakes every
@@ -300,33 +371,39 @@ impl SemanticState {
     /// Checks each page individually via GET /api/pages/{id} — returns 200 for
     /// accessible pages, 403/404 for restricted. This correctly handles custom
     /// entity permissions (unlike filter[id:in] on the list endpoint).
-    /// Results are cached per (token_id, page_id) for 5 minutes.
+    ///
+    /// Three-tier cache (issue #58 lever a):
+    ///   1. L1 — in-memory `HashMap<(token_hash, page_id), CachedAccess>`,
+    ///      5 minute TTL. Same as before; rekeyed to `token_hash`.
+    ///   2. L2 — durable `permission_cache` table, default 1h TTL
+    ///      (`BSMCP_PERMISSION_CACHE_TTL_SECS`). Survives restart.
+    ///   3. HTTP fallback — `can_access_page` per remaining page.
     ///
     /// Per-call structured counters (issue #58 lever 0): cache_hits,
     /// cache_misses, http_fallback fan-out and wall-clock. Emitted as a
     /// single `tracing::info!(target: "acl_filter", ...)` event at end of
     /// call. Field names are Prometheus-counter-shaped so #90 Phase 2 can
     /// promote them without rename:
-    ///   bsmcp_acl_cache_hits_total
+    ///   bsmcp_acl_cache_hits_total       (L1 + L2 combined)
     ///   bsmcp_acl_cache_misses_total
     ///   bsmcp_acl_http_fallback_total
     ///   bsmcp_acl_http_fallback_duration_seconds
     async fn filter_by_permission(&self, page_ids: &[i64], client: &BookStackClient) -> Vec<i64> {
-        let token_id = client.token_id().to_string();
+        let token_hash = hash_token_id(client.token_id());
         let now = Instant::now();
         let call_start = Instant::now();
 
         let mut uncached_ids: Vec<i64> = Vec::new();
         let mut accessible: Vec<i64> = Vec::new();
-        let mut cache_hits: usize = 0;
+        let mut l1_hits: usize = 0;
 
         {
             let cache = self.permission_cache.read().await;
             for &pid in page_ids {
-                let key = (token_id.clone(), pid);
+                let key = (token_hash.clone(), pid);
                 if let Some(entry) = cache.get(&key) {
                     if now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL {
-                        cache_hits += 1;
+                        l1_hits += 1;
                         if entry.accessible {
                             accessible.push(pid);
                         }
@@ -334,6 +411,51 @@ impl SemanticState {
                     }
                 }
                 uncached_ids.push(pid);
+            }
+        }
+
+        // L2: durable cache for anything L1 didn't have. Best-effort: if the
+        // backend errors out we just treat as a miss and HTTP-fall-through.
+        let mut l2_hits: usize = 0;
+        if !uncached_ids.is_empty() {
+            let ttl = permission_cache_l2_ttl_secs();
+            let min_cached_at = now_unix_secs() - ttl;
+            match self
+                .db
+                .get_permission_cache_batch(&token_hash, &uncached_ids, min_cached_at)
+                .await
+            {
+                Ok(rows) => {
+                    let hit_map: HashMap<i64, bool> = rows.into_iter().collect();
+                    let mut still_uncached: Vec<i64> = Vec::with_capacity(uncached_ids.len());
+                    // Hydrate L1 with L2 hits, settle accessibility immediately.
+                    let mut l1_writer = self.permission_cache.write().await;
+                    for pid in uncached_ids.drain(..) {
+                        if let Some(&viewable) = hit_map.get(&pid) {
+                            l2_hits += 1;
+                            l1_writer.insert(
+                                (token_hash.clone(), pid),
+                                CachedAccess {
+                                    accessible: viewable,
+                                    cached_at: now,
+                                },
+                            );
+                            if viewable {
+                                accessible.push(pid);
+                            }
+                        } else {
+                            still_uncached.push(pid);
+                        }
+                    }
+                    uncached_ids = still_uncached;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acl_filter",
+                        error = %e,
+                        "permission_cache_l2_lookup_failed"
+                    );
+                }
             }
         }
 
@@ -372,7 +494,7 @@ impl SemanticState {
                 let mut cache = self.permission_cache.write().await;
                 for &(pid, ok) in &results {
                     cache.insert(
-                        (token_id.clone(), pid),
+                        (token_hash.clone(), pid),
                         CachedAccess {
                             accessible: ok,
                             cached_at: now,
@@ -389,16 +511,34 @@ impl SemanticState {
                     });
                 }
             }
+
+            // L2 write-through. Best-effort: a failure here doesn't sink the
+            // foreground call — next request will just refetch.
+            let now_secs = now_unix_secs();
+            if let Err(e) = self
+                .db
+                .upsert_permission_cache_batch(&token_hash, &results, now_secs)
+                .await
+            {
+                tracing::warn!(
+                    target: "acl_filter",
+                    error = %e,
+                    "permission_cache_l2_upsert_failed"
+                );
+            }
         }
 
         // Per-call ACL filter telemetry. One structured event per
         // `filter_by_permission` invocation; #90 Phase 2 promotes to
         // counters without renaming the fields.
+        let cache_hits = l1_hits + l2_hits;
         tracing::info!(
             target: "acl_filter",
             candidates = page_ids.len(),
             cache_hits = cache_hits,
             cache_misses = cache_misses,
+            l1_hits = l1_hits,
+            l2_hits = l2_hits,
             http_fallback = http_fallback_fired,
             http_fallback_ms = http_fallback_ms as u64,
             elapsed_ms = call_start.elapsed().as_millis() as u64,
@@ -2081,5 +2221,74 @@ mod acl_fanout_tests {
             after_second, after_first,
             "cache hit should suppress further HTTP fan-out"
         );
+    }
+
+    /// Lever a — durable L2 cache. Verifies that warm-cache after restart
+    /// (simulated by constructing a fresh `SemanticState` on the same
+    /// sqlite path) skips the HTTP fan-out entirely.
+    #[tokio::test]
+    async fn permission_cache_l2_survives_restart() {
+        let (base, counter) = mock_bookstack(vec![10, 11]).await;
+        let path = temp_sqlite_path("l2-restart");
+
+        // First "process": warm the L2 cache.
+        {
+            let sqlite = Arc::new(SqliteDb::open(
+                &path,
+                "test-encryption-key-thirty-two-chars-long",
+            ));
+            sqlite.init_semantic_tables().await.unwrap();
+            let core_db: Arc<dyn DbBackend> = sqlite.clone();
+            let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
+            let index_db: Arc<dyn IndexDb> = sqlite.clone();
+            let state = Arc::new(SemanticState::new(
+                semantic_db,
+                core_db,
+                index_db,
+                "http://unused".to_string(),
+                "test-webhook-secret-16chars".to_string(),
+            ));
+            let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+            let r = state
+                .filter_by_permission(&[10i64, 11, 12], &client)
+                .await;
+            let mut sorted = r;
+            sorted.sort();
+            assert_eq!(sorted, vec![10, 11]);
+            assert_eq!(counter.load(Ordering::SeqCst), 3);
+        }
+
+        // Second "process": fresh state, same backing file. L1 is empty,
+        // but L2 still has the verdicts from the first session.
+        {
+            let sqlite = Arc::new(SqliteDb::open(
+                &path,
+                "test-encryption-key-thirty-two-chars-long",
+            ));
+            sqlite.init_semantic_tables().await.unwrap();
+            let core_db: Arc<dyn DbBackend> = sqlite.clone();
+            let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
+            let index_db: Arc<dyn IndexDb> = sqlite.clone();
+            let state = Arc::new(SemanticState::new(
+                semantic_db,
+                core_db,
+                index_db,
+                "http://unused".to_string(),
+                "test-webhook-secret-16chars".to_string(),
+            ));
+            let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+            let r = state
+                .filter_by_permission(&[10i64, 11, 12], &client)
+                .await;
+            let mut sorted = r;
+            sorted.sort();
+            assert_eq!(sorted, vec![10, 11]);
+            // No new HTTP traffic — L2 served every candidate.
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                3,
+                "L2 should suppress HTTP fan-out post-restart"
+            );
+        }
     }
 }

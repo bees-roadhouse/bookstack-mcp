@@ -225,6 +225,38 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// List page IDs that have a stored ACL. Used by the daily reconciliation
     /// job to know which pages to refresh.
     async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String>;
+
+    // --- Permission cache (per-token, per-page) ---
+    //
+    // Issue #58 lever (a): durable L2 below the in-memory L1 in
+    // `SemanticState`. Survives restart, so cold-start no longer means
+    // fan-out a `can_access_page` call per candidate. Keyed by
+    // `SHA256(token_id)` so a raw credential identifier never lands on disk.
+
+    /// Fetch cached permission verdicts for a list of pages. Returns
+    /// `(page_id, viewable)` only for entries that exist AND whose
+    /// `cached_at >= min_cached_at`. Missing or stale rows are omitted so
+    /// the caller can fall through to HTTP.
+    async fn get_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        page_ids: &[i64],
+        min_cached_at: i64,
+    ) -> Result<Vec<(i64, bool)>, String>;
+
+    /// Upsert one or more permission cache entries for a token. Idempotent
+    /// on `(token_hash, page_id)`; refreshes both `viewable` and
+    /// `cached_at`. Batched into a single transaction.
+    async fn upsert_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        entries: &[(i64, bool)],
+        cached_at: i64,
+    ) -> Result<(), String>;
+
+    /// Delete cache rows whose `cached_at < older_than`. Returns the row
+    /// count removed. Called by the periodic eviction task.
+    async fn evict_stale_permission_cache(&self, older_than: i64) -> Result<usize, String>;
 }
 
 /// v1.0.0 reconciliation index — structural mirror of every BookStack item we

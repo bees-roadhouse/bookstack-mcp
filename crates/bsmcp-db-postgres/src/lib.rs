@@ -665,6 +665,31 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("Failed to create acl_reconcile_state: {e}"))?;
 
+        // Permission cache (issue #58 lever a): per-token, per-page viewable
+        // verdict. L2 below the in-memory L1 in `SemanticState` so cold-cache
+        // after restart skips the HTTP fan-out for known-cached tokens.
+        // `token_hash` is `SHA256(token_id)` so a raw credential identifier
+        // never lands on disk.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS permission_cache (
+                token_hash TEXT NOT NULL,
+                page_id    BIGINT NOT NULL,
+                viewable   BOOLEAN NOT NULL,
+                cached_at  BIGINT NOT NULL,
+                PRIMARY KEY (token_hash, page_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to create permission_cache: {e}"))?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_permission_cache_cached_at \
+             ON permission_cache(cached_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
+
         tracing::info!(backend = "postgres", "semantic_tables_initialized");
         Ok(())
     }
@@ -1678,6 +1703,68 @@ impl SemanticDb for PostgresDb {
                 .await
                 .map_err(|e| format!("list_acl_page_ids: {e}"))?;
         Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    async fn get_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        page_ids: &[i64],
+        min_cached_at: i64,
+    ) -> Result<Vec<(i64, bool)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(i64, bool)> = sqlx::query_as(
+            "SELECT page_id, viewable FROM permission_cache \
+             WHERE token_hash = $1 AND cached_at >= $2 AND page_id = ANY($3)",
+        )
+        .bind(token_hash)
+        .bind(min_cached_at)
+        .bind(page_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("get_permission_cache_batch: {e}"))?;
+        Ok(rows)
+    }
+
+    async fn upsert_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        entries: &[(i64, bool)],
+        cached_at: i64,
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Build parallel arrays for an UNNEST-driven bulk upsert. Single
+        // roundtrip regardless of batch size; conflict-resolves to the
+        // freshest viewable + cached_at per (token_hash, page_id).
+        let page_ids: Vec<i64> = entries.iter().map(|(p, _)| *p).collect();
+        let viewables: Vec<bool> = entries.iter().map(|(_, v)| *v).collect();
+        sqlx::query(
+            "INSERT INTO permission_cache (token_hash, page_id, viewable, cached_at) \
+             SELECT $1, p, v, $2 \
+             FROM UNNEST($3::BIGINT[], $4::BOOLEAN[]) AS t(p, v) \
+             ON CONFLICT (token_hash, page_id) DO UPDATE SET \
+             viewable = EXCLUDED.viewable, cached_at = EXCLUDED.cached_at",
+        )
+        .bind(token_hash)
+        .bind(cached_at)
+        .bind(&page_ids)
+        .bind(&viewables)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("upsert_permission_cache_batch: {e}"))?;
+        Ok(())
+    }
+
+    async fn evict_stale_permission_cache(&self, older_than: i64) -> Result<usize, String> {
+        let result = sqlx::query("DELETE FROM permission_cache WHERE cached_at < $1")
+            .bind(older_than)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("evict_stale_permission_cache: {e}"))?;
+        Ok(result.rows_affected() as usize)
     }
 }
 

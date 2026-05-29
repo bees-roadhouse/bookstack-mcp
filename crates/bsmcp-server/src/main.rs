@@ -193,6 +193,7 @@ async fn main() {
                         webhook_secret,
                     ));
                     state.clone().spawn_acl_reconcile();
+                    state.clone().spawn_permission_cache_evictor();
                     Some(state)
                 }
             }
