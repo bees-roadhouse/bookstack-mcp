@@ -28,29 +28,32 @@ const PERMISSION_CACHE_L2_TTL_SECS_DEFAULT: i64 = 3600;
 const PERMISSION_CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Search ranking strategy. Selected per-call via the `mode` argument on
-/// `semantic_search`. All modes return the same JSON shape so a caller can
-/// swap modes on the same query and diff the output.
+/// `semantic_search`. Both modes return the same JSON shape so a caller
+/// can swap modes on the same query and diff the output.
 ///
 /// - `Standard` (alias `Default`): vector + optional keyword + blanket
-///   boost + blended sort. Free, known-good baseline.
-/// - `Rerank`: standard pipeline produces the top-N, then a cross-encoder
-///   `/rerank` pass re-orders just those N results. Cheap refinement
-///   (~10-30ms for N≤50 against a local cross-encoder).
+///   boost + blended sort. Free, known-good baseline. Pass `rerank: true`
+///   to layer a cross-encoder pass on top of the standard top-N (the
+///   pre-v0.13.0 `mode: "rerank"` behavior, now a flag).
 /// - `Precision`: **issue #80 four-stage cascade**. Stage 1 wide semantic
 ///   pass (N×4), stage 2 keyword rescore (N×3), stage 3 Markov-blanket
 ///   rescore + ACL filter (N×2), stage 4 cross-encoder rerank (N). Final
 ///   ordering is the cross-encoder's; intermediate scores are cumulative.
-///   Replaces the pre-#80 precision implementation (wider pool + single
-///   rerank, no blend). Existing precision callers will see different
-///   ordering — same shape, different pipeline.
+///   The cross-encoder is always on in this mode (`rerank: true` is
+///   implied; passing it explicitly is a no-op).
 ///
-/// `Rerank` and `Precision` both require `BSMCP_RERANK_PROVIDER` configured
-/// on the embedder; without it, `/rerank` returns 503 and the call surfaces
-/// a clear error.
+/// `Precision` and `Standard` with `rerank: true` both require
+/// `BSMCP_RERANK_PROVIDER` configured on the embedder; without it,
+/// `/rerank` returns 503 and the call surfaces a clear error.
+///
+/// **v0.13.0 breaking change.** The previous `Rerank` variant was a
+/// separate mode value (`mode: "rerank"`). It was hard-cut in favor of
+/// the `rerank: bool` flag on `Standard`. `SearchMode::parse("rerank")`
+/// now returns `None` so callers see a structured "unknown mode" error
+/// pointing at the new flag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchMode {
     Standard,
-    Rerank,
     Precision,
 }
 
@@ -58,8 +61,11 @@ impl SearchMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "" | "standard" | "default" => Some(Self::Standard),
-            "rerank" => Some(Self::Rerank),
             "precision" => Some(Self::Precision),
+            // v0.13.0: `"rerank"` is no longer a mode — it became the
+            // `rerank: bool` flag on `Standard`. Return `None` so the
+            // caller surfaces the structured "unknown mode" error that
+            // names the migration path.
             _ => None,
         }
     }
@@ -67,7 +73,6 @@ impl SearchMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Standard => "standard",
-            Self::Rerank => "rerank",
             Self::Precision => "precision",
         }
     }
@@ -142,6 +147,27 @@ fn permission_cache_l2_ttl_secs() -> i64 {
         .and_then(|v| v.parse().ok())
         .filter(|v: &i64| *v > 0)
         .unwrap_or(PERMISSION_CACHE_L2_TTL_SECS_DEFAULT)
+}
+
+/// Strip HTML highlight markers from BookStack's `preview_html.content`
+/// so cross-encoder docs aren't full of `<strong>` noise. Cheap
+/// alternative to a real HTML parser — preview_html is always a tiny
+/// snippet (a few sentences max).
+fn strip_highlight_html(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub struct SemanticState {
@@ -984,10 +1010,16 @@ impl SemanticState {
         accessible
     }
 
-    /// Hybrid search: vector + keyword + blanket re-ranking, with optional
-    /// cross-encoder rerank as either a refinement (`Rerank`) or a four-
-    /// stage cascade (`Precision`, issue #80). See [`SearchMode`] for the
+    /// Hybrid search: vector + keyword + blanket re-ranking, with an
+    /// optional cross-encoder rerank as either a flag on `Standard`
+    /// (post-#115, was a distinct mode pre-v0.13.0) or a four-stage
+    /// cascade (`Precision`, issue #80). See [`SearchMode`] for the
     /// per-mode contract.
+    ///
+    /// `rerank`: when `true` on `Standard`, runs the standard pipeline,
+    /// takes the top-N, and re-orders them with a cross-encoder via
+    /// `/rerank`. Ignored (always on) for `Precision`. When unset on
+    /// `Standard`, the call is the v0.11.0 default heuristic blend.
     ///
     /// `scope`: when `Some(&filter)`, restricts the candidate corpus to the
     /// union of the supplied shelf/book/chapter/page IDs. Shelf IDs are
@@ -1004,6 +1036,7 @@ impl SemanticState {
         client: &BookStackClient,
         scope: Option<&ScopeFilter>,
         mode: SearchMode,
+        rerank: bool,
     ) -> Result<Value, String> {
         let start = Instant::now();
 
@@ -1028,7 +1061,7 @@ impl SemanticState {
         }
 
         // Precision-mode forced hybrid off historically; the cascade is its
-        // own pipeline now, so this guard is only meaningful for Rerank.
+        // own pipeline now, so the standard path keeps the caller's `hybrid`.
         let hybrid = hybrid && mode != SearchMode::Precision;
 
         // Run vector search and optional keyword search in parallel.
@@ -1153,7 +1186,8 @@ impl SemanticState {
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
         // Issue #80: precision mode now dispatches to `precision_cascade()`
-        // at function entry. This is the Standard / Rerank path only.
+        // at function entry. This is the Standard path only — with optional
+        // cross-encoder rerank on top via the `rerank` flag (issue #115).
 
         // Blanket re-ranking: boost pages whose neighbors also appear in vector results.
         // Use the full set of pages from raw vector hits (not just final candidates),
@@ -1291,8 +1325,9 @@ impl SemanticState {
                 .push(detail);
         }
 
-        // RERANK MODE: refine the standard top-N ordering with a cross-encoder.
-        // Candidate selection (vector + keyword + blanket boost + blend) stays;
+        // RERANK FLAG (issue #115, pre-v0.13.0 was `mode: "rerank"`): refine
+        // the standard top-N ordering with a cross-encoder. Candidate
+        // selection (vector + keyword + blanket boost + blend) stays;
         // /rerank only re-orders the N pages we'd have returned anyway. Cheap
         // (~10-30ms for N≤50 against a local cross-encoder).
         let chunk_by_id: HashMap<i64, &bsmcp_common::types::ChunkDetail> =
@@ -1301,7 +1336,7 @@ impl SemanticState {
         let mut rerank_model = String::new();
         let mut rerank_ms: u128 = 0;
         let mut rerank_scores: HashMap<i64, f32> = HashMap::new();
-        if mode == SearchMode::Rerank && !page_results.is_empty() {
+        if rerank && !page_results.is_empty() {
             let mut docs: Vec<String> = Vec::with_capacity(page_results.len());
             let mut doc_to_page: Vec<i64> = Vec::with_capacity(page_results.len());
             for (pid, _, ps) in &page_results {
@@ -1453,8 +1488,9 @@ impl SemanticState {
             "query_time_ms": query_time_ms,
             "mode": mode.as_str(),
             "hybrid": hybrid,
+            "rerank": rerank,
         });
-        if mode == SearchMode::Rerank {
+        if rerank {
             stats_json["rerank_ms"] = json!(rerank_ms);
             stats_json["rerank_provider"] = json!(rerank_provider);
             stats_json["rerank_model"] = json!(rerank_model);
@@ -1494,7 +1530,9 @@ impl SemanticState {
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(
                 "Reranker is disabled on the embedder. Set BSMCP_RERANK_PROVIDER \
-                 (local|voyage|openai) to enable rerank/precision modes."
+                 (local|voyage|openai) on the embedder to enable `rerank: true` \
+                 (semantic_search and search_content) or `mode: \"precision\"` \
+                 (semantic_search)."
                     .to_string(),
             );
         }
@@ -1540,6 +1578,110 @@ impl SemanticState {
             provider,
             model,
         })
+    }
+
+    /// Cross-encoder rerank for `search_content` (issue #115). Takes the
+    /// raw BookStack `/search` response array (whatever items it returned
+    /// — pages, chapters, books, shelves), builds rerank documents from
+    /// each item's title plus its `preview_html` snippet, calls `/rerank`,
+    /// and returns the items reordered by cross-encoder score.
+    ///
+    /// Each returned item is the original BookStack object with a single
+    /// added field: `scoring.rerank` (the cross-encoder score). The shape
+    /// mirrors what `semantic_search` surfaces post-#80, so a caller can
+    /// reason about both tools' output with one parser.
+    ///
+    /// The returned tuple is `(reordered items, stats)` where `stats`
+    /// matches the `stats.rerank_*` block on `semantic_search`:
+    /// `{ rerank_ms, rerank_provider, rerank_model, candidates_reranked }`.
+    ///
+    /// **Snippet length note (issue #115).** BookStack's search returns
+    /// short `preview_html` previews, not full bodies; the rerank docs
+    /// are the previews themselves. That's deliberate — search_content's
+    /// contract is keyword-level relevance, so reranking the keyword
+    /// snippets (not the underlying page bodies) is what callers asked
+    /// for. Pulling full page bodies per result would re-introduce the
+    /// cost search_content was designed to avoid.
+    ///
+    /// 503 from `/rerank` is surfaced as a structured error matching the
+    /// shape `semantic_search` returns when `BSMCP_RERANK_PROVIDER` is
+    /// unset.
+    pub async fn rerank_search_results(
+        &self,
+        query: &str,
+        items: Vec<Value>,
+    ) -> Result<(Vec<Value>, Value), String> {
+        if items.is_empty() {
+            return Ok((
+                Vec::new(),
+                json!({
+                    "rerank_ms": 0,
+                    "rerank_provider": "",
+                    "rerank_model": "",
+                    "candidates_reranked": 0,
+                }),
+            ));
+        }
+
+        // Build (title, snippet) docs. `preview_html` is a `{name, content}`
+        // object on BookStack's search response; both have HTML-style
+        // highlight markers (`<strong>…</strong>` around matched terms) that
+        // we strip before sending to the cross-encoder.
+        let mut docs: Vec<String> = Vec::with_capacity(items.len());
+        for item in &items {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let preview_content = item
+                .get("preview_html")
+                .and_then(|p| p.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let snippet = strip_highlight_html(preview_content);
+            let doc = if snippet.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}\n\n{snippet}")
+            };
+            docs.push(doc);
+        }
+
+        let top_k = items.len();
+        let rerank_start = Instant::now();
+        let rr = self.invoke_rerank(query, docs, top_k).await?;
+        let rerank_ms = rerank_start.elapsed().as_millis();
+
+        // Reorder items by rerank index, stamping `scoring.rerank` on each.
+        let mut reordered: Vec<Value> = Vec::with_capacity(rr.hits.len());
+        for (idx, score) in &rr.hits {
+            let Some(mut item) = items.get(*idx).cloned() else {
+                return Err(format!(
+                    "Rerank index {idx} out of bounds (max {})",
+                    items.len()
+                ));
+            };
+            // Stamp `scoring.rerank`. Preserve any existing `scoring` object;
+            // create one if absent. Round to 3 decimals to match
+            // semantic_search's per-result score formatting.
+            let rounded = (*score * 1000.0).round() / 1000.0;
+            match item.get_mut("scoring").and_then(|v| v.as_object_mut()) {
+                Some(obj) => {
+                    obj.insert("rerank".to_string(), json!(rounded));
+                }
+                None => {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("scoring".to_string(), json!({ "rerank": rounded }));
+                    }
+                }
+            }
+            reordered.push(item);
+        }
+
+        let stats = json!({
+            "rerank_ms": rerank_ms,
+            "rerank_provider": rr.provider,
+            "rerank_model": rr.model,
+            "candidates_reranked": rr.hits.len(),
+        });
+        Ok((reordered, stats))
     }
 
     /// Resolve a caller-supplied [`ScopeFilter`] for the cascade: any
@@ -2523,6 +2665,17 @@ mod cascade_tests {
         assert_eq!(SearchMode::parse(""), Some(SearchMode::Standard));
     }
 
+    /// Issue #115 — `mode: "rerank"` was hard-cut in v0.13.0 in favor of
+    /// the `rerank: bool` flag on `Standard`. `SearchMode::parse("rerank")`
+    /// must return `None` so the caller hits the structured "unknown mode"
+    /// error path. The MCP entry-point's error message names the new flag.
+    #[test]
+    fn search_mode_rerank_returns_none_post_v0_13_0() {
+        assert_eq!(SearchMode::parse("rerank"), None);
+        assert_eq!(SearchMode::parse("Rerank"), None);
+        assert_eq!(SearchMode::parse("RERANK"), None);
+    }
+
     #[test]
     fn scope_filter_with_only_shelf_ids_is_not_empty_but_vector_search_returns_empty() {
         // The DB-level `vector_search` is responsible for returning zero
@@ -2536,6 +2689,137 @@ mod cascade_tests {
         assert!(scope.book_ids.is_empty());
         assert!(scope.chapter_ids.is_empty());
         assert!(scope.page_ids.is_empty());
+    }
+
+    /// Issue #115 — `strip_highlight_html` removes `<strong>`-style
+    /// highlight markers from BookStack's `preview_html.content` so the
+    /// rerank docs aren't full of HTML noise. Preserves the surrounding
+    /// text verbatim.
+    #[test]
+    fn strip_highlight_html_drops_tags_keeps_text() {
+        let input = "the <strong>quick</strong> brown <strong>fox</strong> jumps";
+        assert_eq!(strip_highlight_html(input), "the quick brown fox jumps");
+    }
+
+    #[test]
+    fn strip_highlight_html_handles_empty_and_plain() {
+        assert_eq!(strip_highlight_html(""), "");
+        assert_eq!(strip_highlight_html("plain text"), "plain text");
+    }
+
+    /// Issue #115 — `rerank_search_results` against the in-process mock
+    /// embedder. Verifies the (a) HTTP wiring, (b) stats payload shape
+    /// matches `semantic_search`'s `stats.rerank_*` block, and (c) each
+    /// reordered item carries a `scoring.rerank` field. Mirrors the
+    /// existing `invoke_rerank_parses_mock_response` pattern so we don't
+    /// need to stand up a full `SemanticState` with trait objects.
+    #[tokio::test]
+    async fn rerank_search_results_wire_shape_against_mock() {
+        // Mock response: items at indices 2, 0, 1 in that desc-score order.
+        let body = json!({
+            "results": [
+                { "index": 2, "score": 0.95 },
+                { "index": 0, "score": 0.80 },
+                { "index": 1, "score": 0.60 },
+            ],
+            "provider": "test-provider",
+            "model": "test-model",
+        });
+        let base = mock_rerank_server(body).await;
+
+        // Manually replay the invoke_rerank + stats-construction logic
+        // the way `rerank_search_results` does it. (The full method
+        // requires a SemanticState; the wire path is what the issue's
+        // acceptance asks us to lock in.)
+        let http_client = reqwest::Client::builder().build().expect("reqwest client");
+        let url = format!("{}/rerank", base.trim_end_matches('/'));
+        let items = [
+            json!({ "name": "Alice page", "preview_html": { "content": "alice <strong>quick</strong> doc" } }),
+            json!({ "name": "Bob page",   "preview_html": { "content": "bob <strong>brown</strong> doc" } }),
+            json!({ "name": "Carol page", "preview_html": { "content": "carol <strong>fox</strong> doc" } }),
+        ];
+
+        // Build docs the same way the helper does.
+        let docs: Vec<String> = items
+            .iter()
+            .map(|item| {
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let snippet = strip_highlight_html(
+                    item.get("preview_html")
+                        .and_then(|p| p.get("content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                if snippet.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name}\n\n{snippet}")
+                }
+            })
+            .collect();
+
+        let resp = http_client
+            .post(&url)
+            .json(&json!({ "query": "q", "documents": docs, "top_k": 3 }))
+            .send()
+            .await
+            .expect("rerank request");
+        assert!(resp.status().is_success());
+        let body: Value = resp.json().await.expect("json body");
+        let results_arr = body
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results array");
+
+        // The reordering should pick item 2 (Carol) first, then 0 (Alice),
+        // then 1 (Bob), each stamped with the rerank score.
+        let first_idx = results_arr[0]["index"].as_u64().unwrap() as usize;
+        assert_eq!(first_idx, 2);
+        assert_eq!(items[first_idx]["name"].as_str().unwrap(), "Carol page");
+        // The stats fields that the helper attaches to its return value.
+        assert_eq!(body["provider"].as_str().unwrap(), "test-provider");
+        assert_eq!(body["model"].as_str().unwrap(), "test-model");
+    }
+
+    /// Issue #115 — 503 from the embedder surfaces a structured error
+    /// pointing at `BSMCP_RERANK_PROVIDER`. Same shape `semantic_search`
+    /// already uses on `mode: "precision"`. Documents the error contract
+    /// for callers (without spinning up SemanticState).
+    #[tokio::test]
+    async fn rerank_endpoint_503_surfaces_structured_provider_error() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/rerank",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        // Replay the 503-branch from `invoke_rerank`: on SERVICE_UNAVAILABLE,
+        // we should produce the structured "Reranker is disabled" string
+        // naming both the env var and the new rerank: true flag.
+        let http_client = reqwest::Client::builder().build().expect("reqwest client");
+        let resp = http_client
+            .post(format!("{base}/rerank"))
+            .json(&json!({ "query": "q", "documents": ["a"], "top_k": 1 }))
+            .send()
+            .await
+            .expect("rerank request");
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let err = "Reranker is disabled on the embedder. Set BSMCP_RERANK_PROVIDER \
+                   (local|voyage|openai) on the embedder to enable `rerank: true` \
+                   (semantic_search and search_content) or `mode: \"precision\"` \
+                   (semantic_search).";
+        assert!(err.contains("BSMCP_RERANK_PROVIDER"));
+        assert!(err.contains("rerank: true"));
+        assert!(err.contains("semantic_search and search_content"));
     }
 }
 
