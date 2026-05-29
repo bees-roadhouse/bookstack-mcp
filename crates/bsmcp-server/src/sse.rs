@@ -442,7 +442,7 @@ pub async fn handle_message(
         }
     };
 
-    let semantic = state.semantic.as_deref();
+    let semantic = state.semantic.as_ref();
     let response = mcp::handle_request(
         &request,
         &client,
@@ -532,7 +532,7 @@ pub async fn handle_streamable(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let semantic = state.semantic.as_deref();
+    let semantic = state.semantic.as_ref();
 
     // Streamable HTTP 2025-03-26: the `Mcp-Session-Id` header is minted on
     // initialize (below) and echoed by the client on every subsequent

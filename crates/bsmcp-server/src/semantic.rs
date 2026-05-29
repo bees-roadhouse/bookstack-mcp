@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -182,12 +183,57 @@ pub struct SemanticState {
     /// recompute doesn't reissue the `list_roles` + per-role detail fetch on
     /// every search. 5 min TTL — roles change rarely.
     role_ctx_cache: RwLock<Option<CachedRoleContext>>,
+    /// In-flight HTTP-check coalescing map (issue #58 lever c). Keyed by
+    /// `(token_hash, page_id)`; concurrent searches asking about the same
+    /// page reuse the running future via `futures::future::Shared` instead
+    /// of issuing a duplicate `can_access_page` call.
+    acl_http_inflight: InflightCheckMap,
 }
 
 /// Cap on the in-flight set per [`SemanticState`]. When a single search
 /// produces more uncomputed pages than this, the spawner queues a global
 /// `acl_reconcile` job and bails instead of fanning out per-page tasks.
 const ACL_RECOMPUTE_INFLIGHT_CAP: usize = 200;
+
+/// Default concurrency for the HTTP fan-out fallback (issue #58 lever c).
+/// Override with `BSMCP_ACL_HTTP_CONCURRENCY`. Matches the pre-#58 value;
+/// env tunability lets ops bump or shrink on the live instance without
+/// redeploy.
+const ACL_HTTP_CONCURRENCY_DEFAULT: usize = 25;
+
+/// Default per-page-check timeout for the HTTP fallback (issue #58 lever c).
+/// Override with `BSMCP_ACL_HTTP_TIMEOUT_SECS`. Tighter than the 60s shared
+/// HTTP client timeout so one slow page can't hold the whole fan-out.
+const ACL_HTTP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
+fn acl_http_concurrency() -> usize {
+    std::env::var("BSMCP_ACL_HTTP_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .unwrap_or(ACL_HTTP_CONCURRENCY_DEFAULT)
+}
+
+fn acl_http_timeout() -> Duration {
+    std::env::var("BSMCP_ACL_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(ACL_HTTP_TIMEOUT_DEFAULT)
+}
+
+/// In-flight HTTP-check map for request coalescing (issue #58 lever c).
+/// When two concurrent searches reach the HTTP fallback for the same
+/// `(token_hash, page_id)`, the second one joins the first's future
+/// instead of issuing a duplicate `can_access_page` call.
+///
+/// The value is a [`Shared`] future producing the access decision. The
+/// underlying work runs once via `tokio::spawn`; multiple awaiters get
+/// clones of the shared handle. The spawner cleans up its own slot on
+/// completion via the cleanup closure inside [`coalesced_can_access_page`].
+type InflightCheckMap =
+    tokio::sync::Mutex<HashMap<(String, i64), Shared<BoxFuture<'static, bool>>>>;
 /// Max concurrent `reconcile_page` HTTP calls per kick. Each call is ~3
 /// `get_content_permissions` requests; 5 keeps the background load below
 /// foreground search budget.
@@ -231,7 +277,69 @@ impl SemanticState {
             role_id_cache: RwLock::new(HashMap::new()),
             acl_recompute_inflight: RwLock::new(HashSet::new()),
             role_ctx_cache: RwLock::new(None),
+            acl_http_inflight: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Coalesced + timeout-capped HTTP page-access check (issue #58 lever c).
+    ///
+    /// If another concurrent caller is already running `can_access_page`
+    /// for `(token_hash, page_id)`, joins that running future via
+    /// [`Shared`] instead of firing a duplicate request. The first caller
+    /// inserts a fresh shared future, runs it, removes the slot when done,
+    /// and returns the result.
+    ///
+    /// Wrapped in `tokio::time::timeout` with the per-page timeout from
+    /// [`acl_http_timeout`]. A timeout is treated as a deny — same as the
+    /// pre-#58 behavior when BookStack returned a non-success response —
+    /// plus a structured warning log so the bake numbers stay observable.
+    pub(crate) async fn coalesced_can_access_page(
+        self: &Arc<Self>,
+        token_hash: &str,
+        page_id: i64,
+        client: BookStackClient,
+    ) -> bool {
+        let key = (token_hash.to_string(), page_id);
+        let (fut, is_owner) = {
+            let mut map = self.acl_http_inflight.lock().await;
+            if let Some(existing) = map.get(&key) {
+                (existing.clone(), false)
+            } else {
+                let timeout = acl_http_timeout();
+                let client_for_fut = client;
+                let work = async move {
+                    match tokio::time::timeout(timeout, client_for_fut.can_access_page(page_id))
+                        .await
+                    {
+                        Ok(ok) => ok,
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "acl_filter",
+                                page_id,
+                                timeout_ms = timeout.as_millis() as u64,
+                                "acl_http_check_timeout"
+                            );
+                            false
+                        }
+                    }
+                };
+                let fut: Shared<BoxFuture<'static, bool>> = work.boxed().shared();
+                map.insert(key.clone(), fut.clone());
+                (fut, true)
+            }
+        };
+
+        let result = fut.await;
+
+        if is_owner {
+            // Best-effort cleanup. If a concurrent caller saw the same slot
+            // and entered the joiner branch, they cloned the shared future
+            // before we removed it — both paths still return the same value.
+            let mut map = self.acl_http_inflight.lock().await;
+            map.remove(&key);
+        }
+
+        result
     }
 
     /// Fire-and-forget background recompute for pages the prefilter
@@ -717,17 +825,15 @@ impl SemanticState {
         let mut prefilter_uncomputed: usize = 0;
         let mut recompute_candidates: Vec<i64> = Vec::new();
         if !uncached_ids.is_empty() {
-            if let Some(role_ids) = self
-                .resolve_caller_role_ids(client, &token_hash)
-                .await
-            {
+            if let Some(role_ids) = self.resolve_caller_role_ids(client, &token_hash).await {
                 match self
                     .db
                     .prefilter_pages_by_roles(&uncached_ids, &role_ids)
                     .await
                 {
                     Ok(verdicts) => {
-                        let verdict_map: HashMap<i64, AclPrefilter> = verdicts.into_iter().collect();
+                        let verdict_map: HashMap<i64, AclPrefilter> =
+                            verdicts.into_iter().collect();
                         let mut still_pending: Vec<i64> = Vec::with_capacity(uncached_ids.len());
                         // Note: pages missing from `pages` (not embedded) have
                         // no verdict at all; default to Uncomputed (HTTP).
@@ -788,29 +894,30 @@ impl SemanticState {
         let mut http_fallback_ms: u128 = 0;
 
         if !uncached_ids.is_empty() {
-            // Check each page individually with concurrency limit. Bumped from
-            // 10 → 25 because the cold-cache permission filter is the dominant
-            // cost in semantic search; BookStack handles the burst comfortably.
+            // Coalesced + bounded HTTP fan-out (issue #58 lever c).
+            // `buffer_unordered` replaces the pre-#58 manual spawn + JoinHandle
+            // vec + Semaphore; same effect, env-tunable, cleaner shutdown.
+            // `coalesced_can_access_page` shares an in-flight future across
+            // concurrent searches asking about the same page id, and wraps the
+            // call in a 5s timeout so one slow page can't hold the whole pool.
             let http_start = Instant::now();
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(25));
-            let mut handles = Vec::new();
-
-            for pid in uncached_ids.clone() {
-                let client = client.clone();
-                let sem = semaphore.clone();
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await;
-                    let ok = client.can_access_page(pid).await;
-                    (pid, ok)
-                }));
-            }
-
-            let mut results: Vec<(i64, bool)> = Vec::new();
-            for handle in handles {
-                if let Ok(result) = handle.await {
-                    results.push(result);
-                }
-            }
+            let concurrency = acl_http_concurrency();
+            let me = self.clone();
+            let token_hash_clone = token_hash.clone();
+            let client = client.clone();
+            let results: Vec<(i64, bool)> = stream::iter(uncached_ids.clone())
+                .map(|pid| {
+                    let me = me.clone();
+                    let token_hash = token_hash_clone.clone();
+                    let client = client.clone();
+                    async move {
+                        let ok = me.coalesced_can_access_page(&token_hash, pid, client).await;
+                        (pid, ok)
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
             http_fallback_fired = results.len();
             http_fallback_ms = http_start.elapsed().as_millis();
 
@@ -2762,9 +2869,7 @@ mod acl_fanout_tests {
         ));
         let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
 
-        let accessible = state
-            .filter_by_permission(&[1, 2, 3, 4, 5], &client)
-            .await;
+        let accessible = state.filter_by_permission(&[1, 2, 3, 4, 5], &client).await;
         let mut sorted = accessible;
         sorted.sort();
         // Page 1+2 allowed via prefilter, page 3 denied via prefilter,
@@ -2898,6 +3003,115 @@ mod acl_fanout_tests {
         let _ = before; // silence dead-code lint on unused total_pages
     }
 
+    /// Lever c — request coalescing. Two concurrent searches asking
+    /// about the same `(token_hash, page_id)` must share the in-flight
+    /// `can_access_page` call instead of duplicating it. Verified by
+    /// driving the coalesced helper with a slow mock that holds each
+    /// response for ~50ms, then asserting the mock saw fewer HTTP hits
+    /// than the number of awaiters.
+    #[tokio::test]
+    async fn coalesced_can_access_page_dedups_concurrent_callers() {
+        use axum::extract::Path;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::Router;
+
+        let counter: StdArc<AtomicUsize> = StdArc::new(AtomicUsize::new(0));
+        let ctr = counter.clone();
+        let app = Router::new().route(
+            "/api/pages/{id}",
+            get(move |Path(_id): Path<i64>| {
+                let ctr = ctr.clone();
+                async move {
+                    ctr.fetch_add(1, Ordering::SeqCst);
+                    // Hold long enough that concurrent callers overlap. The
+                    // coalescing path keeps the second + third caller off the
+                    // wire entirely.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({"id": 1})),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        let state = make_state("coalesce", "http://unused".to_string()).await;
+        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+
+        let s1 = state.clone();
+        let c1 = client.clone();
+        let s2 = state.clone();
+        let c2 = client.clone();
+        let s3 = state.clone();
+        let c3 = client.clone();
+
+        let token_hash = hash_token_id(client.token_id());
+        let token_hash_1 = token_hash.clone();
+        let token_hash_2 = token_hash.clone();
+        let token_hash_3 = token_hash.clone();
+
+        let (r1, r2, r3) = tokio::join!(
+            tokio::spawn(async move { s1.coalesced_can_access_page(&token_hash_1, 1, c1).await }),
+            tokio::spawn(async move { s2.coalesced_can_access_page(&token_hash_2, 1, c2).await }),
+            tokio::spawn(async move { s3.coalesced_can_access_page(&token_hash_3, 1, c3).await }),
+        );
+        assert!(r1.unwrap());
+        assert!(r2.unwrap());
+        assert!(r3.unwrap());
+        // Coalescing should cap HTTP calls below the 3-caller count. In
+        // practice the second + third are guaranteed to find the shared
+        // future under the mutex, so the mock sees exactly 1.
+        let observed = counter.load(Ordering::SeqCst);
+        assert!(
+            observed < 3,
+            "coalescing should suppress duplicate HTTP — saw {observed} hits for 3 concurrent callers"
+        );
+    }
+
+    /// Lever c — per-page timeout returns deny without holding the fan-out.
+    /// Verified by pointing the client at a server that never responds and
+    /// asserting the call finishes within the timeout budget with a deny.
+    #[tokio::test]
+    async fn coalesced_can_access_page_times_out_to_deny() {
+        // Bind a listener and never accept — connect attempts succeed but
+        // the response never arrives. With the 5s default that's still too
+        // slow for a unit test; lower it via env override for this call.
+        std::env::set_var("BSMCP_ACL_HTTP_TIMEOUT_SECS", "1");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        // Accept but never respond — keeps the connection open forever.
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let base = format!("http://{addr}");
+        let state = make_state("timeout", "http://unused".to_string()).await;
+        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+        let token_hash = hash_token_id(client.token_id());
+
+        let started = Instant::now();
+        let ok = state
+            .coalesced_can_access_page(&token_hash, 1, client)
+            .await;
+        let elapsed = started.elapsed();
+        std::env::remove_var("BSMCP_ACL_HTTP_TIMEOUT_SECS");
+        assert!(!ok, "timeout should deny");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout should bound elapsed time; saw {elapsed:?}"
+        );
+    }
+
     /// Lever a — durable L2 cache. Verifies that warm-cache after restart
     /// (simulated by constructing a fresh `SemanticState` on the same
     /// sqlite path) skips the HTTP fan-out entirely.
@@ -2924,9 +3138,7 @@ mod acl_fanout_tests {
                 "test-webhook-secret-16chars".to_string(),
             ));
             let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
-            let r = state
-                .filter_by_permission(&[10i64, 11, 12], &client)
-                .await;
+            let r = state.filter_by_permission(&[10i64, 11, 12], &client).await;
             let mut sorted = r;
             sorted.sort();
             assert_eq!(sorted, vec![10, 11]);
@@ -2952,9 +3164,7 @@ mod acl_fanout_tests {
                 "test-webhook-secret-16chars".to_string(),
             ));
             let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
-            let r = state
-                .filter_by_permission(&[10i64, 11, 12], &client)
-                .await;
+            let r = state.filter_by_permission(&[10i64, 11, 12], &client).await;
             let mut sorted = r;
             sorted.sort();
             assert_eq!(sorted, vec![10, 11]);
