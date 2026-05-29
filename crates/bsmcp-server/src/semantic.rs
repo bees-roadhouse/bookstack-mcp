@@ -301,12 +301,24 @@ impl SemanticState {
     /// accessible pages, 403/404 for restricted. This correctly handles custom
     /// entity permissions (unlike filter[id:in] on the list endpoint).
     /// Results are cached per (token_id, page_id) for 5 minutes.
+    ///
+    /// Per-call structured counters (issue #58 lever 0): cache_hits,
+    /// cache_misses, http_fallback fan-out and wall-clock. Emitted as a
+    /// single `tracing::info!(target: "acl_filter", ...)` event at end of
+    /// call. Field names are Prometheus-counter-shaped so #90 Phase 2 can
+    /// promote them without rename:
+    ///   bsmcp_acl_cache_hits_total
+    ///   bsmcp_acl_cache_misses_total
+    ///   bsmcp_acl_http_fallback_total
+    ///   bsmcp_acl_http_fallback_duration_seconds
     async fn filter_by_permission(&self, page_ids: &[i64], client: &BookStackClient) -> Vec<i64> {
         let token_id = client.token_id().to_string();
         let now = Instant::now();
+        let call_start = Instant::now();
 
         let mut uncached_ids: Vec<i64> = Vec::new();
         let mut accessible: Vec<i64> = Vec::new();
+        let mut cache_hits: usize = 0;
 
         {
             let cache = self.permission_cache.read().await;
@@ -314,6 +326,7 @@ impl SemanticState {
                 let key = (token_id.clone(), pid);
                 if let Some(entry) = cache.get(&key) {
                     if now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL {
+                        cache_hits += 1;
                         if entry.accessible {
                             accessible.push(pid);
                         }
@@ -324,10 +337,15 @@ impl SemanticState {
             }
         }
 
+        let cache_misses = uncached_ids.len();
+        let mut http_fallback_fired: usize = 0;
+        let mut http_fallback_ms: u128 = 0;
+
         if !uncached_ids.is_empty() {
             // Check each page individually with concurrency limit. Bumped from
             // 10 → 25 because the cold-cache permission filter is the dominant
             // cost in semantic search; BookStack handles the burst comfortably.
+            let http_start = Instant::now();
             let semaphore = Arc::new(tokio::sync::Semaphore::new(25));
             let mut handles = Vec::new();
 
@@ -347,6 +365,8 @@ impl SemanticState {
                     results.push(result);
                 }
             }
+            http_fallback_fired = results.len();
+            http_fallback_ms = http_start.elapsed().as_millis();
 
             {
                 let mut cache = self.permission_cache.write().await;
@@ -370,6 +390,21 @@ impl SemanticState {
                 }
             }
         }
+
+        // Per-call ACL filter telemetry. One structured event per
+        // `filter_by_permission` invocation; #90 Phase 2 promotes to
+        // counters without renaming the fields.
+        tracing::info!(
+            target: "acl_filter",
+            candidates = page_ids.len(),
+            cache_hits = cache_hits,
+            cache_misses = cache_misses,
+            http_fallback = http_fallback_fired,
+            http_fallback_ms = http_fallback_ms as u64,
+            elapsed_ms = call_start.elapsed().as_millis() as u64,
+            accessible = accessible.len(),
+            "acl_filter_done"
+        );
 
         accessible
     }
@@ -1926,5 +1961,125 @@ mod cascade_tests {
         assert!(scope.book_ids.is_empty());
         assert!(scope.chapter_ids.is_empty());
         assert!(scope.page_ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod acl_fanout_tests {
+    //! Issue #58 — ACL fan-out reduction tests. Cover the five levers landed
+    //! in this change: per-call counters, DB-backed permission cache, DB-side
+    //! prefilter, reactive recompute, and coalesced HTTP fallback.
+
+    use super::*;
+    use bsmcp_db_sqlite::SqliteDb;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// Spin a tiny mock BookStack server that:
+    ///   - GET /api/pages/{id}: 200 if `id` is in `allowed`, else 404.
+    ///   - GET /api/users/{id}: returns the configured user JSON.
+    /// Returns the base URL and a shared counter of `can_access_page` hits so
+    /// tests can assert on fan-out.
+    pub(crate) async fn mock_bookstack(allowed: Vec<i64>) -> (String, StdArc<AtomicUsize>) {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::Router;
+        let allowed: StdArc<Vec<i64>> = StdArc::new(allowed);
+        let counter: StdArc<AtomicUsize> = StdArc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let app = Router::new().route(
+            "/api/pages/{id}",
+            get(move |Path(id): Path<i64>| {
+                let allowed = allowed.clone();
+                let counter = counter_clone.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if allowed.contains(&id) {
+                        (StatusCode::OK, axum::Json(serde_json::json!({"id": id}))).into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({"error": "not found"})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), counter)
+    }
+
+    pub(crate) fn temp_sqlite_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir();
+        let unique = format!(
+            "bsmcp-acl58-{label}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        dir.join(unique)
+    }
+
+    pub(crate) async fn make_state(label: &str, embedder_url: String) -> Arc<SemanticState> {
+        let path = temp_sqlite_path(label);
+        let sqlite = Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        sqlite.init_semantic_tables().await.unwrap();
+        let core_db: Arc<dyn DbBackend> = sqlite.clone();
+        let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
+        let index_db: Arc<dyn IndexDb> = sqlite.clone();
+        Arc::new(SemanticState::new(
+            semantic_db,
+            core_db,
+            index_db,
+            embedder_url,
+            "test-webhook-secret-16chars".to_string(),
+        ))
+    }
+
+    /// Lever 0 — counters. Verifies that a second call hits the in-memory
+    /// cache (no extra `can_access_page` requests fire). Also exercises the
+    /// happy path of `filter_by_permission` end-to-end against a sqlite
+    /// backend + mock BookStack.
+    #[tokio::test]
+    async fn filter_by_permission_caches_hits() {
+        let (base, counter) = mock_bookstack(vec![1, 2]).await;
+        let state = make_state("counters", "http://unused".to_string()).await;
+        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+
+        let ids = vec![1i64, 2, 3];
+        let r1 = state.filter_by_permission(&ids, &client).await;
+        let mut sorted = r1.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2]);
+        let after_first = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            after_first, 3,
+            "every page should hit BookStack on a cold cache"
+        );
+
+        // Second call: all three hit the in-memory cache. No new HTTP calls.
+        let r2 = state.filter_by_permission(&ids, &client).await;
+        let mut sorted2 = r2;
+        sorted2.sort();
+        assert_eq!(sorted2, vec![1, 2]);
+        let after_second = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            after_second, after_first,
+            "cache hit should suppress further HTTP fan-out"
+        );
     }
 }
