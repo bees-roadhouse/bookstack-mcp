@@ -122,8 +122,7 @@ Browser-based admin config page. Token-gated via the `/authorize` form — when 
 
 The page is admin-only — non-admin saves silently drop every field. Surfaces only the global server fields the index worker still needs:
 
-- `hive_shelf_id`
-- `user_journals_shelf_id`
+- `indexed_shelves` — comma-separated shelf IDs the full walk crawls. Empty = walk every visible shelf (the v0.13.0 default for fresh deployments; replaces the v0.12.x `hive_shelf_id` + `user_journals_shelf_id` fields per #119).
 
 There is no MCP write path for global settings — they must be configured via `/settings` by an admin. Per-user settings have been removed; the server holds no per-caller state beyond OAuth tokens.
 

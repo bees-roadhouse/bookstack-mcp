@@ -133,10 +133,11 @@ pub async fn handle_settings_get(State(state): State<AppState>, headers: HeaderM
 
 #[derive(Deserialize, Default)]
 pub struct SettingsForm {
+    // Issue #119 — single comma-separated integer list. Empty input = walk
+    // every visible shelf (the new default). Replaces the v0.12.x
+    // hive_shelf_id + user_journals_shelf_id named inputs.
     #[serde(default)]
-    pub hive_shelf_id: Option<String>,
-    #[serde(default)]
-    pub user_journals_shelf_id: Option<String>,
+    pub indexed_shelves: Option<String>,
     // Issue #80 — cascade multipliers + named scopes. Multipliers come in
     // as four separate number inputs; kb_scopes is a single JSON textarea
     // because the shape is open-ended (HashMap<String, ScopeDef>).
@@ -174,8 +175,10 @@ pub async fn handle_settings_post(
     let is_admin = bs_client.is_admin().await.unwrap_or(false);
     if is_admin {
         let mut globals = state.db.get_global_settings().await.unwrap_or_default();
-        globals.hive_shelf_id = parse_optional_i64(&form.hive_shelf_id);
-        globals.user_journals_shelf_id = parse_optional_i64(&form.user_journals_shelf_id);
+        // Issue #119 — parse comma-separated integer list. Malformed entries
+        // (non-numeric tokens, garbage) are dropped silently; empty input
+        // becomes an empty Vec, the walk-all sentinel.
+        globals.indexed_shelves = parse_indexed_shelves(&form.indexed_shelves);
 
         // Issue #80 — cascade multipliers. An empty input keeps the existing
         // value (so partial form posts don't accidentally reset the cascade
@@ -246,11 +249,19 @@ pub async fn handle_settings_probe_post(
 
 // --- Form parsing helpers ---
 
-fn parse_optional_i64(v: &Option<String>) -> Option<i64> {
+/// Parse the comma-separated `indexed_shelves` form field into a clean
+/// `Vec<i64>`. Empty / whitespace-only input → empty Vec (the walk-all
+/// sentinel). Garbage tokens (non-numeric) are silently dropped — the
+/// form is admin-only and round-trips through the input on render, so an
+/// operator can see what the parser kept. Issue #119.
+fn parse_indexed_shelves(v: &Option<String>) -> Vec<i64> {
     v.as_deref()
+        .unwrap_or("")
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok())
+        .filter_map(|s| s.parse::<i64>().ok())
+        .collect()
 }
 
 fn parse_optional_u32(v: &Option<String>) -> Option<u32> {
@@ -274,6 +285,12 @@ fn render_settings_page(g: &GlobalSettings) -> String {
     } else {
         serde_json::to_string_pretty(&g.kb_scopes).unwrap_or_default()
     };
+    let indexed_shelves_csv = g
+        .indexed_shelves
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -287,6 +304,7 @@ h2 {{ margin-top: 2em; border-bottom: 1px solid #ddd; padding-bottom: 0.2em; }}
 .note {{ color: #666; font-size: 0.9em; }}
 label {{ display: block; margin: 0.8em 0 0.3em; font-weight: 600; }}
 input[type=number] {{ padding: 0.5em; box-sizing: border-box; font-family: inherit; width: 8em; }}
+input[type=text] {{ width: 100%; padding: 0.5em; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.9em; }}
 textarea {{ width: 100%; min-height: 8em; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.9em; padding: 0.5em; }}
 .help {{ font-size: 0.85em; color: #555; margin-top: 0.2em; }}
 .row {{ display: flex; gap: 1em; flex-wrap: wrap; }}
@@ -300,10 +318,14 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
 <p class="note">Admin-only global server config. Non-admin saves silently drop every field below.</p>
 <form method="post" action="/settings">
   <h2>Index worker</h2>
-  <label>hive_shelf_id <input type="number" name="hive_shelf_id" value="{hive_shelf_id}"></label>
-  <p class="help">Identity-shelf id consumed by the index worker's full walk.</p>
-  <label>user_journals_shelf_id <input type="number" name="user_journals_shelf_id" value="{user_journals_shelf_id}"></label>
-  <p class="help">User-journals-shelf id consumed by the index worker's full walk.</p>
+  <label>Indexed shelves <input type="text" name="indexed_shelves" value="{indexed_shelves}" placeholder="42, 87"></label>
+  <p class="help">
+    Comma-separated shelf IDs the full walk crawls (e.g. <code>42, 87</code>).
+    <strong>Leave empty to walk every shelf the index token can see</strong> — the
+    default for fresh deployments. Replaces the v0.12.x <code>hive_shelf_id</code> +
+    <code>user_journals_shelf_id</code> fields (issue #119); their values were
+    auto-migrated into this list on upgrade.
+  </p>
 
   <h2>Semantic search — precision cascade (issue #80)</h2>
   <p class="help">
@@ -338,11 +360,7 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
 </form>
 </body>
 </html>"#,
-        hive_shelf_id = g.hive_shelf_id.map(|i| i.to_string()).unwrap_or_default(),
-        user_journals_shelf_id = g
-            .user_journals_shelf_id
-            .map(|i| i.to_string())
-            .unwrap_or_default(),
+        indexed_shelves = html_escape(&indexed_shelves_csv),
         cascade_stage1 = g.cascade_multipliers.stage1,
         cascade_stage2 = g.cascade_multipliers.stage2,
         cascade_stage3 = g.cascade_multipliers.stage3,
@@ -353,4 +371,41 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
         cascade_default_stage4 = defaults.stage4,
         kb_scopes_json = html_escape(&kb_scopes_json),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_indexed_shelves_empty_input_yields_empty_vec() {
+        assert!(parse_indexed_shelves(&None).is_empty());
+        assert!(parse_indexed_shelves(&Some(String::new())).is_empty());
+        assert!(parse_indexed_shelves(&Some("   ".to_string())).is_empty());
+        assert!(parse_indexed_shelves(&Some(",,  ,".to_string())).is_empty());
+    }
+
+    #[test]
+    fn parse_indexed_shelves_well_formed_csv() {
+        assert_eq!(
+            parse_indexed_shelves(&Some("42, 87, 100".to_string())),
+            vec![42, 87, 100]
+        );
+        // Whitespace tolerated, order preserved.
+        assert_eq!(
+            parse_indexed_shelves(&Some("  1 ,2,  3  ".to_string())),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn parse_indexed_shelves_drops_garbage_tokens() {
+        // Mix of valid + garbage — valid ones survive in input order.
+        assert_eq!(
+            parse_indexed_shelves(&Some("42, foo, 87, bar, 100".to_string())),
+            vec![42, 87, 100]
+        );
+        // All-garbage input collapses to empty (walk-all sentinel).
+        assert!(parse_indexed_shelves(&Some("foo, bar, baz".to_string())).is_empty());
+    }
 }

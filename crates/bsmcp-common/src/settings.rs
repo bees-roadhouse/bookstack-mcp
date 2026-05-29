@@ -2,15 +2,20 @@
 //!
 //! v0.10.0: dropped per-user `UserSettings` and the briefing-only
 //! `GlobalSettings` fields. The server is now a BookStack CRUD facade plus
-//! semantic search; there is no per-user state to persist. The surviving
-//! `GlobalSettings` covers the fields the index worker still needs
-//! (`hive_shelf_id`, `user_journals_shelf_id`) plus a single behavior
-//! toggle the `/settings` UI exposes.
+//! semantic search; there is no per-user state to persist.
 //!
 //! Issue #80 (v0.13.0): adds `kb_scopes` (named scope cuts callable by name
 //! from `semantic_search`) and `cascade_multipliers` (the 4/3/2/1 stage
 //! pool defaults for precision-mode). Both persist as JSON blobs on the
 //! singleton `global_settings` row.
+//!
+//! Issue #119 (v0.13.0): drops `hive_shelf_id` + `user_journals_shelf_id`
+//! in favor of a generic `indexed_shelves: Vec<i64>`. Empty (default) means
+//! the index worker walks every shelf the index token can see — gives new
+//! deployments useful semantic search out of the box without `/settings`
+//! config. Non-empty restricts the full walk to the named subset. The
+//! migration auto-populates the new field with the union of any old values
+//! on first boot post-upgrade.
 
 use std::collections::HashMap;
 
@@ -162,13 +167,16 @@ impl CascadeMultipliers {
 /// non-admin updates).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GlobalSettings {
-    /// Identity-shelf id consumed by the index worker's full walk.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hive_shelf_id: Option<i64>,
-
-    /// User-journals-shelf id consumed by the index worker's full walk.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_journals_shelf_id: Option<i64>,
+    /// Shelf ids the index worker's full walk crawls. Empty (default) means
+    /// "walk every shelf the index token can see" — useful out-of-the-box
+    /// behavior for fresh deployments. Non-empty restricts the walk to the
+    /// listed shelves, letting operators carve out a scoped corpus.
+    ///
+    /// Replaces the v0.12.x `hive_shelf_id` + `user_journals_shelf_id`
+    /// fields (issue #119). The DB migration auto-populates this with the
+    /// union of any pre-existing values on first read post-upgrade.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexed_shelves: Vec<i64>,
 
     /// Named scope cuts addressable from `semantic_search`'s `scopes` array.
     /// Persisted as a JSON blob on the singleton settings row (issue #80).
@@ -265,7 +273,7 @@ mod tests {
             },
         );
         let g = GlobalSettings {
-            hive_shelf_id: Some(7),
+            indexed_shelves: vec![7, 42],
             kb_scopes: scopes,
             cascade_multipliers: CascadeMultipliers {
                 stage1: 6,
@@ -277,12 +285,36 @@ mod tests {
         };
         let json = serde_json::to_string(&g).expect("serialize");
         let parsed: GlobalSettings = serde_json::from_str(&json).expect("parse");
-        assert_eq!(parsed.hive_shelf_id, Some(7));
+        assert_eq!(parsed.indexed_shelves, vec![7, 42]);
         assert_eq!(parsed.cascade_multipliers.stage1, 6);
         assert_eq!(parsed.kb_scopes.len(), 1);
         assert_eq!(
             parsed.kb_scopes.get("policies").unwrap().book_ids,
             vec![12, 34]
         );
+    }
+
+    /// Issue #119 — empty `indexed_shelves` is the "walk all" sentinel; it
+    /// must round-trip cleanly (and stay skipped on serialize when empty).
+    #[test]
+    fn global_settings_serde_round_trip_empty_indexed_shelves() {
+        let g = GlobalSettings::default();
+        let json = serde_json::to_string(&g).expect("serialize");
+        // Empty Vec is skipped — no "indexed_shelves" key should appear.
+        assert!(
+            !json.contains("indexed_shelves"),
+            "default empty indexed_shelves should be skipped on serialize, got: {json}"
+        );
+        let parsed: GlobalSettings = serde_json::from_str(&json).expect("parse");
+        assert!(parsed.indexed_shelves.is_empty());
+    }
+
+    /// Issue #119 — JSON missing `indexed_shelves` entirely (e.g. a v0.12.x
+    /// row that never carried it) must parse to an empty Vec.
+    #[test]
+    fn global_settings_serde_no_indexed_shelves_field() {
+        let json = r#"{"cascade_multipliers": {"stage1":4,"stage2":3,"stage3":2,"stage4":1}, "updated_at": 0}"#;
+        let parsed: GlobalSettings = serde_json::from_str(json).expect("parse");
+        assert!(parsed.indexed_shelves.is_empty());
     }
 }
