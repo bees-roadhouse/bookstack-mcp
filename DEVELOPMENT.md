@@ -168,7 +168,7 @@ Each GitHub Release attaches `bsmcp-server` archives for these targets:
 |--------|---------|--------|
 | `x86_64-unknown-linux-gnu` | `.tar.gz` | ubuntu-22.04 (glibc ≥ 2.35) |
 | `aarch64-unknown-linux-gnu` | `.tar.gz` | ubuntu-22.04 + cross-linker |
-| `x86_64-apple-darwin` | `.tar.gz` | macos-13 |
+| `x86_64-apple-darwin` | `.tar.gz` | macos-14 (cross-compiled from Apple Silicon) |
 | `aarch64-apple-darwin` | `.tar.gz` | macos-14 |
 | `x86_64-pc-windows-msvc` | `.zip` | windows-2022 |
 

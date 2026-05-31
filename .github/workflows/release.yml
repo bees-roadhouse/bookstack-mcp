@@ -44,6 +44,7 @@ jobs:
   build-release-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/release'
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -112,6 +113,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/release'
     needs: [build-release-images]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       packages: write
     steps:
@@ -154,6 +156,7 @@ jobs:
   github-release-on-merge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/release'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     outputs:
@@ -216,6 +219,7 @@ jobs:
   release-binaries-on-merge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/release'
     needs: [github-release-on-merge]
+    timeout-minutes: 60
     permissions:
       contents: write
     strategy:
@@ -229,8 +233,13 @@ jobs:
             runner: ubuntu-22.04
             archive: tar.gz
             cross: true
+          # Cross-compiled from the Apple-Silicon runner. macos-13 (Intel)
+          # stalls indefinitely at `cargo build` here; macos-14 + the
+          # x86_64-apple-darwin rustup target builds it in minutes. The
+          # macOS SDK ships both arch slices, so cc/openssl-src/bundled
+          # SQLite cross-compile with no extra linker config.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-14
@@ -305,6 +314,7 @@ jobs:
   tag-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: write
       packages: write
@@ -371,6 +381,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [tag-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       packages: write
     steps:
@@ -415,6 +426,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [tag-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     outputs:
@@ -453,6 +465,7 @@ jobs:
   release-binaries-on-tag:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [github-release-on-tag]
+    timeout-minutes: 60
     permissions:
       contents: write
     strategy:
@@ -466,8 +479,13 @@ jobs:
             runner: ubuntu-22.04
             archive: tar.gz
             cross: true
+          # Cross-compiled from the Apple-Silicon runner. macos-13 (Intel)
+          # stalls indefinitely at `cargo build` here; macos-14 + the
+          # x86_64-apple-darwin rustup target builds it in minutes. The
+          # macOS SDK ships both arch slices, so cc/openssl-src/bundled
+          # SQLite cross-compile with no extra linker config.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-14
