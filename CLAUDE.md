@@ -120,9 +120,7 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 
 Browser-based admin config page. Token-gated via the `/authorize` form — when `?return_to=/settings` is set, the server validates the BookStack API token and issues a settings-session cookie (HttpOnly, 8h TTL, in-memory store) instead of running the full OAuth code dance.
 
-The page is admin-only — non-admin saves silently drop every field. Surfaces only the global server fields the index worker still needs:
-
-- `indexed_shelves` — comma-separated shelf IDs the full walk crawls. Empty = walk every visible shelf (the v0.13.0 default for fresh deployments; replaces the v0.12.x `hive_shelf_id` + `user_journals_shelf_id` fields per #119).
+The page is admin-only — non-admin saves silently drop every field. Surfaces only the precision-cascade pool multipliers + named-scopes (`kb_scopes_json`) map from issue #80. There is no global indexed-shelves cut: the worker walks every visible shelf on every full walk (issue #122), and per-call scoping via `semantic_search`'s `shelf_ids` / `book_ids` / `chapter_ids` / `page_ids` / `scopes` params (issue #80) is the only scope surface. The v0.12.x `hive_shelf_id` + `user_journals_shelf_id` config and the v0.13.0-RC `indexed_shelves` interim are both gone.
 
 There is no MCP write path for global settings — they must be configured via `/settings` by an admin. Per-user settings have been removed; the server holds no per-caller state beyond OAuth tokens.
 

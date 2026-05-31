@@ -48,12 +48,6 @@ impl SqliteDb {
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
              CREATE TABLE IF NOT EXISTS global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
-                 /* Issue #119 — replaced hive_shelf_id + user_journals_shelf_id
-                    with a generic JSON array. Empty array = walk every shelf
-                    the index token can see (the new default). Non-empty =
-                    walk only the listed shelves. The pre-#119 columns are
-                    auto-migrated into this field below and then dropped. */
-                 indexed_shelves_json TEXT NOT NULL DEFAULT '[]',
                  set_by_token_hash TEXT,
                  updated_at INTEGER NOT NULL DEFAULT 0,
                  /* Issue #80 — named scope cuts (HashMap<String, ScopeDef>)
@@ -61,6 +55,11 @@ impl SqliteDb {
                     JSON blobs. Empty/NULL means: use defaults. */
                  kb_scopes_json TEXT,
                  cascade_multipliers_json TEXT
+                 /* Issue #122 — the v0.13.0-RC `indexed_shelves_json` column
+                    (and the v0.12.x `hive_shelf_id` + `user_journals_shelf_id`
+                    columns it replaced) are dropped via the migration block
+                    below. The indexer now walks every shelf the token can see
+                    unconditionally; scope is per-call only. */
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -203,78 +202,19 @@ impl SqliteDb {
             // via .ok() (same pattern as the v0.8.0 block).
             "ALTER TABLE global_settings ADD COLUMN kb_scopes_json TEXT",
             "ALTER TABLE global_settings ADD COLUMN cascade_multipliers_json TEXT",
-            // Issue #119 — add the generic indexed_shelves column. The
-            // back-fill from the soon-to-be-dropped hive_shelf_id +
-            // user_journals_shelf_id columns runs in a separate dedicated
-            // block below (it has to read the old columns BEFORE we drop
-            // them). Duplicate-column errors swallowed via .ok().
-            "ALTER TABLE global_settings ADD COLUMN indexed_shelves_json TEXT NOT NULL DEFAULT '[]'",
-        ] {
-            conn.execute_batch(sql).ok();
-        }
-
-        // Issue #119 — auto-migrate the deprecated hive_shelf_id +
-        // user_journals_shelf_id columns into the new indexed_shelves_json
-        // field, then drop the old columns. Idempotent:
-        //
-        //   * If neither old column exists, the SELECT errors and we skip
-        //     the back-fill (already migrated, nothing to do).
-        //   * If indexed_shelves_json is already populated (non-empty
-        //     array), we leave it alone. Operators may have set it via
-        //     `/settings` after upgrade; we don't want to clobber that.
-        //   * The DROP COLUMN steps are guarded by IF EXISTS — SQLite 3.35+
-        //     supports both. Tested on the embedder's bundled rusqlite which
-        //     ships a newer SQLite. On older builds the DROP no-ops and
-        //     leaves stale columns; the read path doesn't touch them so
-        //     the db keeps working.
-        if let Ok((hsid, ujsid)) = conn.query_row(
-            "SELECT hive_shelf_id, user_journals_shelf_id FROM global_settings WHERE id = 1",
-            [],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-        ) {
-            let current: String = conn
-                .query_row(
-                    "SELECT indexed_shelves_json FROM global_settings WHERE id = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or_else(|_| "[]".to_string());
-            // Only back-fill if the new field is still the default empty
-            // array. An operator-supplied non-empty value wins.
-            let needs_backfill = current.trim() == "[]" || current.trim().is_empty();
-            if needs_backfill {
-                let mut shelves: Vec<i64> = Vec::new();
-                if let Some(v) = hsid {
-                    shelves.push(v);
-                }
-                if let Some(v) = ujsid {
-                    if !shelves.contains(&v) {
-                        shelves.push(v);
-                    }
-                }
-                if !shelves.is_empty() {
-                    let json = serde_json::to_string(&shelves).unwrap_or_else(|_| "[]".to_string());
-                    if let Err(e) = conn.execute(
-                        "UPDATE global_settings SET indexed_shelves_json = ?1 WHERE id = 1",
-                        rusqlite::params![json],
-                    ) {
-                        tracing::warn!(
-                            error = %e,
-                            "global_settings_indexed_shelves_backfill_failed"
-                        );
-                    } else {
-                        tracing::info!(
-                            shelves = ?shelves,
-                            "global_settings_indexed_shelves_backfilled_from_legacy"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Now drop the deprecated columns. Idempotent via DROP COLUMN
-        // IF EXISTS (SQLite 3.35+). Older SQLite silently no-ops via .ok().
-        for sql in [
+            // Issue #122 — drop the v0.13.0-RC `indexed_shelves_json` column
+            // (added by #120 to replace the v0.12.x `hive_shelf_id` +
+            // `user_journals_shelf_id` pair, themselves dropped here). The
+            // indexer now walks every visible shelf unconditionally; scope is
+            // a per-call concern on `semantic_search`. SQLite 3.35+ supports
+            // bare `ALTER TABLE ... DROP COLUMN` (matching the v0.10.0 block
+            // above) but doesn't carry IF EXISTS — duplicate/missing-column
+            // errors are swallowed via .ok() so the migration is idempotent
+            // both on re-runs and on databases that never had the column.
+            "ALTER TABLE global_settings DROP COLUMN indexed_shelves_json",
+            // Also clean up the v0.12.x columns if a database somehow skipped
+            // the #120 migration window entirely (fresh install on v0.13.0
+            // proper never sees them, but defensive idempotence is cheap).
             "ALTER TABLE global_settings DROP COLUMN hive_shelf_id",
             "ALTER TABLE global_settings DROP COLUMN user_journals_shelf_id",
         ] {
@@ -572,17 +512,13 @@ impl DbBackend for SqliteDb {
             let conn = conn.lock().unwrap();
             let row = conn
                 .query_row(
-                    "SELECT indexed_shelves_json,
-                        set_by_token_hash, updated_at,
+                    "SELECT set_by_token_hash, updated_at,
                         kb_scopes_json, cascade_multipliers_json
                  FROM global_settings WHERE id = 1",
                     [],
                     |row| {
-                        let indexed_shelves_json: String = row.get(0)?;
-                        let kb_scopes_json: Option<String> = row.get(3)?;
-                        let cascade_json: Option<String> = row.get(4)?;
-                        let indexed_shelves: Vec<i64> =
-                            serde_json::from_str(&indexed_shelves_json).unwrap_or_default();
+                        let kb_scopes_json: Option<String> = row.get(2)?;
+                        let cascade_json: Option<String> = row.get(3)?;
                         let kb_scopes = kb_scopes_json
                             .as_deref()
                             .and_then(|s| serde_json::from_str(s).ok())
@@ -592,9 +528,8 @@ impl DbBackend for SqliteDb {
                             .and_then(|s| serde_json::from_str(s).ok())
                             .unwrap_or_default();
                         Ok(GlobalSettings {
-                            indexed_shelves,
-                            set_by_token_hash: row.get::<_, Option<String>>(1)?,
-                            updated_at: row.get::<_, i64>(2)?,
+                            set_by_token_hash: row.get::<_, Option<String>>(0)?,
+                            updated_at: row.get::<_, i64>(1)?,
                             kb_scopes,
                             cascade_multipliers,
                         })
@@ -630,10 +565,6 @@ impl DbBackend for SqliteDb {
             Some(serde_json::to_string(&s.cascade_multipliers).map_err(|e| {
                 format!("save_global_settings: serialize cascade_multipliers: {e}")
             })?);
-        // Issue #119 — always serialize indexed_shelves; empty vec persists
-        // as "[]" (the "walk-all" sentinel).
-        let indexed_shelves_json = serde_json::to_string(&s.indexed_shelves)
-            .map_err(|e| format!("save_global_settings: serialize indexed_shelves: {e}"))?;
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let existing_setter: Option<String> = conn
@@ -647,14 +578,12 @@ impl DbBackend for SqliteDb {
             let final_setter = existing_setter.unwrap_or(setter);
             conn.execute(
                 "UPDATE global_settings
-                 SET indexed_shelves_json = ?1,
-                     set_by_token_hash = ?2,
-                     updated_at = ?3,
-                     kb_scopes_json = ?4,
-                     cascade_multipliers_json = ?5
+                 SET set_by_token_hash = ?1,
+                     updated_at = ?2,
+                     kb_scopes_json = ?3,
+                     cascade_multipliers_json = ?4
                  WHERE id = 1",
                 params![
-                    indexed_shelves_json,
                     final_setter,
                     SqliteDb::now_secs(),
                     kb_scopes_json,
@@ -3916,9 +3845,15 @@ mod lifecycle_tests {
                 .unwrap();
             assert_eq!(exists, 0, "global_settings.{col} should be dropped");
         }
-        // Issue #119 — the two legacy shelf columns are now also dropped
-        // and replaced by the generic indexed_shelves_json column.
-        for col in ["hive_shelf_id", "user_journals_shelf_id"] {
+        // Issue #122 — every shelf-cut column the briefing/RC era carried
+        // is dropped: both the v0.12.x named pair AND the v0.13.0-RC
+        // `indexed_shelves_json` field. The indexer walks every visible
+        // shelf unconditionally now.
+        for col in [
+            "hive_shelf_id",
+            "user_journals_shelf_id",
+            "indexed_shelves_json",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = ?1",
@@ -3928,34 +3863,23 @@ mod lifecycle_tests {
                 .unwrap();
             assert_eq!(
                 exists, 0,
-                "global_settings.{col} should be dropped (issue #119)"
+                "global_settings.{col} should be dropped (issue #122)"
             );
         }
-        let indexed_shelves_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = ?1",
-                ["indexed_shelves_json"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            indexed_shelves_exists, 1,
-            "global_settings.indexed_shelves_json should be present (issue #119)"
-        );
 
         drop(conn);
         std::fs::remove_file(&path).ok();
     }
 
-    /// Issue #119 — opening a v0.12.x database with non-NULL legacy shelf
-    /// columns back-fills `indexed_shelves_json` with the union of the two
-    /// before dropping them. Idempotent: reopening doesn't clobber the
-    /// migrated value (or anything an operator set since).
+    /// Issue #122 — opening a v0.13.0-RC database that still carries
+    /// `indexed_shelves_json` cleanly drops the column on startup. The
+    /// settings load doesn't reference it and the schema migration block
+    /// removes it via `DROP COLUMN IF EXISTS` (SQLite 3.35+).
     #[tokio::test]
-    async fn v0_13_0_migration_backfills_indexed_shelves_from_legacy() {
+    async fn v0_13_0_migration_drops_indexed_shelves_json_column() {
         let dir = env::temp_dir();
         let unique = format!(
-            "bsmcp-test-mig119-{}-{}.db",
+            "bsmcp-test-mig122-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3964,113 +3888,68 @@ mod lifecycle_tests {
         );
         let path = dir.join(&unique);
 
-        // Pre-create the v0.12.x shape (legacy shelf columns populated, no
-        // indexed_shelves_json yet).
+        // Pre-create the v0.13.0-RC shape — `indexed_shelves_json` populated
+        // with a non-default value an operator might have set via `/settings`.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
-                 hive_shelf_id INTEGER,
-                 user_journals_shelf_id INTEGER,
+                 indexed_shelves_json TEXT NOT NULL DEFAULT '[]',
                  set_by_token_hash TEXT,
                  updated_at INTEGER NOT NULL DEFAULT 0,
                  kb_scopes_json TEXT,
                  cascade_multipliers_json TEXT
              );
-             INSERT INTO global_settings
-                 (id, hive_shelf_id, user_journals_shelf_id, updated_at)
-                 VALUES (1, 42, 87, 0);",
+             INSERT INTO global_settings (id, indexed_shelves_json, updated_at)
+                 VALUES (1, '[42, 87]', 0);",
         )
         .unwrap();
         drop(conn);
 
-        // First open — runs the back-fill, drops the legacy columns.
+        // First open — runs the migration, drops the column.
         let db = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
-        let g = bsmcp_common::db::DbBackend::get_global_settings(&db)
+        let _ = bsmcp_common::db::DbBackend::get_global_settings(&db)
             .await
             .unwrap();
-        assert_eq!(
-            g.indexed_shelves,
-            vec![42, 87],
-            "back-fill should union the two legacy fields in insertion order"
-        );
-
-        // Second open — must not clobber. The legacy columns are gone; the
-        // existing indexed_shelves_json wins.
         drop(db);
+
+        // Verify the column is gone.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = 'indexed_shelves_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 0,
+            "indexed_shelves_json must be dropped on startup (issue #122)"
+        );
+        drop(conn);
+
+        // Second open — idempotent: a DB with no `indexed_shelves_json`
+        // (post-drop) and no legacy columns reopens without error and
+        // returns sane defaults.
         let db2 = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
         let g2 = bsmcp_common::db::DbBackend::get_global_settings(&db2)
             .await
             .unwrap();
-        assert_eq!(
-            g2.indexed_shelves,
-            vec![42, 87],
-            "second open is idempotent"
-        );
-
+        assert_eq!(g2.updated_at, 0);
+        assert!(g2.kb_scopes.is_empty());
         drop(db2);
+
         std::fs::remove_file(&path).ok();
     }
 
-    /// Issue #119 — back-fill must not overwrite a non-empty operator-set
-    /// value. If `indexed_shelves_json` is already populated when the
-    /// migration runs (e.g. operator hit `/settings` between the column-add
-    /// step and a restart), the legacy union is dropped on the floor.
+    /// Issue #122 — a fresh v0.13.0 database opens cleanly: no
+    /// `indexed_shelves_json`, no v0.12.x columns, and `get_global_settings`
+    /// returns the default record without reference to either.
     #[tokio::test]
-    async fn v0_13_0_migration_preserves_operator_set_indexed_shelves() {
+    async fn v0_13_0_fresh_open_settings_round_trip() {
         let dir = env::temp_dir();
         let unique = format!(
-            "bsmcp-test-mig119-pres-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let path = dir.join(&unique);
-
-        // Simulate the rare interleaving: indexed_shelves_json already set,
-        // legacy columns also set with different values. Migration should
-        // keep the explicit value.
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE global_settings (
-                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                 hive_shelf_id INTEGER,
-                 user_journals_shelf_id INTEGER,
-                 set_by_token_hash TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT 0,
-                 kb_scopes_json TEXT,
-                 cascade_multipliers_json TEXT,
-                 indexed_shelves_json TEXT NOT NULL DEFAULT '[]'
-             );
-             INSERT INTO global_settings
-                 (id, hive_shelf_id, user_journals_shelf_id, indexed_shelves_json, updated_at)
-                 VALUES (1, 1, 2, '[99, 100]', 0);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
-        let g = bsmcp_common::db::DbBackend::get_global_settings(&db)
-            .await
-            .unwrap();
-        assert_eq!(
-            g.indexed_shelves,
-            vec![99, 100],
-            "operator-set value must survive the back-fill"
-        );
-        drop(db);
-        std::fs::remove_file(&path).ok();
-    }
-
-    /// Issue #119 — fresh database (no legacy columns at all) opens cleanly
-    /// and reports an empty `indexed_shelves` (the walk-all sentinel).
-    #[tokio::test]
-    async fn v0_13_0_fresh_open_has_empty_indexed_shelves() {
-        let dir = env::temp_dir();
-        let unique = format!(
-            "bsmcp-test-mig119-fresh-{}-{}.db",
+            "bsmcp-test-mig122-fresh-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4083,10 +3962,18 @@ mod lifecycle_tests {
         let g = bsmcp_common::db::DbBackend::get_global_settings(&db)
             .await
             .unwrap();
-        assert!(
-            g.indexed_shelves.is_empty(),
-            "fresh open must default to the walk-all sentinel (empty Vec)"
-        );
+        assert_eq!(g.updated_at, 0);
+        assert!(g.kb_scopes.is_empty());
+
+        // Save + reload must work without the dropped column being in play.
+        bsmcp_common::db::DbBackend::save_global_settings(&db, &g, "test-hash")
+            .await
+            .unwrap();
+        let g2 = bsmcp_common::db::DbBackend::get_global_settings(&db)
+            .await
+            .unwrap();
+        assert!(g2.updated_at > 0, "save bumps updated_at");
+
         drop(db);
         std::fs::remove_file(&path).ok();
     }

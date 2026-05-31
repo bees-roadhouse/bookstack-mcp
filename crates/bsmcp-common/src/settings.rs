@@ -9,13 +9,13 @@
 //! pool defaults for precision-mode). Both persist as JSON blobs on the
 //! singleton `global_settings` row.
 //!
-//! Issue #119 (v0.13.0): drops `hive_shelf_id` + `user_journals_shelf_id`
-//! in favor of a generic `indexed_shelves: Vec<i64>`. Empty (default) means
-//! the index worker walks every shelf the index token can see — gives new
-//! deployments useful semantic search out of the box without `/settings`
-//! config. Non-empty restricts the full walk to the named subset. The
-//! migration auto-populates the new field with the union of any old values
-//! on first boot post-upgrade.
+//! Issue #122 (v0.13.0): drops the interim `indexed_shelves: Vec<i64>` field
+//! added by #119 (which itself replaced the v0.12.x `hive_shelf_id` +
+//! `user_journals_shelf_id` named-shelf fields). The indexer now walks every
+//! shelf the index token can see on every full walk — unconditionally. Scope
+//! is a per-call concern, expressed via `semantic_search`'s `shelf_ids` /
+//! `book_ids` / `chapter_ids` / `page_ids` / `scopes` params (issue #80). The
+//! DB migration drops the now-stale `indexed_shelves_json` column on startup.
 
 use std::collections::HashMap;
 
@@ -167,17 +167,6 @@ impl CascadeMultipliers {
 /// non-admin updates).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GlobalSettings {
-    /// Shelf ids the index worker's full walk crawls. Empty (default) means
-    /// "walk every shelf the index token can see" — useful out-of-the-box
-    /// behavior for fresh deployments. Non-empty restricts the walk to the
-    /// listed shelves, letting operators carve out a scoped corpus.
-    ///
-    /// Replaces the v0.12.x `hive_shelf_id` + `user_journals_shelf_id`
-    /// fields (issue #119). The DB migration auto-populates this with the
-    /// union of any pre-existing values on first read post-upgrade.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub indexed_shelves: Vec<i64>,
-
     /// Named scope cuts addressable from `semantic_search`'s `scopes` array.
     /// Persisted as a JSON blob on the singleton settings row (issue #80).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -273,7 +262,6 @@ mod tests {
             },
         );
         let g = GlobalSettings {
-            indexed_shelves: vec![7, 42],
             kb_scopes: scopes,
             cascade_multipliers: CascadeMultipliers {
                 stage1: 6,
@@ -285,7 +273,6 @@ mod tests {
         };
         let json = serde_json::to_string(&g).expect("serialize");
         let parsed: GlobalSettings = serde_json::from_str(&json).expect("parse");
-        assert_eq!(parsed.indexed_shelves, vec![7, 42]);
         assert_eq!(parsed.cascade_multipliers.stage1, 6);
         assert_eq!(parsed.kb_scopes.len(), 1);
         assert_eq!(
@@ -294,27 +281,28 @@ mod tests {
         );
     }
 
-    /// Issue #119 — empty `indexed_shelves` is the "walk all" sentinel; it
-    /// must round-trip cleanly (and stay skipped on serialize when empty).
+    /// Issue #122 — `GlobalSettings` no longer carries `indexed_shelves`.
+    /// Default serialization must not mention the dropped field, and JSON
+    /// containing the legacy key must round-trip cleanly (the key is just
+    /// ignored — serde's struct deser tolerates unknown fields by default).
     #[test]
-    fn global_settings_serde_round_trip_empty_indexed_shelves() {
+    fn global_settings_serde_default_omits_indexed_shelves() {
         let g = GlobalSettings::default();
         let json = serde_json::to_string(&g).expect("serialize");
-        // Empty Vec is skipped — no "indexed_shelves" key should appear.
         assert!(
             !json.contains("indexed_shelves"),
-            "default empty indexed_shelves should be skipped on serialize, got: {json}"
+            "dropped field must not appear in serialized output, got: {json}"
         );
-        let parsed: GlobalSettings = serde_json::from_str(&json).expect("parse");
-        assert!(parsed.indexed_shelves.is_empty());
     }
 
-    /// Issue #119 — JSON missing `indexed_shelves` entirely (e.g. a v0.12.x
-    /// row that never carried it) must parse to an empty Vec.
+    /// Issue #122 — JSON carrying a stale `indexed_shelves` field (e.g. from
+    /// a v0.13.0-RC #120 deployment) must still deserialize cleanly. The
+    /// field is silently dropped.
     #[test]
-    fn global_settings_serde_no_indexed_shelves_field() {
-        let json = r#"{"cascade_multipliers": {"stage1":4,"stage2":3,"stage3":2,"stage4":1}, "updated_at": 0}"#;
+    fn global_settings_serde_ignores_legacy_indexed_shelves_field() {
+        let json = r#"{"indexed_shelves":[7,42],"cascade_multipliers":{"stage1":4,"stage2":3,"stage3":2,"stage4":1},"updated_at":0}"#;
         let parsed: GlobalSettings = serde_json::from_str(json).expect("parse");
-        assert!(parsed.indexed_shelves.is_empty());
+        assert_eq!(parsed.updated_at, 0);
+        assert_eq!(parsed.cascade_multipliers.stage1, 4);
     }
 }

@@ -32,3 +32,9 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 # release.yml's binary matrix builds bsmcp-server for all five targets, so this
 # crate is the right place for the dep.
 openssl = { version = "0.10", features = ["vendored"] }
+
+[dev-dependencies]
+# Used to exercise the SettingsForm parser directly in tests without booting
+# axum. axum::Form delegates to serde_urlencoded internally, so the dev-dep
+# matches the production codepath.
+serde_urlencoded = "0.7"

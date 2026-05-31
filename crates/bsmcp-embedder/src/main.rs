@@ -277,7 +277,13 @@ async fn main() {
 ///
 /// Single-token deployments don't have to duplicate credentials.
 async fn run_worker(
-    db: Arc<dyn DbBackend>,
+    // Kept on the signature so the role dispatcher in `main` can hand the
+    // same DbBackend to either run_embedder or run_worker without forking
+    // the wiring. The worker stopped reading globals after #122 dropped the
+    // `GlobalSettings::indexed_shelves` field — the indexer walks every
+    // visible shelf unconditionally now, so there's nothing in
+    // global_settings the worker cares about.
+    _db: Arc<dyn DbBackend>,
     index_db: Arc<dyn IndexDb>,
     semantic_db: Arc<dyn SemanticDb>,
 ) {
@@ -311,7 +317,7 @@ async fn run_worker(
         .unwrap_or(300);
     tracing::info!(delta_interval_s = delta_interval, "worker_delta_interval");
 
-    let worker = worker::IndexWorker::new(bs_client, db, index_db);
+    let worker = worker::IndexWorker::new(bs_client, index_db);
     let handle = worker.spawn(delta_interval, Some(semantic_db));
 
     // Block on the worker indefinitely. Crashes inside the spawned task
