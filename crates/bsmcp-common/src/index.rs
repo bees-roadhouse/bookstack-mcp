@@ -233,6 +233,60 @@ pub struct PageCache {
     pub page_updated_at: Option<String>,
 }
 
+// --- Directory tree (issue #69) ---
+//
+// The `directory` MCP tool returns a scoped, depth-limited tree assembled
+// from the bookstack_* index tables. Replaces the assemble-it-yourself
+// pattern of calling list_shelves + list_books + list_chapters + list_pages
+// and stitching on the client. See `IndexDb::read_directory_tree`.
+
+/// Where to root the directory walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryScope {
+    /// Full tree: every shelf, plus shelf-less books grouped under a
+    /// synthetic "Unshelved" root.
+    All,
+    Shelf(i64),
+    Book(i64),
+    Chapter(i64),
+}
+
+/// What level a `DirectoryNode` sits at. The same struct is reused at every
+/// level — `node_type` says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryNodeKind {
+    Shelf,
+    Book,
+    Chapter,
+    Page,
+}
+
+impl DirectoryNodeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shelf => "shelf",
+            Self::Book => "book",
+            Self::Chapter => "chapter",
+            Self::Page => "page",
+        }
+    }
+}
+
+/// One node in the directory tree returned by `read_directory_tree`.
+/// `id` is the BookStack id of the underlying entity. `children` is empty
+/// for pages and for any node trimmed by `depth`. Page nodes carry
+/// `page_kind` since the structural index already classifies them.
+#[derive(Clone, Debug)]
+pub struct DirectoryNode {
+    pub kind: DirectoryNodeKind,
+    pub id: i64,
+    pub name: String,
+    pub slug: String,
+    /// Only set on `Page` nodes (mirrors `IndexedPage.page_kind.as_str()`).
+    pub page_kind: Option<String>,
+    pub children: Vec<DirectoryNode>,
+}
+
 #[derive(Clone, Debug)]
 pub struct IndexJob {
     pub id: i64,
@@ -258,19 +312,24 @@ pub struct IndexJob {
 // to compute (kind, key, archive_year) for each item. Test-friendly,
 // branch-coverable, no mocks needed.
 
-/// Classify a shelf by id against the globally-configured shelf IDs.
-pub fn classify_shelf(
-    shelf_id: i64,
-    hive_shelf_id: Option<i64>,
-    user_journals_shelf_id: Option<i64>,
-) -> ShelfKind {
-    if Some(shelf_id) == hive_shelf_id {
-        ShelfKind::Hive
-    } else if Some(shelf_id) == user_journals_shelf_id {
-        ShelfKind::UserJournals
-    } else {
-        ShelfKind::Unclassified
-    }
+/// Classify a shelf by id.
+///
+/// Issue #122 (v0.13.0): the indexer walks every visible shelf
+/// unconditionally and no longer distinguishes "hive shelf" from
+/// "user journals shelf". Every shelf the worker walks is now
+/// [`ShelfKind::Unclassified`], so this helper is a constant — kept as a
+/// single call site (rather than inlined at every walk path) for
+/// grep-ability and to make the future "we again care about shelf roles"
+/// reintroduction cheap.
+///
+/// The downstream [`ShelfKind::Hive`] / [`ShelfKind::UserJournals`] arms in
+/// [`classify_book`] / [`classify_chapter`] / [`classify_page`] remain on
+/// the structs for serde back-compat with pre-#119 indexed rows; they're
+/// effectively dead code post-#119/#122 because no shelf classifies into
+/// them anymore. They will get pruned in a follow-up cleanup once any
+/// lingering rows have been re-walked.
+pub fn classify_shelf(_shelf_id: i64) -> ShelfKind {
+    ShelfKind::Unclassified
 }
 
 /// Classify a book by its name and the kind of shelf it lives on.
@@ -460,18 +519,14 @@ fn match_iso_date(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Issue #119 — post-refactor every shelf is `Unclassified`. The Hive /
+    /// UserJournals variants survive on the enum for back-compat with rows
+    /// already in the index but the classifier no longer produces them.
     #[test]
-    fn shelf_classification() {
-        assert_eq!(classify_shelf(927, Some(927), Some(2023)), ShelfKind::Hive);
-        assert_eq!(
-            classify_shelf(2023, Some(927), Some(2023)),
-            ShelfKind::UserJournals
-        );
-        assert_eq!(
-            classify_shelf(99, Some(927), Some(2023)),
-            ShelfKind::Unclassified
-        );
-        assert_eq!(classify_shelf(927, None, None), ShelfKind::Unclassified);
+    fn shelf_classification_is_always_unclassified() {
+        assert_eq!(classify_shelf(927), ShelfKind::Unclassified);
+        assert_eq!(classify_shelf(2023), ShelfKind::Unclassified);
+        assert_eq!(classify_shelf(0), ShelfKind::Unclassified);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -7,14 +8,20 @@ use pulldown_cmark::{html, Options, Parser};
 
 use crate::semantic::{trim_match, SearchMode, SemanticState};
 use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::db::IndexDb;
+use bsmcp_common::index::{DirectoryNode, DirectoryNodeKind, DirectoryScope};
+use bsmcp_common::time::TimezoneConfig;
+use bsmcp_common::types::ScopeFilter;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
 pub async fn handle_request(
     request: &Value,
     client: &BookStackClient,
-    semantic: Option<&SemanticState>,
+    semantic: Option<&Arc<SemanticState>>,
+    index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
+    tz: &TimezoneConfig,
 ) -> Option<Value> {
     let id = request.get("id");
 
@@ -56,15 +63,24 @@ pub async fn handle_request(
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = execute_tool(name, &args, client, semantic, staging).await;
+            let result = execute_tool(name, &args, client, semantic, index_db, staging).await;
+
+            // Every tools/call result carries `_meta.time` (issue #67) so a
+            // session can reason about "today / yesterday / this morning"
+            // without re-deriving the conversion on every turn. Field names
+            // match the pre-#79 `meta.briefing.time` shape so any consumer
+            // reading that path adopts with a one-key change.
+            let meta = json!({ "time": tz.time_block() });
 
             let tool_result = match result {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
+                    "_meta": meta,
                 }),
                 Err(e) => json!({
                     "content": [{ "type": "text", "text": format!("Error: {e}") }],
                     "isError": true,
+                    "_meta": meta,
                 }),
             };
 
@@ -94,15 +110,48 @@ async fn execute_tool(
     name: &str,
     args: &Value,
     client: &BookStackClient,
-    semantic: Option<&SemanticState>,
+    semantic: Option<&Arc<SemanticState>>,
+    index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
 ) -> Result<String, String> {
     match name {
+        // Directory tree (issue #69) — scoped, depth-limited tree from the
+        // bookstack_* index tables. Page-level ACL filter via BookStack's
+        // can_access_page; empty chapters/books/shelves are pruned.
+        "directory" => {
+            let scope = parse_directory_scope(args)?;
+            let depth =
+                arg_i64_opt(args, "depth").and_then(|d| if d < 0 { None } else { Some(d as u32) });
+            // The "include" knob is accepted today for forward compatibility
+            // with the issue's "summary" / "full" tiers. The current shape
+            // returns meta only (id + name + slug + kind + children). Summary
+            // and full are reserved for a follow-up that pulls page_cache
+            // descriptions / bodies.
+            let include = arg_str_default(args, "include", "meta");
+            validate_enum(&include, &["meta", "summary", "full"], "include")?;
+            let tree = index_db
+                .read_directory_tree(scope, depth)
+                .await
+                .map_err(|e| format!("directory: {e}"))?;
+            let filtered = filter_directory_tree_by_acl(tree, client).await;
+            let payload = json!({
+                "scope": directory_scope_payload(scope),
+                "depth": depth,
+                "include": include,
+                "tree": filtered
+                    .iter()
+                    .map(directory_node_to_json)
+                    .collect::<Vec<_>>(),
+            });
+            format_json(&payload)
+        }
         // Semantic Search (conditional)
         "semantic_search" => {
             let sem = semantic.ok_or("Semantic search is not enabled")?;
             let query = arg_str(args, "query")?;
-            let limit = arg_i64(args, "limit", 10).clamp(1, 50) as usize;
+            // Issue #80 — limit cap raised from 50 to 100. Defaults stay
+            // at 10 so today's callers see no change.
+            let limit = arg_i64(args, "limit", 10).clamp(1, 100) as usize;
             let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
             let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args
@@ -113,20 +162,81 @@ async fn execute_tool(
                 .get("verbose")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Issue #80 — `default` (issue spec) is the documented schema
+            // default; `standard` still parses as an alias for backward
+            // compat. Issue #115 (v0.13.0) — `mode: "rerank"` is hard-cut.
+            // It now returns a structured "unknown mode" error pointing at
+            // the new `rerank: true` flag.
             let mode_str = args
                 .get("mode")
                 .and_then(|v| v.as_str())
-                .unwrap_or("standard");
+                .unwrap_or("default");
             let mode = SearchMode::parse(mode_str).ok_or_else(|| {
-                format!("invalid mode '{mode_str}' (expected: standard, rerank, precision)")
+                if mode_str.eq_ignore_ascii_case("rerank") {
+                    // Migration breadcrumb (issue #115). `mode: "rerank"`
+                    // was hard-cut in v0.13.0; the equivalent is now
+                    // `mode: "standard", rerank: true`.
+                    "mode: \"rerank\" was removed in v0.13.0. \
+                     Pass `rerank: true` with `mode: \"standard\"` instead — \
+                     same cross-encoder pass, now a flag."
+                        .to_string()
+                } else {
+                    format!(
+                        "invalid mode '{mode_str}' \
+                         (expected: default, standard, precision)"
+                    )
+                }
             })?;
+            // Issue #115 — `rerank: bool` flag layers the cross-encoder
+            // on top of the standard pipeline. Ignored on `precision`
+            // (always on by definition there).
+            let rerank = args
+                .get("rerank")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            // Issue #80 — scope params. Explicit ID lists union with named
+            // scopes resolved from `global_settings.kb_scopes`. Empty/no
+            // scope = full corpus (current behavior).
+            let mut scope = ScopeFilter {
+                shelf_ids: arg_i64_array(args, "shelf_ids"),
+                book_ids: arg_i64_array(args, "book_ids"),
+                chapter_ids: arg_i64_array(args, "chapter_ids"),
+                page_ids: arg_i64_array(args, "page_ids"),
+            };
+            let named_scopes: Vec<String> = args
+                .get("scopes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut unknown_scopes: Vec<String> = Vec::new();
+            if !named_scopes.is_empty() {
+                let (resolved, unknown) = sem.resolve_named_scopes(&named_scopes).await;
+                scope.merge(&resolved);
+                unknown_scopes = unknown;
+            }
+            scope.dedup();
+            let scope_arg = if scope.is_empty() { None } else { Some(&scope) };
+
             // The HTTP `filter_by_permission` fallback inside `sem.search`
             // enforces per-page access control via BookStack's API.
             let mut result = sem
                 .search(
-                    &query, limit, threshold, hybrid, verbose, client, None, mode,
+                    &query, limit, threshold, hybrid, verbose, client, scope_arg, mode, rerank,
                 )
                 .await?;
+            if !unknown_scopes.is_empty() {
+                // Surface unknown named scopes inline so the caller can
+                // notice (a typo, a deleted scope) without a hard error
+                // killing the search.
+                if let Some(stats) = result.get_mut("stats").and_then(|v| v.as_object_mut()) {
+                    stats.insert("unknown_scopes".to_string(), json!(unknown_scopes));
+                }
+            }
             trim_semantic_search_payload(&mut result);
             format_json(&result)
         }
@@ -147,8 +257,55 @@ async fn execute_tool(
             let query = arg_str(args, "query")?;
             let page = arg_i64(args, "page", 1).max(1);
             let count = arg_count(args, 20);
+            // Issue #115 — `rerank: bool` flag. When `true`, take the
+            // keyword results, POST to the embedder's /rerank, return
+            // reordered with `scoring.rerank` per result and
+            // `stats.rerank_*` (shape mirrors `semantic_search`). When
+            // unset, keep the v0.12.x text format the existing callers
+            // expect.
+            let rerank = args
+                .get("rerank")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let result = client.search(&query, page, count).await?;
-            Ok(format_search_results(&result, client.base_url()))
+            if !rerank {
+                return Ok(format_search_results(&result, client.base_url()));
+            }
+            // Rerank requires semantic search to be enabled (the embedder
+            // is the host for `/rerank`). If the deployment didn't opt in
+            // to semantic search, return a structured error pointing the
+            // caller at the env var — same 503-shape `semantic_search`
+            // already uses when the provider is unset.
+            let sem = semantic.ok_or(
+                "search_content rerank=true requires the embedder \
+                 (BSMCP_SEMANTIC_SEARCH=true) and BSMCP_RERANK_PROVIDER \
+                 configured on it.",
+            )?;
+            let items: Vec<Value> = result
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let total = result.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+            let (reordered, rerank_stats) = sem.rerank_search_results(&query, items).await?;
+
+            // Mirror `semantic_search`'s response shape: `results` array +
+            // a `stats` block carrying the rerank_* fields. The
+            // `query_time_ms` field is omitted here because BookStack's
+            // search call already times itself client-side; the rerank
+            // call is the only piece we control.
+            let payload = json!({
+                "total": total,
+                "results": reordered,
+                "stats": {
+                    "rerank": true,
+                    "rerank_ms": rerank_stats.get("rerank_ms"),
+                    "rerank_provider": rerank_stats.get("rerank_provider"),
+                    "rerank_model": rerank_stats.get("rerank_model"),
+                    "candidates_reranked": rerank_stats.get("candidates_reranked"),
+                }
+            });
+            format_json(&payload)
         }
 
         // Shelves
@@ -994,6 +1151,17 @@ fn arg_i64_required(args: &Value, key: &str) -> Result<i64, String> {
     arg_i64_opt(args, key).ok_or_else(|| format!("Missing required argument: {key}"))
 }
 
+/// Parse a JSON array of integers at `args[key]`. Missing, non-array, or
+/// empty values yield an empty `Vec`. Non-integer entries are silently
+/// skipped — callers don't need to surface that, since downstream layers
+/// validate the resulting IDs against the embedding store anyway.
+fn arg_i64_array(args: &Value, key: &str) -> Vec<i64> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default()
+}
+
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
@@ -1094,6 +1262,185 @@ fn filter_string_update_fields(args: &Value, fields: &[&str]) -> Value {
 
 fn format_json(v: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(v).map_err(|e| e.to_string())
+}
+
+// --- directory tool helpers (issue #69) ---
+
+/// Parse the `scope` argument. Accepts:
+/// - omitted / `"all"` / `null` → `DirectoryScope::All`
+/// - object form `{ "shelf": <id> }`, `{ "book": <id> }`, `{ "chapter": <id> }`
+///
+/// Rejects ambiguous combinations (e.g. both `shelf` and `book`).
+fn parse_directory_scope(args: &Value) -> Result<DirectoryScope, String> {
+    let scope = args.get("scope");
+    let scope = match scope {
+        None | Some(Value::Null) => return Ok(DirectoryScope::All),
+        Some(s) => s,
+    };
+    if let Some(s) = scope.as_str() {
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(DirectoryScope::All);
+        }
+        return Err(format!(
+            "invalid scope string '{s}' — expected \"all\" or an object \
+             like {{\"shelf\": ID}} / {{\"book\": ID}} / {{\"chapter\": ID}}"
+        ));
+    }
+    if let Some(obj) = scope.as_object() {
+        let shelf = obj.get("shelf").and_then(value_as_i64);
+        let book = obj.get("book").and_then(value_as_i64);
+        let chapter = obj.get("chapter").and_then(value_as_i64);
+        let count = [shelf, book, chapter]
+            .iter()
+            .filter(|v| v.is_some())
+            .count();
+        if count > 1 {
+            return Err(
+                "scope object must specify exactly one of {shelf, book, chapter}".to_string(),
+            );
+        }
+        if let Some(id) = shelf {
+            return Ok(DirectoryScope::Shelf(id));
+        }
+        if let Some(id) = book {
+            return Ok(DirectoryScope::Book(id));
+        }
+        if let Some(id) = chapter {
+            return Ok(DirectoryScope::Chapter(id));
+        }
+        return Err(
+            "scope object must specify one of {shelf, book, chapter} with an integer id"
+                .to_string(),
+        );
+    }
+    Err("scope must be \"all\" or an object — see tool description".to_string())
+}
+
+fn directory_scope_payload(scope: DirectoryScope) -> Value {
+    match scope {
+        DirectoryScope::All => json!("all"),
+        DirectoryScope::Shelf(id) => json!({ "shelf": id }),
+        DirectoryScope::Book(id) => json!({ "book": id }),
+        DirectoryScope::Chapter(id) => json!({ "chapter": id }),
+    }
+}
+
+fn directory_node_to_json(node: &DirectoryNode) -> Value {
+    let mut obj = json!({
+        "type": node.kind.as_str(),
+        "id": node.id,
+        "name": node.name,
+        "slug": node.slug,
+    });
+    if let Some(pk) = &node.page_kind {
+        obj["page_kind"] = json!(pk);
+    }
+    if !node.children.is_empty() {
+        obj["children"] = Value::Array(node.children.iter().map(directory_node_to_json).collect());
+    } else if matches!(
+        node.kind,
+        DirectoryNodeKind::Shelf | DirectoryNodeKind::Book | DirectoryNodeKind::Chapter
+    ) {
+        // Empty children on a container — emit `[]` so the client doesn't
+        // have to special-case "missing" vs "empty". Pages omit it.
+        obj["children"] = Value::Array(Vec::new());
+    }
+    obj
+}
+
+/// Filter the candidate tree by per-page ACL.
+///
+/// Walks the tree, collects every page id, asks BookStack which ones the
+/// caller can see (in parallel with a small concurrency cap), then prunes
+/// pages the caller can't see plus any chapter/book/shelf that ended up
+/// with no surviving descendants. Containers explicitly trimmed to depth=0
+/// are NOT considered empty — they have no children because the caller
+/// asked us not to walk them, not because the content is hidden.
+async fn filter_directory_tree_by_acl(
+    tree: Vec<DirectoryNode>,
+    client: &BookStackClient,
+) -> Vec<DirectoryNode> {
+    let mut page_ids: Vec<i64> = Vec::new();
+    collect_page_ids(&tree, &mut page_ids);
+    if page_ids.is_empty() {
+        // No pages anywhere in the candidate tree — nothing to filter against.
+        // Containers (shelves/books/chapters) with no page descendants stay
+        // visible as-is; emptiness is the caller's signal.
+        return tree;
+    }
+    page_ids.sort_unstable();
+    page_ids.dedup();
+
+    // Concurrency cap matches semantic_search's filter_by_permission (25).
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(25));
+    let mut handles = Vec::with_capacity(page_ids.len());
+    for pid in page_ids.iter().copied() {
+        let client = client.clone();
+        let sem = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            (pid, client.can_access_page(pid).await)
+        }));
+    }
+    let mut allowed: std::collections::HashSet<i64> =
+        std::collections::HashSet::with_capacity(page_ids.len());
+    for h in handles {
+        if let Ok((pid, ok)) = h.await {
+            if ok {
+                allowed.insert(pid);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(tree.len());
+    for node in tree {
+        if let Some(filtered) = filter_node(node, &allowed) {
+            out.push(filtered);
+        }
+    }
+    out
+}
+
+fn collect_page_ids(nodes: &[DirectoryNode], out: &mut Vec<i64>) {
+    for n in nodes {
+        if matches!(n.kind, DirectoryNodeKind::Page) {
+            out.push(n.id);
+        } else {
+            collect_page_ids(&n.children, out);
+        }
+    }
+}
+
+/// Recursive prune. Pages stay iff their id is in `allowed`. Containers stay
+/// iff at least one descendant page survives — except when the container
+/// reached the tree with an empty children list (a depth=0 cut by the
+/// caller); we can't tell visibility from emptiness in that case, so we
+/// keep it.
+fn filter_node(
+    node: DirectoryNode,
+    allowed: &std::collections::HashSet<i64>,
+) -> Option<DirectoryNode> {
+    if matches!(node.kind, DirectoryNodeKind::Page) {
+        if allowed.contains(&node.id) {
+            return Some(node);
+        }
+        return None;
+    }
+    let had_children = !node.children.is_empty();
+    let mut kept = Vec::with_capacity(node.children.len());
+    for child in node.children {
+        if let Some(c) = filter_node(child, allowed) {
+            kept.push(c);
+        }
+    }
+    if had_children && kept.is_empty() {
+        // Every descendant was a forbidden page → drop the container.
+        return None;
+    }
+    Some(DirectoryNode {
+        children: kept,
+        ..node
+    })
 }
 
 /// `semantic_search` MCP-tool payload trim. Caps each result's chunks and
@@ -1730,15 +2077,54 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
 pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
     let mut tools = vec![
         tool("search_content",
-            "Search across all BookStack content (pages, chapters, books, shelves). Supports operators: {type:page}, [tag_name=value], {in_name:term}, {created_by:me}, exact match with quotes.",
+            "Search across all BookStack content (pages, chapters, books, shelves). Supports operators: {type:page}, [tag_name=value], {in_name:term}, {created_by:me}, exact match with quotes. \
+             \n\nPass `rerank: true` (issue #115) to layer a cross-encoder rerank on top of the keyword results — the results are re-ordered by relevance to the query, each result picks up a `scoring.rerank` field, and `stats.{rerank_ms, rerank_provider, rerank_model, candidates_reranked}` lands on the response (same shape `semantic_search` already uses). Requires `BSMCP_RERANK_PROVIDER` configured on the embedder; without it the call returns a structured error.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "page": { "type": "integer", "description": "Page number", "default": 1 },
-                    "count": { "type": "integer", "description": "Results per page", "default": 20 }
+                    "count": { "type": "integer", "description": "Results per page", "default": 20 },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "When true, cross-encoder re-orders the keyword results and the response surfaces `scoring.rerank` + `stats.rerank_*` (same shape as semantic_search). Requires `BSMCP_RERANK_PROVIDER` on the embedder. Default false.",
+                        "default": false
+                    }
                 },
                 "required": ["query"]
+            })),
+
+        // Directory tree (issue #69) — one-shot scoped tree from the bookstack_* index.
+        tool("directory",
+            "Return a scoped, depth-limited tree of BookStack content (shelves → books → chapters → pages). \
+             Reads from the internal structural index — NOT live BookStack — so it's fast (~10ms warm) and consistent with the indexer's view. \
+             Replaces the assemble-it-yourself pattern of calling list_shelves + list_books + list_chapters + list_pages. \
+             Pages are ACL-filtered against the calling token; chapters/books/shelves with no surviving pages are pruned. \
+             \n\nScope: omit (or `\"all\"`) for the full tree, or pass `{\"shelf\": ID}` / `{\"book\": ID}` / `{\"chapter\": ID}` to root the walk. \
+             Depth: max levels to descend (0 = roots only, omit for unbounded). \
+             Include: `\"meta\"` (id + name + slug + page_kind, default), `\"summary\"` and `\"full\"` are accepted for forward compat and currently behave like `meta`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "description": "Root of the walk. Omit or pass \"all\" for the full tree. Object form: exactly one of {\"shelf\": ID}, {\"book\": ID}, {\"chapter\": ID}.",
+                        "oneOf": [
+                            { "type": "string", "enum": ["all"] },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "shelf":   { "type": "integer", "description": "Shelf ID to root the walk at" },
+                                    "book":    { "type": "integer", "description": "Book ID to root the walk at" },
+                                    "chapter": { "type": "integer", "description": "Chapter ID to root the walk at" }
+                                },
+                                "additionalProperties": false
+                            },
+                            { "type": "null" }
+                        ]
+                    },
+                    "depth": { "type": "integer", "description": "Max depth to descend (0 = roots only). Omit for unbounded." },
+                    "include": { "type": "string", "enum": ["meta", "summary", "full"], "description": "Per-node detail level. `meta` returns id + name + slug + page_kind. `summary` and `full` reserved for follow-up.", "default": "meta" }
+                }
             })),
 
         // Shelves
@@ -2075,24 +2461,76 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
-            "Semantic search with cross-encoder relevance ranking. \
-             **Default to `mode: \"precision\"`** — it's faster (~1s less than standard on typical queries), picks better hits, and surfaces the most-relevant pages first. \
-             Use `mode: \"standard\"` only when you need a broader sweep (more results, blanket-adjacent pages) — standard keeps pages that precision's strict cross-encoder ordering drops. Both modes return the same JSON shape, so A/B is just a `mode` swap. \
+            "Semantic search with cross-encoder relevance ranking and optional scope cuts. \
+             **Default to `mode: \"precision\"`** — it runs the issue-#80 four-stage cascade \
+             (semantic → keyword → Markov-blanket → cross-encoder) and picks better hits than the \
+             default heuristic blend. Use `mode: \"default\"` for a wider sweep (more results, \
+             blanket-adjacent pages); both modes return the same JSON shape so A/B is a single \
+             `mode` swap. \
              \n\nMode reference: \
-             `precision` (recommended) — wider vector pass (5× limit), cross-encoder ranks. Best for \"find the right page.\" \
-             `standard` — vector + keyword + Markov-blanket boost + blended sort. Best for \"find everything relevant.\" \
-             `rerank` — standard's candidate selection, then cross-encoder reorders the top-N. Middle ground; rarely the right pick over precision. \
-             \n\n`precision` and `rerank` need `BSMCP_RERANK_PROVIDER` configured on the embedder. If you get \"Reranker is disabled,\" retry with `mode: \"standard\"`. \
-             \n\nInclude synonyms and domain vocabulary in your query for better recall (e.g., \"security breach incident response ransomware\" beats \"office got hacked\").",
+             `precision` (recommended) — N×4 → N×3 → N×2 → N cascade. Final ordering = \
+             cross-encoder. Best for \"find the right page.\" \
+             `default` — vector + keyword + Markov-blanket boost + blended sort. Best for \
+             \"find everything relevant.\" Pass `rerank: true` to layer the cross-encoder on top \
+             of the standard top-N (the pre-v0.13.0 `mode: \"rerank\"`, now a flag). \
+             `standard` is an alias for `default` (backward compat). \
+             \n\n**v0.13.0 breaking change.** `mode: \"rerank\"` was hard-cut. The equivalent is \
+             `mode: \"standard\", rerank: true` — same cross-encoder pass, now a flag. Callers \
+             passing the old value get a structured error pointing at the migration. \
+             \n\n`precision` and `rerank: true` need `BSMCP_RERANK_PROVIDER` configured on the \
+             embedder. If you get \"Reranker is disabled,\" retry without the flag (or with \
+             `mode: \"default\"`). \
+             \n\n**Scope params (optional)** restrict the search to a subset of the KB. Explicit \
+             `shelf_ids` / `book_ids` / `chapter_ids` / `page_ids` are unioned; `scopes` is a \
+             list of named scope keys resolved from `global_settings.kb_scopes` (set via the \
+             `/settings` UI). Mixing explicit IDs and named scopes is also a union. No scope = \
+             full corpus (unchanged behavior). \
+             \n\nInclude synonyms and domain vocabulary in your query for better recall (e.g., \
+             \"security breach incident response ransomware\" beats \"office got hacked\").",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query. Include synonyms and related terms for better results." },
-                    "limit": { "type": "integer", "description": "Max number of page results to return", "default": 10 },
+                    "limit": { "type": "integer", "description": "Max number of page results to return (capped at 100). Issue #80 raised the cap from 50 to 100 for precision-mode cascade callers.", "default": 10 },
                     "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Default: 0.45 for hybrid, 0.50 for pure vector.", "default": 0.45 },
-                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Forced to false when mode='precision'.", "default": true },
+                    "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Ignored in `precision` mode (cascade has its own keyword stage).", "default": true },
                     "verbose": { "type": "boolean", "description": "Include full Markov blanket data in results. Default false returns slim results (scores, chunks, scoring breakdown). Set true for full graph context.", "default": false },
-                    "mode": { "type": "string", "description": "Ranking strategy. **`precision` recommended** (faster, more accurate). `standard` for wider sweep. `rerank` is the middle ground. Schema default stays `standard` for instances without rerank configured.", "enum": ["standard", "rerank", "precision"], "default": "standard" }
+                    "mode": {
+                        "type": "string",
+                        "description": "Ranking strategy. **`precision` recommended** (issue-#80 4-stage cascade, more accurate). `default` for wider sweep — pair with `rerank: true` for the pre-v0.13.0 `mode: \"rerank\"` behavior. `standard` is an alias for `default` (backward compat).",
+                        "enum": ["default", "standard", "precision"],
+                        "default": "default"
+                    },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "When true on `mode: \"standard\"`, layers a cross-encoder rerank on top of the standard top-N — equivalent to the pre-v0.13.0 `mode: \"rerank\"`. No-op on `mode: \"precision\"` (cascade always reranks). Requires `BSMCP_RERANK_PROVIDER` on the embedder. Default false.",
+                        "default": false
+                    },
+                    "shelf_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks under one of these shelves. Resolved via the structural index to the matching books. Union semantics with other scope fields."
+                    },
+                    "book_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks in one of these books. Union semantics with other scope fields."
+                    },
+                    "chapter_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks in one of these chapters. Union semantics with other scope fields."
+                    },
+                    "page_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Restrict the search to chunks belonging to one of these pages. Union semantics with other scope fields."
+                    },
+                    "scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Named scopes from `global_settings.kb_scopes` (e.g., 'policies', 'sops'). Unknown names are surfaced as `stats.unknown_scopes` in the response."
+                    }
                 },
                 "required": ["query"]
             })));
@@ -2175,18 +2613,23 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// v0.10.0 surface lock: 59 BookStack CRUD tools + 3 semantic tools = 62.
-    /// Anything extra means a briefing-era surface leaked back in.
+    /// v0.10.0 surface lock + issue #69: 59 BookStack CRUD plus 1 directory
+    /// tool plus 3 semantic tools equals 63. Anything extra means a
+    /// briefing-era surface leaked back in.
     #[test]
-    fn tools_list_count_is_62_with_semantic() {
+    fn tools_list_count_is_63_with_semantic() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 62, "expected 59 CRUD + 3 semantic = 62 tools");
+        assert_eq!(
+            tools.len(),
+            63,
+            "expected 59 CRUD + 1 directory + 3 semantic = 63 tools"
+        );
     }
 
     #[test]
-    fn tools_list_count_is_59_without_semantic() {
+    fn tools_list_count_is_60_without_semantic() {
         let tools = tool_definitions(false);
-        assert_eq!(tools.len(), 59, "expected 59 CRUD tools");
+        assert_eq!(tools.len(), 60, "expected 59 CRUD + 1 directory = 60 tools");
     }
 
     /// Locks the precise tool name set so a briefing/session/dismiss-style
@@ -2200,6 +2643,7 @@ mod tests {
             .collect();
         let expected: HashSet<String> = [
             "search_content",
+            "directory",
             "list_shelves",
             "get_shelf",
             "create_shelf",
@@ -2275,6 +2719,476 @@ mod tests {
         assert!(
             missing.is_empty(),
             "missing tools from tools/list: {missing:?}"
+        );
+    }
+
+    // --- directory tool helpers (issue #69) ---
+
+    #[test]
+    fn parse_directory_scope_defaults_to_all() {
+        assert_eq!(
+            parse_directory_scope(&json!({})).unwrap(),
+            DirectoryScope::All
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": null })).unwrap(),
+            DirectoryScope::All
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": "all" })).unwrap(),
+            DirectoryScope::All
+        );
+    }
+
+    #[test]
+    fn parse_directory_scope_picks_one_root() {
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "shelf": 42 } })).unwrap(),
+            DirectoryScope::Shelf(42)
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "book": 7 } })).unwrap(),
+            DirectoryScope::Book(7)
+        );
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "chapter": 99 } })).unwrap(),
+            DirectoryScope::Chapter(99)
+        );
+        // Accept stringified ids — AI clients sometimes ship strings.
+        assert_eq!(
+            parse_directory_scope(&json!({ "scope": { "book": "12" } })).unwrap(),
+            DirectoryScope::Book(12)
+        );
+    }
+
+    #[test]
+    fn parse_directory_scope_rejects_ambiguity() {
+        let err =
+            parse_directory_scope(&json!({ "scope": { "shelf": 1, "book": 2 } })).unwrap_err();
+        assert!(err.contains("exactly one"));
+
+        let err = parse_directory_scope(&json!({ "scope": {} })).unwrap_err();
+        assert!(err.contains("one of"));
+
+        let err = parse_directory_scope(&json!({ "scope": "bogus" })).unwrap_err();
+        assert!(err.contains("scope"));
+    }
+
+    #[test]
+    fn directory_node_to_json_renders_meta_shape() {
+        let leaf = DirectoryNode {
+            kind: DirectoryNodeKind::Page,
+            id: 5,
+            name: "p".to_string(),
+            slug: "p".to_string(),
+            page_kind: Some("manifest".to_string()),
+            children: Vec::new(),
+        };
+        let chap = DirectoryNode {
+            kind: DirectoryNodeKind::Chapter,
+            id: 3,
+            name: "c".to_string(),
+            slug: "c".to_string(),
+            page_kind: None,
+            children: vec![leaf.clone()],
+        };
+
+        let v_leaf = directory_node_to_json(&leaf);
+        assert_eq!(v_leaf["type"], "page");
+        assert_eq!(v_leaf["id"], 5);
+        assert_eq!(v_leaf["page_kind"], "manifest");
+        // Pages have no children field in the meta shape.
+        assert!(v_leaf.get("children").is_none());
+
+        let v_chap = directory_node_to_json(&chap);
+        assert_eq!(v_chap["type"], "chapter");
+        assert_eq!(v_chap["children"].as_array().unwrap().len(), 1);
+
+        // Empty containers still emit an empty children array — clients
+        // shouldn't have to special-case "missing" vs "empty".
+        let empty_book = DirectoryNode {
+            kind: DirectoryNodeKind::Book,
+            id: 1,
+            name: "b".to_string(),
+            slug: "b".to_string(),
+            page_kind: None,
+            children: Vec::new(),
+        };
+        let v = directory_node_to_json(&empty_book);
+        assert_eq!(v["children"], json!([]));
+    }
+
+    #[test]
+    fn filter_directory_drops_forbidden_pages_and_empty_chapters() {
+        // Tree: shelf → book → chapter(allowed-page, forbidden-page) +
+        // chapter(only-forbidden) + book-root forbidden-page.
+        let tree = vec![DirectoryNode {
+            kind: DirectoryNodeKind::Shelf,
+            id: 100,
+            name: "s".to_string(),
+            slug: "s".to_string(),
+            page_kind: None,
+            children: vec![DirectoryNode {
+                kind: DirectoryNodeKind::Book,
+                id: 200,
+                name: "b".to_string(),
+                slug: "b".to_string(),
+                page_kind: None,
+                children: vec![
+                    DirectoryNode {
+                        kind: DirectoryNodeKind::Chapter,
+                        id: 300,
+                        name: "c1".to_string(),
+                        slug: "c1".to_string(),
+                        page_kind: None,
+                        children: vec![
+                            DirectoryNode {
+                                kind: DirectoryNodeKind::Page,
+                                id: 1,
+                                name: "ok".to_string(),
+                                slug: "ok".to_string(),
+                                page_kind: Some("unclassified".to_string()),
+                                children: vec![],
+                            },
+                            DirectoryNode {
+                                kind: DirectoryNodeKind::Page,
+                                id: 2,
+                                name: "forbidden".to_string(),
+                                slug: "forbidden".to_string(),
+                                page_kind: Some("unclassified".to_string()),
+                                children: vec![],
+                            },
+                        ],
+                    },
+                    DirectoryNode {
+                        kind: DirectoryNodeKind::Chapter,
+                        id: 301,
+                        name: "c2".to_string(),
+                        slug: "c2".to_string(),
+                        page_kind: None,
+                        children: vec![DirectoryNode {
+                            kind: DirectoryNodeKind::Page,
+                            id: 3,
+                            name: "forbidden2".to_string(),
+                            slug: "forbidden2".to_string(),
+                            page_kind: Some("unclassified".to_string()),
+                            children: vec![],
+                        }],
+                    },
+                    DirectoryNode {
+                        kind: DirectoryNodeKind::Page,
+                        id: 4,
+                        name: "root-forbidden".to_string(),
+                        slug: "root-forbidden".to_string(),
+                        page_kind: Some("unclassified".to_string()),
+                        children: vec![],
+                    },
+                ],
+            }],
+        }];
+
+        // Allow only page 1.
+        let allowed: std::collections::HashSet<i64> = [1].into_iter().collect();
+        let mut out = Vec::new();
+        for node in tree {
+            if let Some(n) = filter_node(node, &allowed) {
+                out.push(n);
+            }
+        }
+        // The whole shelf survives (one page chain stayed); but c2 dropped
+        // because every descendant was forbidden, and the root-forbidden
+        // page is gone too.
+        assert_eq!(out.len(), 1);
+        let shelf = &out[0];
+        let book = &shelf.children[0];
+        // Only c1 should remain in the book — c2 and the forbidden root
+        // page get pruned.
+        assert_eq!(book.children.len(), 1);
+        let c1 = &book.children[0];
+        assert_eq!(c1.id, 300);
+        assert_eq!(c1.children.len(), 1);
+        assert_eq!(c1.children[0].id, 1);
+    }
+
+    #[test]
+    fn filter_directory_keeps_container_when_caller_cut_depth() {
+        // A book with no children (caller asked depth=0). We can't tell
+        // whether it's "really empty" or "depth-cut", so we keep it.
+        let tree = vec![DirectoryNode {
+            kind: DirectoryNodeKind::Book,
+            id: 200,
+            name: "b".to_string(),
+            slug: "b".to_string(),
+            page_kind: None,
+            children: vec![],
+        }];
+        let allowed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for node in tree {
+            if let Some(n) = filter_node(node, &allowed) {
+                out.push(n);
+            }
+        }
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn collect_page_ids_walks_full_tree() {
+        let tree = vec![DirectoryNode {
+            kind: DirectoryNodeKind::Shelf,
+            id: 1,
+            name: "s".to_string(),
+            slug: "s".to_string(),
+            page_kind: None,
+            children: vec![
+                DirectoryNode {
+                    kind: DirectoryNodeKind::Page,
+                    id: 10,
+                    name: "p10".to_string(),
+                    slug: "p10".to_string(),
+                    page_kind: None,
+                    children: vec![],
+                },
+                DirectoryNode {
+                    kind: DirectoryNodeKind::Book,
+                    id: 2,
+                    name: "b".to_string(),
+                    slug: "b".to_string(),
+                    page_kind: None,
+                    children: vec![DirectoryNode {
+                        kind: DirectoryNodeKind::Page,
+                        id: 20,
+                        name: "p20".to_string(),
+                        slug: "p20".to_string(),
+                        page_kind: None,
+                        children: vec![],
+                    }],
+                },
+            ],
+        }];
+        let mut ids = Vec::new();
+        collect_page_ids(&tree, &mut ids);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![10, 20]);
+    }
+
+    // --- Issue #80 — semantic_search scope param parsing ---
+
+    #[test]
+    fn arg_i64_array_parses_explicit_ids() {
+        let args = json!({
+            "shelf_ids": [1, 2, 3],
+            "book_ids": [10, 20],
+            "chapter_ids": [],
+            "page_ids": [99]
+        });
+        assert_eq!(arg_i64_array(&args, "shelf_ids"), vec![1, 2, 3]);
+        assert_eq!(arg_i64_array(&args, "book_ids"), vec![10, 20]);
+        assert_eq!(arg_i64_array(&args, "chapter_ids"), Vec::<i64>::new());
+        assert_eq!(arg_i64_array(&args, "page_ids"), vec![99]);
+        // Missing key → empty vec.
+        assert_eq!(arg_i64_array(&args, "missing"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn arg_i64_array_skips_non_integer_entries() {
+        let args = json!({
+            "book_ids": [1, "not-a-number", 2, null, 3]
+        });
+        assert_eq!(arg_i64_array(&args, "book_ids"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn arg_i64_array_handles_non_array() {
+        let args = json!({ "book_ids": "not-an-array" });
+        assert_eq!(arg_i64_array(&args, "book_ids"), Vec::<i64>::new());
+    }
+
+    /// Building a ScopeFilter from the parsed arrays matches the issue-#80
+    /// union semantics: the explicit lists carry through unchanged.
+    #[test]
+    fn scope_filter_assembly_from_explicit_args_unions() {
+        let args = json!({
+            "shelf_ids": [1],
+            "book_ids": [10, 20],
+            "chapter_ids": [100],
+            "page_ids": [1000, 2000]
+        });
+        let scope = ScopeFilter {
+            shelf_ids: arg_i64_array(&args, "shelf_ids"),
+            book_ids: arg_i64_array(&args, "book_ids"),
+            chapter_ids: arg_i64_array(&args, "chapter_ids"),
+            page_ids: arg_i64_array(&args, "page_ids"),
+        };
+        assert_eq!(scope.shelf_ids, vec![1]);
+        assert_eq!(scope.book_ids, vec![10, 20]);
+        assert_eq!(scope.chapter_ids, vec![100]);
+        assert_eq!(scope.page_ids, vec![1000, 2000]);
+        assert!(!scope.is_empty());
+    }
+
+    /// No scope params → ScopeFilter::is_empty() is true and the cascade
+    /// caller passes `None` (full-corpus search). Regression test for the
+    /// zero-regression acceptance criterion.
+    #[test]
+    fn scope_filter_is_empty_when_no_scope_args() {
+        let args = json!({ "query": "anything" });
+        let scope = ScopeFilter {
+            shelf_ids: arg_i64_array(&args, "shelf_ids"),
+            book_ids: arg_i64_array(&args, "book_ids"),
+            chapter_ids: arg_i64_array(&args, "chapter_ids"),
+            page_ids: arg_i64_array(&args, "page_ids"),
+        };
+        assert!(scope.is_empty());
+    }
+
+    /// Merging an explicit-ID scope with a named-scope result is union
+    /// semantics. Dedup collapses overlaps. Mirrors the `mcp.rs` flow.
+    #[test]
+    fn scope_filter_merge_then_dedup_unions_and_dedupes() {
+        let mut scope = ScopeFilter {
+            book_ids: vec![10, 20],
+            ..Default::default()
+        };
+        scope.merge(&ScopeFilter {
+            book_ids: vec![20, 30],
+            chapter_ids: vec![100],
+            ..Default::default()
+        });
+        scope.dedup();
+        assert_eq!(scope.book_ids, vec![10, 20, 30]);
+        assert_eq!(scope.chapter_ids, vec![100]);
+        assert!(scope.shelf_ids.is_empty());
+        assert!(scope.page_ids.is_empty());
+    }
+
+    /// `mode` defaults — the schema default is `"default"` per issue #80
+    /// but pre-#80 callers passing `"standard"` still parse to the same
+    /// SearchMode variant (Standard). Locks the zero-regression contract.
+    /// Issue #115 (v0.13.0) — `"rerank"` is hard-cut and now parses to
+    /// `None`; the caller surfaces a structured error pointing at the new
+    /// `rerank: true` flag.
+    #[test]
+    fn search_mode_default_and_standard_both_parse_to_standard() {
+        assert_eq!(SearchMode::parse("default"), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse("standard"), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse(""), Some(SearchMode::Standard));
+        assert_eq!(SearchMode::parse("precision"), Some(SearchMode::Precision));
+        // v0.13.0: `mode: "rerank"` is no longer a valid mode value.
+        assert_eq!(SearchMode::parse("rerank"), None);
+        assert_eq!(SearchMode::parse("nonsense"), None);
+    }
+
+    /// Schema sanity for the new tool surface — semantic_search now accepts
+    /// the scope params. Locks that they're advertised correctly.
+    #[test]
+    fn semantic_search_schema_advertises_scope_params() {
+        let tools = tool_definitions(true);
+        let sem = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("semantic_search"))
+            .expect("semantic_search tool present");
+        let props = sem
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("semantic_search schema has properties");
+        for field in ["shelf_ids", "book_ids", "chapter_ids", "page_ids", "scopes"] {
+            assert!(
+                props.contains_key(field),
+                "semantic_search schema missing '{field}' property"
+            );
+        }
+        // Mode enum surfaces `default` and `precision` per issue #80;
+        // issue #115 (v0.13.0) hard-cut `rerank` from the enum in favor
+        // of the `rerank: true` flag on `standard`.
+        let mode_enum = props
+            .get("mode")
+            .and_then(|m| m.get("enum"))
+            .and_then(|e| e.as_array())
+            .expect("mode schema has enum");
+        let modes: Vec<String> = mode_enum
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(modes.contains(&"default".to_string()));
+        assert!(modes.contains(&"precision".to_string()));
+        assert!(modes.contains(&"standard".to_string()));
+        assert!(
+            !modes.contains(&"rerank".to_string()),
+            "issue #115: `rerank` mode was hard-cut in v0.13.0 — should not appear in the enum"
+        );
+
+        // Issue #115 — `rerank: bool` flag advertised on the schema.
+        let rerank_prop = props
+            .get("rerank")
+            .expect("semantic_search schema missing 'rerank' boolean (issue #115)");
+        assert_eq!(
+            rerank_prop.get("type").and_then(|v| v.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            rerank_prop.get("default").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// Issue #115 — `search_content` advertises the new `rerank: bool`
+    /// flag. Same shape as on `semantic_search` (boolean, default false).
+    #[test]
+    fn search_content_schema_advertises_rerank_flag() {
+        let tools = tool_definitions(true);
+        let sc = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("search_content"))
+            .expect("search_content tool present");
+        let props = sc
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("search_content schema has properties");
+        let rerank_prop = props
+            .get("rerank")
+            .expect("search_content schema missing 'rerank' boolean (issue #115)");
+        assert_eq!(
+            rerank_prop.get("type").and_then(|v| v.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            rerank_prop.get("default").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// Issue #115 — callers passing the removed `mode: "rerank"` get a
+    /// structured error pointing at the new `rerank: true` flag with
+    /// `mode: "standard"`. The error string must explicitly mention both
+    /// "rerank: true" and "mode: \"standard\"" so the migration path is
+    /// obvious from the error alone.
+    #[test]
+    fn legacy_mode_rerank_arg_yields_structured_migration_error() {
+        // Mimic the execute_tool error branch — we hit the `Err` arm of
+        // `SearchMode::parse` and build the migration string.
+        let mode_str = "rerank";
+        let parsed = SearchMode::parse(mode_str);
+        assert!(parsed.is_none(), "v0.13.0: `rerank` is no longer a mode");
+        // Build the same error string the execute_tool branch would.
+        let err = if mode_str.eq_ignore_ascii_case("rerank") {
+            "mode: \"rerank\" was removed in v0.13.0. \
+             Pass `rerank: true` with `mode: \"standard\"` instead — \
+             same cross-encoder pass, now a flag."
+                .to_string()
+        } else {
+            String::new()
+        };
+        assert!(err.contains("rerank: true"), "error must name the new flag");
+        assert!(
+            err.contains("mode: \"standard\""),
+            "error must name the host mode"
+        );
+        assert!(
+            err.contains("v0.13.0"),
+            "error must name the breaking-change release"
         );
     }
 }

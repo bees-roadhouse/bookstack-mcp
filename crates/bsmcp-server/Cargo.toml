@@ -8,6 +8,7 @@ bsmcp-common = { path = "../bsmcp-common" }
 bsmcp-db-sqlite = { path = "../bsmcp-db-sqlite" }
 bsmcp-db-postgres = { path = "../bsmcp-db-postgres" }
 tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
 axum = { version = "0.8", features = ["tokio", "multipart"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +32,9 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 # release.yml's binary matrix builds bsmcp-server for all five targets, so this
 # crate is the right place for the dep.
 openssl = { version = "0.10", features = ["vendored"] }
+
+[dev-dependencies]
+# Used to exercise the SettingsForm parser directly in tests without booting
+# axum. axum::Form delegates to serde_urlencoded internally, so the dev-dep
+# matches the production codepath.
+serde_urlencoded = "0.7"

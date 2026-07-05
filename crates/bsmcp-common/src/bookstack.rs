@@ -272,14 +272,14 @@ impl BookStackClient {
     async fn read_json(resp: reqwest::Response) -> Result<Value, String> {
         Self::check_content_length(&resp, MAX_RESPONSE_SIZE)?;
         let bytes = resp.bytes().await.map_err(|e| {
-            eprintln!("Response read error: {e}");
+            tracing::error!(error = %e, "bookstack_response_read_error");
             "Failed to read response".to_string()
         })?;
         if bytes.len() > MAX_RESPONSE_SIZE {
             return Err(format!("Response too large: {} bytes", bytes.len()));
         }
         serde_json::from_slice(&bytes).map_err(|e| {
-            eprintln!("JSON parse error: {e}");
+            tracing::error!(error = %e, "bookstack_json_parse_error");
             "Invalid response from BookStack".to_string()
         })
     }
@@ -288,14 +288,14 @@ impl BookStackClient {
     async fn read_text(resp: reqwest::Response) -> Result<String, String> {
         Self::check_content_length(&resp, MAX_RESPONSE_SIZE)?;
         let bytes = resp.bytes().await.map_err(|e| {
-            eprintln!("Response read error: {e}");
+            tracing::error!(error = %e, "bookstack_response_read_error");
             "Failed to read response".to_string()
         })?;
         if bytes.len() > MAX_RESPONSE_SIZE {
             return Err(format!("Response too large: {} bytes", bytes.len()));
         }
         String::from_utf8(bytes.to_vec()).map_err(|e| {
-            eprintln!("UTF-8 decode error: {e}");
+            tracing::error!(error = %e, "bookstack_utf8_decode_error");
             "Invalid response encoding".to_string()
         })
     }
@@ -336,7 +336,7 @@ impl BookStackClient {
                 .try_clone()
                 .ok_or_else(|| "non-cloneable request".to_string())?;
             let resp = req.send().await.map_err(|e| {
-                eprintln!("BookStack request error: {e}");
+                tracing::error!(error = %e, "bookstack_request_error");
                 "Request failed".to_string()
             })?;
             if resp.status().as_u16() == 429 {
@@ -356,14 +356,17 @@ impl BookStackClient {
                 if attempt + 1 == Self::RETRY_429_MAX_ATTEMPTS {
                     let status = resp.status();
                     let body = Self::read_error_body(resp).await;
-                    eprintln!("BookStack 429 retry budget exhausted: {body}");
+                    tracing::error!(
+                        body = %body,
+                        "bookstack_429_retry_exhausted"
+                    );
                     return Err(format!("BookStack API error: {status}"));
                 }
-                eprintln!(
-                    "BookStack 429 retry {}/{} after {:?}",
-                    attempt + 1,
-                    Self::RETRY_429_MAX_ATTEMPTS - 1,
-                    delay
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_attempts = Self::RETRY_429_MAX_ATTEMPTS - 1,
+                    delay_ms = delay.as_millis() as u64,
+                    "bookstack_429_retry"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -384,7 +387,7 @@ impl BookStackClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
+            tracing::error!(%status, body = %body, "bookstack_api_error");
             return Err(format!("BookStack API error: {status}"));
         }
         Self::read_json(resp).await
@@ -400,7 +403,7 @@ impl BookStackClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
+            tracing::error!(%status, body = %body, "bookstack_api_error");
             return Err(format!("BookStack API error: {status}"));
         }
         Self::read_json(resp).await
@@ -421,7 +424,7 @@ impl BookStackClient {
             .send()
             .await
             .map_err(|e| {
-                eprintln!("BookStack request error: {e}");
+                tracing::error!(error = %e, "bookstack_request_error");
                 "Request failed".to_string()
             })?;
         self.rate_limiter.observe_limit(resp.headers());
@@ -429,7 +432,7 @@ impl BookStackClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
+            tracing::error!(%status, body = %body, "bookstack_api_error");
             return Err(format!("BookStack API error: {status}"));
         }
 
@@ -446,7 +449,7 @@ impl BookStackClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
+            tracing::error!(%status, body = %body, "bookstack_api_error");
             return Err(format!("BookStack API error: {status}"));
         }
         Self::read_json(resp).await
@@ -461,7 +464,7 @@ impl BookStackClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
+            tracing::error!(%status, body = %body, "bookstack_api_error");
             return Err(format!("BookStack API error: {status}"));
         }
         Self::read_text(resp).await
@@ -476,7 +479,7 @@ impl BookStackClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = Self::read_error_body(resp).await;
-            eprintln!("BookStack API error {status}: {body}");
+            tracing::error!(%status, body = %body, "bookstack_api_error");
             return Err(format!("BookStack API error: {status}"));
         }
         Ok(())
@@ -544,6 +547,38 @@ impl BookStackClient {
         }
     }
 
+    /// Resolve the calling user's role IDs (issue #58 lever a.5).
+    ///
+    /// BookStack has no `/api/users/me` endpoint, so we reuse the same
+    /// search-by-`{created_by:me}` probe `whoami` uses to discover the
+    /// caller's user id, then fetch `/api/users/{id}` and extract the
+    /// `roles` array. Reading your own user row works for any
+    /// authenticated user; the public API contract documents `roles` as
+    /// part of the user-read response.
+    ///
+    /// Returns `Ok(None)` when the user has no created content yet
+    /// (brand-new accounts) — the caller should treat that as
+    /// "prefilter disabled, fall back to HTTP fan-out". Returns `Err`
+    /// only when BookStack is unreachable or rejects the call.
+    pub async fn list_my_roles(&self) -> Result<Option<Vec<i64>>, String> {
+        let ident = match self.whoami().await? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let user = self.get_user(ident.bookstack_user_id).await?;
+        let roles = match user.get("roles").and_then(|v| v.as_array()) {
+            Some(r) => r,
+            None => return Ok(Some(Vec::new())),
+        };
+        let mut ids: Vec<i64> = Vec::with_capacity(roles.len());
+        for role in roles {
+            if let Some(id) = role.get("id").and_then(|v| v.as_i64()) {
+                ids.push(id);
+            }
+        }
+        Ok(Some(ids))
+    }
+
     // --- Shelves ---
 
     pub async fn list_shelves(&self, count: i64, offset: i64) -> Result<Value, String> {
@@ -555,6 +590,40 @@ impl BookStackClient {
             ],
         )
         .await
+    }
+
+    /// Paginated enumeration of every shelf the token can see. Returns the
+    /// flat list of shelf ids — used by the index worker's full walk on
+    /// every run (issue #122, the unconditional walk-all path; replaces the
+    /// briefly-shipped #119/#120 "walk-all when `indexed_shelves` is empty"
+    /// branching). BookStack's `/api/shelves` caps at 500 per page; we page
+    /// until `data` comes back empty.
+    pub async fn list_all_shelves(&self) -> Result<Vec<i64>, String> {
+        const PAGE_SIZE: i64 = 500;
+        let mut ids = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = self.list_shelves(PAGE_SIZE, offset).await?;
+            let arr = page
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if arr.is_empty() {
+                break;
+            }
+            let page_len = arr.len() as i64;
+            for shelf in arr {
+                if let Some(id) = shelf.get("id").and_then(|v| v.as_i64()) {
+                    ids.push(id);
+                }
+            }
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+        Ok(ids)
     }
 
     pub async fn get_shelf(&self, id: i64) -> Result<Value, String> {
@@ -1056,7 +1125,7 @@ impl BookStackClient {
             .file_name(filename.to_string())
             .mime_str(mime_type)
             .map_err(|e| {
-                eprintln!("Multipart error: {e}");
+                tracing::error!(error = %e, "bookstack_multipart_error");
                 "Invalid mime type".to_string()
             })?;
         let form = reqwest::multipart::Form::new()
@@ -1081,7 +1150,7 @@ impl BookStackClient {
             .file_name(filename.to_string())
             .mime_str(mime_type)
             .map_err(|e| {
-                eprintln!("Multipart error: {e}");
+                tracing::error!(error = %e, "bookstack_multipart_error");
                 "Invalid mime type".to_string()
             })?;
         let form = reqwest::multipart::Form::new()

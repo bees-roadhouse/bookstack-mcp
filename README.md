@@ -7,11 +7,11 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 
 - Full CRUD on all core BookStack resources (shelves, books, chapters, pages, attachments)
 - Full-text search with BookStack query operators
-- **Semantic vector search** — natural language search across all content via embeddings (optional). Three modes on `semantic_search`: `standard` (default, vector + keyword + Markov-blanket blend), `rerank` (standard pool, cross-encoder refines top-N), `precision` (wider pool, cross-encoder replaces the blend). Per-page access control enforced via BookStack's API on every result.
+- **Semantic vector search** — natural language search across all content via embeddings (optional). Two modes on `semantic_search`: `standard` (default, vector + keyword + Markov-blanket blend) and `precision` (4-stage cascade — semantic → keyword → Markov-blanket → cross-encoder). An optional `rerank: bool` flag layers a cross-encoder pass on top of the standard top-N (v0.13.0; replaces the pre-v0.13.0 `mode: "rerank"`). Per-page access control enforced via BookStack's API on every result.
 - **Settings UI (`/settings`)** — browser-based admin configuration page (token-gated via the same `/authorize` flow). Surfaces only the global server fields the index worker needs (`hive_shelf_id`, `user_journals_shelf_id`).
 - **Pluggable database** — SQLite for simple deployments, PostgreSQL + pgvector for production
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI, Voyage)
-- **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by `semantic_search`'s `mode: "rerank"` (refinement) and `mode: "precision"` (cascade) modes.
+- **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by `semantic_search`'s `rerank: true` flag (refinement on the standard mode) + `mode: "precision"` (cascade), and by `search_content`'s `rerank: true` flag (v0.13.0).
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
@@ -30,18 +30,18 @@ crates/
   bsmcp-db-sqlite/    SQLite backend (rusqlite, bundled)
   bsmcp-db-postgres/  PostgreSQL + pgvector backend (sqlx)
   bsmcp-server/       MCP server binary (axum, no ONNX dependency)
-  bsmcp-embedder/     Embedder binary (local ONNX / Ollama / OpenAI / Voyage, job queue worker + HTTP /embed + optional /rerank)
-  bsmcp-worker/       Reconciliation worker (initial walk + webhook/cron-driven delta walk; same DB as the server)
+  bsmcp-embedder/     Embedder + reconciliation worker (single binary, role-selected via --role flag)
+                      — local ONNX / Ollama / OpenAI / Voyage embedding, job queue worker, HTTP /embed + optional /rerank
+                      — reconciliation worker: initial walk + webhook/cron delta walk on the index_jobs queue
 
 docker/
   Dockerfile.server       Lightweight server image (~35MB)
-  Dockerfile.embedder     Embedder image with ONNX Runtime (~45MB)
-  Dockerfile.worker       Reconciliation worker image
+  Dockerfile.embedder     Embedder + worker image with ONNX Runtime (~45MB)
   docker-compose.yml      PostgreSQL deployment (production)
   docker-compose.sqlite.yml  SQLite deployment (simple)
 ```
 
-The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding (and `/rerank` when a reranker provider is configured). The embedder supports four embedding backends: local ONNX models (fastembed), Ollama, OpenAI-compatible APIs, and Voyage. The worker owns the `index_jobs` queue — runs the initial full walk on cold start, then consumes webhook + cron jobs and the periodic delta walk.
+The MCP server handles all client-facing protocol, OAuth, and search. The embedder runs separately, polling a database-backed job queue to embed pages and serving a `/embed` HTTP endpoint for query-time embedding (and `/rerank` when a reranker provider is configured). The embedder supports four embedding backends: local ONNX models (fastembed), Ollama, OpenAI-compatible APIs, and Voyage. The reconciliation worker (same binary, run with `--role=worker`) owns the `index_jobs` queue — runs the initial full walk on cold start, then consumes webhook + cron jobs and the periodic delta walk. Run as two compose services (separate embedder + worker) or as one with `--role=both`.
 
 ## Available Tools (59 BookStack + 3 semantic = 62)
 
@@ -68,7 +68,7 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 
 Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack tools.
 
-The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface were removed in v0.10.0; v0.11.0 adds the optional cross-encoder reranker on the embedder side and the three-mode `semantic_search` shape on the server side. See the migration notes below.
+The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface were removed in v0.10.0; v0.11.0 added the optional cross-encoder reranker on the embedder side; v0.13.0 (current) refactors that reranker from a third `semantic_search` mode into a flag on both `semantic_search` and `search_content` (breaking — see the v0.12 → v0.13 migration below). See the migration notes below.
 
 ## Setup
 
@@ -90,8 +90,8 @@ docker compose -f docker/docker-compose.yml up -d
 This starts four containers:
 - **bsmcp-postgres** — PostgreSQL 17 with pgvector extension
 - **bsmcp-server** — MCP server (port 8080)
-- **bsmcp-embedder** — Background embedding service (also serves `/rerank` when a reranker is configured)
-- **bsmcp-worker** — Reconciliation worker: initial walk on cold start, webhook + cron job consumption, periodic delta walk
+- **bsmcp-embedder** — Background embedding service (`--role=embedder`, default); also serves `/rerank` when a reranker is configured
+- **bsmcp-worker** — Reconciliation worker (same image as the embedder, started with `--role=worker`): initial walk on cold start, webhook + cron job consumption, periodic delta walk
 
 ### Quick Start (SQLite — simple)
 
@@ -166,14 +166,26 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_EMBED_CONSECUTIVE_ABORT` | No | `10` | Consecutive failures before a job aborts early |
 | `BSMCP_EMBED_HOST` | No | `0.0.0.0` | Embedder listen address |
 | `BSMCP_EMBED_PORT` | No | `8081` | Embedder listen port |
-| `BSMCP_RERANK_PROVIDER` | No | (unset) | Cross-encoder rerank provider: `local`, `voyage`, `openai`, `none`. Off by default; enables `POST /rerank` on the embedder. See [Reranker Providers](#reranker-providers). |
+| `BSMCP_RERANK_PROVIDER` | No | (unset) | Cross-encoder rerank provider: `local`, `voyage`, `openai`, `none`. Off by default; enables `POST /rerank` on the embedder, which the server consumes for `semantic_search`/`search_content` `rerank: true` and `semantic_search mode: "precision"`. See [Reranker Providers](#reranker-providers). |
 | `BSMCP_RERANK_MODEL` | If reranker on | (per provider) | Reranker model. Defaults: `BAAI/bge-reranker-v2-m3` (local), `rerank-2` (voyage). Required for `openai`. |
 | `BSMCP_RERANK_API_KEY` | If voyage/openai | - | API key for external rerank provider. |
 | `BSMCP_RERANK_API_URL` | If openai | (per provider) | Base URL. Voyage defaults to `https://api.voyageai.com`; openai requires explicit URL. |
 
+#### Role Selector
+
+The embedder image hosts both the embedder loop and the reconciliation worker loop. Select which runs per container via `--role` (CLI flag, primary) or `BSMCP_ROLE` (env fallback). Default is `embedder`.
+
+| Variable / flag | Default | Description |
+|---|---|---|
+| `--role=embedder` / `BSMCP_ROLE=embedder` | (default) | Runs the embed job queue, the `/embed` + `/rerank` HTTP endpoints, and the cross-encoder when configured. Does NOT spawn the reconciliation worker — operators running embedder-only get no automatic index retry-chain reconciliation. |
+| `--role=worker` / `BSMCP_ROLE=worker` | - | Runs the reconciliation worker only: initial full walk, periodic delta walk, lifecycle housekeeper across `index_jobs` + `embed_jobs`. No HTTP listener, no ONNX model loaded. |
+| `--role=both` / `BSMCP_ROLE=both` | - | Runs both loops in one process. Useful for single-host SQLite deployments. |
+
+The CLI flag wins over the env. Setting both (compose `command:` + `BSMCP_ROLE`) is belt-and-suspenders — recommended for clarity in compose files.
+
 #### Worker Variables
 
-Read by `bsmcp-worker` (the reconciliation worker container). The worker shares the same database as the server and owns the `index_jobs` queue.
+Read when the embedder is running with `--role=worker` or `--role=both`. The worker shares the same database as the server and owns the `index_jobs` queue.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -190,7 +202,7 @@ Read by `bsmcp-worker` (the reconciliation worker container). The worker shares 
 
 #### Job Lifecycle Variables
 
-Read by `bsmcp-worker`'s lifecycle housekeeper. Apply to both `embed_jobs` and `index_jobs`.
+Read by the worker role's lifecycle housekeeper. Apply to both `embed_jobs` and `index_jobs`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -234,16 +246,20 @@ The `YOUR_WEBHOOK_SECRET` value must match `BSMCP_WEBHOOK_SECRET` in your server
 
 After saving, any page create/update/delete in BookStack automatically queues a re-embedding job. The embedder picks it up within seconds (configurable via `BSMCP_EMBED_POLL_INTERVAL`).
 
-### Reranker Setup (optional — for `rerank` / `precision` modes)
+### Reranker Setup (optional — for the `rerank: true` flag and `mode: "precision"`)
 
-The cross-encoder reranker is off by default. `semantic_search` falls through to `mode: "standard"` (vector + keyword + Markov-blanket blend) without it. To enable `mode: "rerank"` or `mode: "precision"`:
+The cross-encoder reranker is off by default. `semantic_search` (default `mode: "standard"`, `rerank: false`) and `search_content` (default `rerank: false`) both work fine without it. To enable the `rerank: true` flag on either tool, or to use `mode: "precision"` on `semantic_search`:
 
 1. Pick a provider and set `BSMCP_RERANK_PROVIDER` on the **embedder** to one of:
    - **`local`** — in-process ONNX cross-encoder via fastembed. No API key. Default model: `BAAI/bge-reranker-v2-m3` (~600 MB, downloads on first run). Reuses `BSMCP_MODEL_PATH` for the cache directory.
    - **`voyage`** — Voyage AI's `/v1/rerank`. Set `BSMCP_RERANK_API_KEY`. Default model: `rerank-2`.
    - **`openai`** — any OpenAI-shape `/v1/rerank` endpoint (Voyage, Jina, Cohere-via-shim, self-hosted). Requires all of `BSMCP_RERANK_API_KEY`, `BSMCP_RERANK_API_URL`, and `BSMCP_RERANK_MODEL` (no upstream default — OpenAI itself has not shipped a rerank API).
 2. Restart the embedder. On startup it logs `Reranker: <provider> <model>` and starts answering `POST /rerank`. Without configuration it logs `Reranker: disabled (BSMCP_RERANK_PROVIDER unset or 'none')` and `/rerank` returns 503.
-3. Call `semantic_search` with `mode: "rerank"` (refinement on top of the standard pool) or `mode: "precision"` (wider pool, cross-encoder is the ranker of record). The response includes `scoring.rerank` per result and `stats.{rerank_ms, rerank_provider, rerank_model, candidates_reranked}`. If the reranker is disabled, the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop back to `mode: "standard"`.
+3. Use the reranker from a tool call:
+   - **`semantic_search` with `mode: "standard", rerank: true`** — runs the standard pipeline, then the cross-encoder re-orders the top-N. Equivalent to the pre-v0.13.0 `mode: "rerank"`.
+   - **`semantic_search` with `mode: "precision"`** — wider candidate pool, cross-encoder is the ranker of record (4-stage cascade; rerank is always on).
+   - **`search_content` with `rerank: true`** — BookStack keyword search, then the cross-encoder re-orders the matched results.
+   In all three cases the response includes `scoring.rerank` per result and `stats.{rerank_ms, rerank_provider, rerank_model, candidates_reranked}`. If the reranker is disabled, the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop the flag and retry.
 
 Per-provider config blocks are documented under [Reranker Providers](#reranker-providers).
 
@@ -312,9 +328,67 @@ The token ID and secret come from your BookStack API token (created under **My A
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
 
-> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 added the optional cross-encoder reranker. v0.12.x (current) is CI/build only — no user-facing behavior change (v0.12.0 = CI rework + semantic refinements; v0.12.1 = fixes the aarch64-linux release binary, adds the cargo fmt gate). Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
+> **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 added the optional cross-encoder reranker; v0.12.x was CI/build only; v0.13.0 (current) is **breaking on two fronts** — folds `bsmcp-worker` into `bsmcp-embedder` (single image, role-selected) AND refactors the reranker surface from a third `semantic_search` mode into a `rerank: bool` flag on both `semantic_search` and `search_content`. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
-### From v0.11.0 to v0.12.x (current)
+### From v0.12.x to v0.13.0 (current) — **breaking on two fronts**
+
+#### What changed — worker fold (issue #56)
+
+- **`bsmcp-worker` and `bsmcp-embedder` are now one binary, one image.** The embedder image (`ghcr.io/bees-roadhouse/bsmcp-embedder:0.13.0`) runs in either role depending on `--role=embedder|worker|both` (CLI flag, primary) or `BSMCP_ROLE=embedder|worker|both` (env var, fallback). Default with no flag is `embedder` — preserves v0.12.x behavior for unmigrated compose files that hit the embedder service.
+- **Indexer walks every visible shelf on every full walk. Per-call scoping (`shelf_ids` / `book_ids` / `chapter_ids` / `page_ids` / `scopes` on `semantic_search`) is the only scope surface — the v0.12.x `hive_shelf_id` / `user_journals_shelf_id` config + the v0.13.0-RC `indexed_shelves` interim are both gone.** Issue #122 supersedes #119/#120: the briefly-shipped `GlobalSettings::indexed_shelves` field (empty = walk all, non-empty = walk subset) conflated indexing-time corpus selection with query-time result scoping. With #80's per-call scope params already shipped, callers narrow at the search call instead. The startup migration drops `indexed_shelves_json` from both backends (`DROP COLUMN IF EXISTS` — Postgres native, SQLite 3.35+); the v0.12.x `hive_shelf_id` + `user_journals_shelf_id` columns get the same idempotent drop. The `/settings` UI loses its indexed-shelves input. Operators who carved a narrow corpus via `indexed_shelves` will see the indexer expand to walk every visible shelf on next boot; keep search results scoped by passing `shelf_ids` (or a named `kb_scopes` entry) on each `semantic_search` call.
+- **`bsmcp-worker` Docker image is now an alias of `bsmcp-embedder`.** Pulls of `ghcr.io/bees-roadhouse/bsmcp-worker:0.13.0` resolve to the same manifest. **This alias is one-release-only and will be removed in v0.14.0.** Update your compose now.
+- **CI matrix drops the `bsmcp-worker` entry.** Release builds are now two images: `bsmcp-server` + `bsmcp-embedder`.
+- **`/health` carries a new `role` field** (`"embedder"`, `"worker"`, or `"both"`) so operators can curl two compose services and verify the role flag actually took effect.
+
+#### What changed — rerank as flag (issue #115)
+
+- **`rerank: bool` flag on `semantic_search`.** Replaces the v0.11.0–v0.12.x `mode: "rerank"` value. Set `rerank: true` on `mode: "standard"` (or `mode: "default"`) to get the same cross-encoder-on-top-of-standard behavior the old `mode: "rerank"` produced — same candidate pool, same `/rerank` call path, same `scoring.rerank` + `stats.rerank_*` response shape. Default `false`.
+- **`rerank: bool` flag on `search_content`.** New: when `true`, the BookStack keyword results are reordered by the cross-encoder, each result picks up a `scoring.rerank` field, and `stats.{rerank_ms, rerank_provider, rerank_model, candidates_reranked}` is added to the response. Same shape as `semantic_search`'s rerank surface — a caller can parse both tools' output with one parser. Default `false`.
+- **`mode: "precision"`** keeps the cascade behavior unchanged. The cross-encoder is always on in precision mode by definition; passing `rerank: true` is a no-op there.
+
+#### What's removed (breaking)
+
+- **`semantic_search mode: "rerank"`** is hard-cut — there is no deprecation period. Callers passing `mode: "rerank"` get a structured error: `mode: "rerank" was removed in v0.13.0. Pass `rerank: true` with `mode: "standard"` instead — same cross-encoder pass, now a flag.`
+
+#### What's automatic
+
+- No DB schema changes. No env-var renames. Existing `BSMCP_INDEX_TOKEN_*` / `BSMCP_EMBED_TOKEN_*` precedence is preserved (index tokens primary, embed tokens fallback).
+- Existing semantics (FOR UPDATE SKIP LOCKED, retry chains, supersedence, lifecycle housekeeper) unchanged.
+- Callers that never used `mode: "rerank"` see no behavior change from the search-surface refactor.
+
+#### What you must do — compose
+
+In your compose file, find the `bsmcp-worker` service and change two lines:
+
+```diff
+   bsmcp-worker:
+-    image: ghcr.io/bees-roadhouse/bsmcp-worker:0.12.x
++    image: ghcr.io/bees-roadhouse/bsmcp-embedder:0.13.0
++    command: ["bsmcp-embedder", "--role=worker"]
+     environment:
++      BSMCP_ROLE: worker
+       BSMCP_DB_BACKEND: postgres
+```
+
+If you don't set `--role=worker` (or `BSMCP_ROLE=worker`), the container will boot in default embedder mode and contend with your real embedder for jobs. Setting both is belt-and-suspenders.
+
+The `bsmcp-server` and `bsmcp-embedder` services only need the version bump to `:0.13.0`.
+
+If you want to collapse to a single container, set `--role=both` on the embedder service and delete the worker service entirely.
+
+#### What you must do — `mode: "rerank"` callers
+
+- Replace `{"mode": "rerank"}` with `{"mode": "standard", "rerank": true}` (or `{"rerank": true}` — `mode` defaults to `"standard"`/`"default"`). Same cross-encoder pass, same response shape, just expressed as a flag. The 503 fallback on a missing `BSMCP_RERANK_PROVIDER` is unchanged.
+
+#### Strict env hygiene
+
+When the embedder boots with `--role=worker`, it emits a `WARN worker_role_ignoring_embedder_env env=BSMCP_EMBED_PROVIDER` line for each embedder-only env it finds set. Surfaces stale config you might have copied from the old worker service block. Not fatal — these envs are silently ignored under role=worker.
+
+#### Footprint note
+
+The `bsmcp-worker` role now ships ONNX Runtime (~150 MB on-disk; runtime memory unaffected because the worker role does not load the ONNX model). One-time disk cost per host; the image cache makes subsequent pulls free.
+
+### From v0.11.0 to v0.12.x
 
 #### What's automatic
 - No schema, env-var, or API surface changes. Pull new images, restart.
@@ -327,9 +401,9 @@ All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTE
 #### What's new
 
 - **Cross-encoder reranker on the embedder.** New `POST /rerank` endpoint when `BSMCP_RERANK_PROVIDER` is set on the embedder. Three providers: `local` (in-process ONNX cross-encoder via fastembed; default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint). Off by default — `BSMCP_RERANK_PROVIDER=none` (or unset) leaves the endpoint disabled and returns 503.
-- **Three-mode `semantic_search`.** Replaces the prior single-shape behavior with `mode: "standard" | "rerank" | "precision"`, defaulting to `"standard"`:
+- **Three-mode `semantic_search`** (v0.11.0–v0.12.x — see v0.13.0 notes above for the breaking refactor into a flag). Replaces the prior single-shape behavior with `mode: "standard" | "rerank" | "precision"`, defaulting to `"standard"`:
   - `standard` — vector + keyword + Markov-blanket blend (the v0.10.0 default behavior).
-  - `rerank` — same candidate pool as standard, but the final top-N is re-ordered by the cross-encoder. Cheap refinement (~10–30 ms for top-10 against a local cross-encoder).
+  - `rerank` — same candidate pool as standard, but the final top-N is re-ordered by the cross-encoder. Cheap refinement (~10–30 ms for top-10 against a local cross-encoder). **Hard-cut in v0.13.0** in favor of the `rerank: bool` flag on `mode: "standard"`.
   - `precision` — wider initial vector pool (5× limit), no keyword/blanket blend, cross-encoder is the ranker of record. More expensive, can rescue hits the blend would miss.
 - **Per-result `scoring.rerank` and `stats.rerank_*`** in the search response when either rerank-enabled mode fires (`mode`, `hybrid`, `rerank_ms`, `rerank_provider`, `rerank_model`, `candidates_reranked`).
 
@@ -342,7 +416,7 @@ All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTE
 
 1. Pull new images: `ghcr.io/bees-roadhouse/bsmcp-server:0.11.0` + `ghcr.io/bees-roadhouse/bsmcp-embedder:0.11.0` + `ghcr.io/bees-roadhouse/bsmcp-worker:0.11.0`.
 2. Set `BSMCP_RERANK_PROVIDER` (and the matching `BSMCP_RERANK_MODEL` / `BSMCP_RERANK_API_KEY` / `BSMCP_RERANK_API_URL`) on the embedder.
-3. Pass `mode: "rerank"` or `mode: "precision"` on `semantic_search` calls. If the reranker is disabled, the embedder returns 503 and the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop back to `mode: "standard"`.
+3. Pass `mode: "rerank"` or `mode: "precision"` on `semantic_search` calls. If the reranker is disabled, the embedder returns 503 and the server surfaces a clear error pointing at `BSMCP_RERANK_PROVIDER` so callers can drop back to `mode: "standard"`. (As of v0.13.0, the `mode: "rerank"` value is hard-cut in favor of a `rerank: bool` flag — see the v0.12.x → v0.13.0 notes above.)
 
 ### From v0.9.0 to v0.10.0
 
@@ -761,7 +835,7 @@ BSMCP_EMBED_API_URL=https://api.voyageai.com  # default
 
 ## Reranker Providers
 
-Set via `BSMCP_RERANK_PROVIDER` on the **embedder**. Off by default. See [Reranker Setup](#reranker-setup-optional--for-rerank--precision-modes) for the activation walkthrough.
+Set via `BSMCP_RERANK_PROVIDER` on the **embedder**. Off by default. See [Reranker Setup](#reranker-setup-optional--for-the-rerank-true-flag-and-mode-precision) for the activation walkthrough.
 
 ### Local (default model: `BAAI/bge-reranker-v2-m3`)
 

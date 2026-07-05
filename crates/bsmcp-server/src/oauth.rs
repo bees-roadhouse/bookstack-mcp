@@ -346,7 +346,7 @@ pub async fn handle_authorize_submit(
         state.http_client.clone(),
     );
     if let Err(e) = bs_client.validate().await {
-        eprintln!("OAuth: credential validation failed: {e}");
+        tracing::warn!(error = %e, "oauth_credential_validation_failed");
         let params = AuthorizeParams {
             response_type: form.response_type.clone(),
             client_id: form.client_id.clone(),
@@ -374,7 +374,7 @@ pub async fn handle_authorize_submit(
         )
         .await;
         let cookie = crate::settings_ui::build_session_cookie(&session_id);
-        eprintln!("OAuth: issued settings-UI session for /settings flow");
+        tracing::info!("oauth_settings_session_issued");
         return (
             StatusCode::FOUND,
             [
@@ -419,7 +419,7 @@ pub async fn handle_authorize_submit(
         redirect_url.push_str(&format!("&state={state_encoded}"));
     }
 
-    eprintln!("OAuth: credentials validated, issued auth code");
+    tracing::info!("oauth_auth_code_issued");
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
 }
 
@@ -530,7 +530,7 @@ async fn handle_token_authorization_code(
     let (token_id, token_secret) = if let (Some(tid), Some(tsec)) =
         (auth_code.token_id.clone(), auth_code.token_secret.clone())
     {
-        eprintln!("OAuth: using form-authenticated credentials");
+        tracing::debug!(flow = "form", "oauth_using_credentials");
         (tid, tsec)
     } else {
         let (client_id, client_secret) = match extract_client_credentials(&headers, &form) {
@@ -559,7 +559,7 @@ async fn handle_token_authorization_code(
             state.http_client.clone(),
         );
         if let Err(e) = bs_client.validate().await {
-            eprintln!("OAuth: BookStack credential validation failed: {e}");
+            tracing::warn!(error = %e, "oauth_bookstack_credential_validation_failed");
             return oauth_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_client",
@@ -567,7 +567,10 @@ async fn handle_token_authorization_code(
             );
         }
 
-        eprintln!("OAuth: using legacy client credential flow");
+        tracing::debug!(
+            flow = "legacy_client_credentials",
+            "oauth_using_credentials"
+        );
         (client_id, client_secret)
     };
 
@@ -597,7 +600,7 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
             )
         }
         Err(e) => {
-            eprintln!("OAuth: refresh token lookup failed: {e}");
+            tracing::error!(error = %e, "oauth_refresh_token_lookup_failed");
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -614,7 +617,7 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
         state.http_client.clone(),
     );
     if let Err(e) = bs_client.validate().await {
-        eprintln!("OAuth: stored BookStack credentials no longer valid: {e}");
+        tracing::warn!(error = %e, "oauth_stored_credentials_invalid");
         // Consume the invalid refresh token
         state.db.delete_refresh_token(&old_refresh).await.ok();
         return oauth_error(
@@ -626,10 +629,10 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
 
     // Consume the old refresh token (rotation)
     if let Err(e) = state.db.delete_refresh_token(&old_refresh).await {
-        eprintln!("OAuth: failed to delete old refresh token: {e}");
+        tracing::error!(error = %e, "oauth_delete_old_refresh_token_failed");
     }
 
-    eprintln!("OAuth: refreshing token (credentials validated)");
+    tracing::info!("oauth_token_refresh");
     issue_tokens(&state, &token_id, &token_secret).await
 }
 
@@ -644,7 +647,7 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
         .insert_access_token(&access_token, token_id, token_secret)
         .await
     {
-        eprintln!("OAuth: failed to persist access token: {e}");
+        tracing::error!(error = %e, "oauth_persist_access_token_failed");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
@@ -657,7 +660,7 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
         .insert_refresh_token(&refresh_token, token_id, token_secret)
         .await
     {
-        eprintln!("OAuth: failed to persist refresh token: {e}");
+        tracing::error!(error = %e, "oauth_persist_refresh_token_failed");
         return oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
@@ -665,7 +668,7 @@ async fn issue_tokens(state: &AppState, token_id: &str, token_secret: &str) -> R
         );
     }
 
-    eprintln!("OAuth: issued access token + refresh token");
+    tracing::info!("oauth_tokens_issued");
 
     (
         StatusCode::OK,
@@ -739,7 +742,7 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
         .get("client_name")
         .and_then(|v| v.as_str())
         .unwrap_or("<unnamed>");
-    eprintln!("OAuth: registration request from client: {client_name}");
+    tracing::info!(client_name = %client_name, "oauth_register_request");
 
     let client_id = uuid::Uuid::new_v4().to_string();
 
@@ -764,7 +767,7 @@ pub async fn handle_register(State(state): State<AppState>, body: String) -> Res
         response["scope"] = scope.clone();
     }
 
-    eprintln!("OAuth: registered dynamic client {client_id}");
+    tracing::info!(client_id = %client_id, "oauth_client_registered");
 
     (
         StatusCode::CREATED,

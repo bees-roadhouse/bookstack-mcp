@@ -14,7 +14,7 @@ services:
       retries: 5
 
   bsmcp-server:
-    image: ghcr.io/bees-roadhouse/bsmcp-server:0.7.0
+    image: ghcr.io/bees-roadhouse/bsmcp-server:dev
     environment:
       BSMCP_DB_BACKEND: postgres
       BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
@@ -33,6 +33,9 @@ services:
       BSMCP_REFRESH_TOKEN_TTL: ${BSMCP_REFRESH_TOKEN_TTL:-7776000}
       BSMCP_BACKUP_INTERVAL: ${BSMCP_BACKUP_INTERVAL:-}
       BSMCP_BACKUP_PATH: ${BSMCP_BACKUP_PATH:-/data/backups}
+      BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN: ${BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN:-180}
+      BSMCP_DEFAULT_TIMEZONE: ${BSMCP_DEFAULT_TIMEZONE:-}
+      BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
     ports:
@@ -42,7 +45,7 @@ services:
         condition: service_healthy
 
   bsmcp-embedder:
-    image: ghcr.io/bees-roadhouse/bsmcp-embedder:0.7.0
+    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
     cpus: ${BSMCP_EMBED_CPUS:-0}
     volumes:
       - bsmcp-models:/data/models
@@ -68,6 +71,13 @@ services:
       BSMCP_EMBED_CONSECUTIVE_ABORT: ${BSMCP_EMBED_CONSECUTIVE_ABORT:-10}
       BSMCP_EMBED_HOST: ${BSMCP_EMBED_HOST:-0.0.0.0}
       BSMCP_EMBED_PORT: ${BSMCP_EMBED_PORT:-8081}
+      # Cross-encoder reranker (powers semantic_search mode=rerank|precision).
+      # Provider: local (in-process ONNX via fastembed) | voyage | openai-compatible | none.
+      BSMCP_RERANK_PROVIDER: ${BSMCP_RERANK_PROVIDER:-none}
+      BSMCP_RERANK_MODEL: ${BSMCP_RERANK_MODEL:-}
+      BSMCP_RERANK_API_KEY: ${BSMCP_RERANK_API_KEY:-}
+      BSMCP_RERANK_API_URL: ${BSMCP_RERANK_API_URL:-}
+      BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
     depends_on:
@@ -77,9 +87,18 @@ services:
   # Reconciliation worker — owns the index_jobs queue. Same database as
   # the server (both processes touch index_jobs / bookstack_pages /
   # page_cache). Runs only when an admin BookStack token is configured.
+  #
+  # v0.13.0: this is the SAME image as bsmcp-embedder, selected into
+  # worker mode via `--role=worker` (CLI flag, primary) and BSMCP_ROLE
+  # env (belt + suspenders). bsmcp-worker:<tag> is published as a
+  # registry alias of bsmcp-embedder:<tag> for one release only —
+  # operators should switch the `image:` line during the v0.13.x window.
+  # The alias is removed in v0.14.0. See README "From v0.12.x to v0.13.0".
   bsmcp-worker:
-    image: ghcr.io/bees-roadhouse/bsmcp-worker:0.7.3
+    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
+    command: ["bsmcp-embedder", "--role=worker"]
     environment:
+      BSMCP_ROLE: worker
       BSMCP_DB_BACKEND: postgres
       BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
       BSMCP_ENCRYPTION_KEY: ${BSMCP_ENCRYPTION_KEY}
@@ -89,6 +108,12 @@ services:
       BSMCP_INDEX_TOKEN_ID: ${BSMCP_INDEX_TOKEN_ID:-${BSMCP_EMBED_TOKEN_ID:-}}
       BSMCP_INDEX_TOKEN_SECRET: ${BSMCP_INDEX_TOKEN_SECRET:-${BSMCP_EMBED_TOKEN_SECRET:-}}
       BSMCP_INDEX_DELTA_INTERVAL_SECONDS: ${BSMCP_INDEX_DELTA_INTERVAL_SECONDS:-300}
+      # Job lifecycle housekeeper (applies to both index_jobs + embed_jobs).
+      BSMCP_JOB_TIMEOUT_SECS: ${BSMCP_JOB_TIMEOUT_SECS:-3600}
+      BSMCP_JOB_RECONCILE_SECS: ${BSMCP_JOB_RECONCILE_SECS:-300}
+      BSMCP_JOB_MAX_RETRY_CHAIN: ${BSMCP_JOB_MAX_RETRY_CHAIN:-5}
+      BSMCP_JOB_CLOSE_GRACE_SECS: ${BSMCP_JOB_CLOSE_GRACE_SECS:-30}
+      BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
     depends_on:

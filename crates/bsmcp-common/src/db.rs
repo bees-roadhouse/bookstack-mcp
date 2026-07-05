@@ -160,15 +160,21 @@ pub trait SemanticDb: Send + Sync + 'static {
 
     /// Backend-specific vector search. SQLite: brute-force cosine scan. Postgres: pgvector HNSW.
     ///
-    /// `book_ids`: when `Some(&[..])`, restrict candidates to chunks whose
-    /// parent page lives in one of those books. When `None` or an empty slice,
-    /// search across the entire embedded corpus.
+    /// `scope`: when `Some(&filter)` with at least one non-empty ID list,
+    /// restrict candidates to chunks whose parent page matches the union of
+    /// the supplied book/chapter/page ID lists. When `None` or an
+    /// all-empty filter, search across the entire embedded corpus.
+    ///
+    /// Shelf-level filtering is **not** evaluated here — the embedding
+    /// `pages` table doesn't carry `shelf_id`. The caller is responsible for
+    /// expanding `shelf_ids` to the matching `book_ids` (via the structural
+    /// index) before invoking `vector_search`.
     async fn vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
-        book_ids: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
     ) -> Result<Vec<SearchHit>, String>;
 
     /// Look up the `book_id` for each requested page in one roundtrip.
@@ -219,6 +225,60 @@ pub trait SemanticDb: Send + Sync + 'static {
     /// List page IDs that have a stored ACL. Used by the daily reconciliation
     /// job to know which pages to refresh.
     async fn list_acl_page_ids(&self) -> Result<Vec<i64>, String>;
+
+    /// DB-side ACL prefilter (issue #58 lever a.5). Single query joins
+    /// `pages` against `page_view_acl` to bucket each requested page into
+    /// [`AclPrefilter`]. Lets the semantic-search read path drop
+    /// definitely-denied pages and admit definitely-allowed pages without
+    /// any BookStack HTTP fan-out.
+    ///
+    /// Decision tree per page row:
+    /// - `acl_computed_at IS NULL` → `Uncomputed`
+    /// - `acl_default_open = true` → `DefaultOpen` (HTTP still required for
+    ///   system-perm check, but skipped from the deny short-circuit).
+    /// - any row in `page_view_acl` with `role_id IN role_ids` → `Allow`
+    /// - else → `Deny`
+    ///
+    /// Returns one verdict per requested page that exists in the
+    /// `pages` table. Pages missing from the embedding store are omitted
+    /// (they have no ACL signal yet — fall back to HTTP).
+    async fn prefilter_pages_by_roles(
+        &self,
+        page_ids: &[i64],
+        role_ids: &[i64],
+    ) -> Result<Vec<(i64, AclPrefilter)>, String>;
+
+    // --- Permission cache (per-token, per-page) ---
+    //
+    // Issue #58 lever (a): durable L2 below the in-memory L1 in
+    // `SemanticState`. Survives restart, so cold-start no longer means
+    // fan-out a `can_access_page` call per candidate. Keyed by
+    // `SHA256(token_id)` so a raw credential identifier never lands on disk.
+
+    /// Fetch cached permission verdicts for a list of pages. Returns
+    /// `(page_id, viewable)` only for entries that exist AND whose
+    /// `cached_at >= min_cached_at`. Missing or stale rows are omitted so
+    /// the caller can fall through to HTTP.
+    async fn get_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        page_ids: &[i64],
+        min_cached_at: i64,
+    ) -> Result<Vec<(i64, bool)>, String>;
+
+    /// Upsert one or more permission cache entries for a token. Idempotent
+    /// on `(token_hash, page_id)`; refreshes both `viewable` and
+    /// `cached_at`. Batched into a single transaction.
+    async fn upsert_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        entries: &[(i64, bool)],
+        cached_at: i64,
+    ) -> Result<(), String>;
+
+    /// Delete cache rows whose `cached_at < older_than`. Returns the row
+    /// count removed. Called by the periodic eviction task.
+    async fn evict_stale_permission_cache(&self, older_than: i64) -> Result<usize, String>;
 }
 
 /// v1.0.0 reconciliation index — structural mirror of every BookStack item we
@@ -353,4 +413,35 @@ pub trait IndexDb: Send + Sync + 'static {
 
     async fn get_index_meta(&self, key: &str) -> Result<Option<String>, String>;
     async fn set_index_meta(&self, key: &str, value: &str) -> Result<(), String>;
+
+    // --- Directory tree (issue #69) ---
+
+    /// List every non-deleted shelf in the index. Used by `read_directory_tree`
+    /// when scope is `All` to enumerate the top level.
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String>;
+
+    /// List every non-deleted book that isn't assigned to any shelf. Returned
+    /// alongside `list_indexed_shelves` for the `All` scope so the synthetic
+    /// "Unshelved" group can wrap them.
+    async fn list_indexed_books_unshelved(&self) -> Result<Vec<IndexedBook>, String>;
+
+    /// Assemble a scoped, depth-limited directory tree from the bookstack_*
+    /// index tables (NOT live BookStack — target ~10ms warm).
+    ///
+    /// Depth semantics: 0 returns just the root nodes (shelves or the
+    /// requested book/chapter) with empty `children`; 1 expands one level;
+    /// unbounded (`depth = None`) walks down to pages. `scope` chooses the
+    /// root; `All` materializes every shelf plus a synthetic "Unshelved"
+    /// pseudo-shelf (id = 0, kind = `Shelf`) that holds any book with
+    /// `shelf_id IS NULL`.
+    ///
+    /// Soft-deleted rows (`deleted = TRUE`) are skipped at every level. ACL
+    /// filtering is the caller's job — this method returns the structural
+    /// candidate tree; the MCP layer filters pages via BookStack's
+    /// `can_access_page` and prunes empty branches.
+    async fn read_directory_tree(
+        &self,
+        scope: DirectoryScope,
+        depth: Option<u32>,
+    ) -> Result<Vec<DirectoryNode>, String>;
 }

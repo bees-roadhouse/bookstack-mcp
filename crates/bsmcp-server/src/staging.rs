@@ -44,7 +44,7 @@ pub fn cleanup_expired_sync(store: &StagingStore) {
         map.retain(|_, entry| entry.created_at.elapsed() < STAGING_TTL);
         let removed = before - map.len();
         if removed > 0 {
-            eprintln!("Staging: cleaned up {removed} expired slot(s)");
+            tracing::debug!(removed, "staging_cleanup_expired");
         }
     }
 }
@@ -128,7 +128,13 @@ pub async fn handle_stage_upload(
         );
     }
 
-    eprintln!("Staging: stored {staging_id} ({filename}, {mime_type}, {size} bytes)");
+    tracing::info!(
+        staging_id = %staging_id,
+        filename = %filename,
+        mime_type = %mime_type,
+        size,
+        "staging_file_stored"
+    );
 
     (
         StatusCode::OK,

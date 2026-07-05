@@ -81,7 +81,7 @@ pub async fn build_role_context(client: &BookStackClient) -> Result<RoleContext,
         let detail = match client.get_role(*role_id).await {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("ACL: failed to fetch role {role_id} detail (skipping): {e}");
+                tracing::warn!(role_id = *role_id, error = %e, "acl_role_detail_fetch_failed");
                 continue;
             }
         };
@@ -90,10 +90,10 @@ pub async fn build_role_context(client: &BookStackClient) -> Result<RoleContext,
         }
     }
 
-    eprintln!(
-        "ACL: built role context — {} total roles, {} have system-level page view",
-        all_role_ids.len(),
-        view_all_role_ids.len()
+    tracing::info!(
+        total_roles = all_role_ids.len(),
+        view_all_roles = view_all_role_ids.len(),
+        "acl_role_context_built"
     );
     Ok(RoleContext {
         all_role_ids,
@@ -265,7 +265,7 @@ pub async fn reconcile_all_pages(
             Ok(Some(m)) => m,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("ACL reconcile: get_page_meta({page_id}) failed: {e}");
+                tracing::error!(page_id, error = %e, "acl_reconcile_get_page_meta_failed");
                 failed += 1;
                 continue;
             }
@@ -273,14 +273,14 @@ pub async fn reconcile_all_pages(
         match resolve_page_acl(client, page_id, meta.chapter_id, meta.book_id, &role_ctx).await {
             Ok(acl) => {
                 if let Err(e) = db.upsert_page_acl(&acl).await {
-                    eprintln!("ACL reconcile: upsert page {page_id} failed: {e}");
+                    tracing::error!(page_id, error = %e, "acl_reconcile_upsert_failed");
                     failed += 1;
                 } else {
                     processed += 1;
                 }
             }
             Err(e) => {
-                eprintln!("ACL reconcile: resolve page {page_id} failed: {e}");
+                tracing::error!(page_id, error = %e, "acl_reconcile_resolve_failed");
                 failed += 1;
             }
         }

@@ -35,6 +35,55 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+/// Scope filter applied across all stages of the precision cascade and the
+/// stage-1 vector pass of any scoped search. Empty vectors mean "no filter
+/// for this kind"; an entirely empty [`ScopeFilter`] is treated as "full
+/// corpus" by callers (use [`Self::is_empty`] to test).
+///
+/// IDs are unioned across the four kinds: a page qualifies if it matches any
+/// shelf/book/chapter/page list. Stage-1 intersection is done at the SQL
+/// layer in the page table — the embedding `pages` table carries `book_id`
+/// and `chapter_id` directly; `shelf_id` is resolved via the structural
+/// index's `bookstack_books.shelf_id` column.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeFilter {
+    pub shelf_ids: Vec<i64>,
+    pub book_ids: Vec<i64>,
+    pub chapter_ids: Vec<i64>,
+    pub page_ids: Vec<i64>,
+}
+
+impl ScopeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.shelf_ids.is_empty()
+            && self.book_ids.is_empty()
+            && self.chapter_ids.is_empty()
+            && self.page_ids.is_empty()
+    }
+
+    /// Merge another scope's IDs into this one (union semantics).
+    pub fn merge(&mut self, other: &ScopeFilter) {
+        self.shelf_ids.extend(other.shelf_ids.iter().copied());
+        self.book_ids.extend(other.book_ids.iter().copied());
+        self.chapter_ids.extend(other.chapter_ids.iter().copied());
+        self.page_ids.extend(other.page_ids.iter().copied());
+    }
+
+    /// Drop duplicate IDs in-place. Useful after [`Self::merge`] from
+    /// multiple named scopes.
+    pub fn dedup(&mut self) {
+        for ids in [
+            &mut self.shelf_ids,
+            &mut self.book_ids,
+            &mut self.chapter_ids,
+            &mut self.page_ids,
+        ] {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MarkovBlanket {
     pub linked_from: Vec<RelatedPage>,
@@ -91,4 +140,30 @@ pub struct PageAcl {
     pub default_open: bool,
     /// Unix epoch seconds the ACL was computed.
     pub computed_at: i64,
+}
+
+/// Verdict of the DB-side ACL prefilter (issue #58 lever a.5). Computed
+/// per candidate page against the calling user's role IDs by joining the
+/// `pages` table with `page_view_acl`. The prefilter sits before the HTTP
+/// fan-out in the semantic-search read path so non-default-open pages a
+/// user can't view get dropped without any BookStack round-trip.
+///
+/// Routing:
+/// - [`Allow`](Self::Allow): admit to results without HTTP. ACL was
+///   computed AND the user has a role match in `page_view_acl`.
+/// - [`Deny`](Self::Deny): drop without HTTP. ACL was computed AND no
+///   role match. The big win.
+/// - [`DefaultOpen`](Self::DefaultOpen): the all-inheriting case. Still
+///   send to HTTP because BookStack evaluates role-level system perms
+///   dynamically at the page-read endpoint (see `bsmcp_common::acl`
+///   docs lines 16-19).
+/// - [`Uncomputed`](Self::Uncomputed): ACL was never computed for this
+///   page (new page, embedder backlog). Falls through to HTTP AND
+///   triggers a background recompute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AclPrefilter {
+    Allow,
+    Deny,
+    DefaultOpen,
+    Uncomputed,
 }

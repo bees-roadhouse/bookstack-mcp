@@ -5,13 +5,19 @@ members = [
     "crates/bsmcp-db-postgres",
     "crates/bsmcp-server",
     "crates/bsmcp-embedder",
-    "crates/bsmcp-worker",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.12.2"
+version = "0.13.0"
+
+[workspace.dependencies]
+# Structured logging. `json` feature enables the JSON output mode that
+# `BSMCP_LOG_FORMAT=json` selects; `env-filter` parses `RUST_LOG`. The
+# logging subscriber is initialized per-binary via `bsmcp_common::logging`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [profile.release]
 lto = true

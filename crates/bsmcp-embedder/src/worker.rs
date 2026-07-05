@@ -1,10 +1,15 @@
-//! v1.0.0 reconciliation worker.
+//! v1.0.0 reconciliation worker (folded into bsmcp-embedder in v0.13.0).
 //!
 //! Background tokio task that keeps `bookstack_*` index tables and
 //! `page_cache` in sync with the live BookStack instance. Phase 4b ships
 //! the worker scaffolding + the initial full walk + a single-page
 //! reconcile helper (the building block that webhook + delta walk in
 //! Phase 4c will reuse).
+//!
+//! As of v0.13.0 this lives inside the `bsmcp-embedder` crate — the
+//! standalone `bsmcp-worker` binary was folded in (closes #56). The
+//! embedder's `--role={embedder|worker|both}` flag selects which loops
+//! run; the worker code itself is unchanged from the standalone binary.
 //!
 //! Triggers (this phase):
 //!   - On startup: enqueue an `all` job if `index_meta.last_full_walk_at`
@@ -33,9 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use bsmcp_common::bookstack::BookStackClient;
-use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
+use bsmcp_common::db::{IndexDb, SemanticDb};
 use bsmcp_common::index::*;
-use bsmcp_common::settings::GlobalSettings;
 
 const DEFAULT_RECONCILE_SECS: u64 = 300;
 const DEFAULT_TIMEOUT_SECS: i64 = 3600;
@@ -52,21 +56,15 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// the worker task.
 const YIELD_EVERY: usize = 25;
 
-pub struct IndexWorker {
+pub(crate) struct IndexWorker {
     bs_client: BookStackClient,
-    db: Arc<dyn DbBackend>,
     index_db: Arc<dyn IndexDb>,
 }
 
 impl IndexWorker {
-    pub fn new(
-        bs_client: BookStackClient,
-        db: Arc<dyn DbBackend>,
-        index_db: Arc<dyn IndexDb>,
-    ) -> Self {
+    pub(crate) fn new(bs_client: BookStackClient, index_db: Arc<dyn IndexDb>) -> Self {
         Self {
             bs_client,
-            db,
             index_db,
         }
     }
@@ -79,7 +77,7 @@ impl IndexWorker {
     /// `delta_interval_secs` controls the periodic delta-walk cadence
     /// (0 disables it). Webhook-triggered jobs still arrive in real time;
     /// the periodic walk is a safety net for missed webhooks.
-    pub fn spawn(
+    pub(crate) fn spawn(
         self,
         delta_interval_secs: u64,
         semantic_db: Option<Arc<dyn SemanticDb>>,
@@ -111,9 +109,12 @@ impl IndexWorker {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_CLOSE_GRACE_SECS);
 
-            eprintln!(
-                "IndexWorker: lifecycle housekeeper — timeout={timeout_secs}s reconcile={reconcile_secs}s \
-                 max_chain={max_chain} close_grace={close_grace}s"
+            tracing::info!(
+                timeout_s = timeout_secs,
+                reconcile_s = reconcile_secs,
+                max_chain,
+                close_grace_s = close_grace,
+                "indexworker_lifecycle_housekeeper"
             );
 
             // Stagger 30s after startup so the initial walk gets a head start.
@@ -131,28 +132,38 @@ impl IndexWorker {
                     .await
                 {
                     for j in jobs {
-                        eprintln!(
-                            "IndexWorker: timing out index job {} (started_at={:?})",
-                            j.id, j.started_at
+                        tracing::warn!(
+                            job_id = j.id,
+                            started_at = ?j.started_at,
+                            "indexworker_index_job_timing_out"
                         );
                         if let Err(e) = worker_for_lifecycle
                             .index_db
                             .fail_index_job(j.id, "timeout")
                             .await
                         {
-                            eprintln!("IndexWorker: fail_index_job({}) failed: {e}", j.id);
+                            tracing::error!(
+                                job_id = j.id,
+                                error = %e,
+                                "indexworker_fail_index_job_failed"
+                            );
                         }
                     }
                 }
                 if let Some(sdb) = semantic_for_lifecycle.as_ref() {
                     if let Ok(jobs) = sdb.list_running_embed_jobs_started_before(cutoff).await {
                         for j in jobs {
-                            eprintln!(
-                                "IndexWorker: timing out embed job {} (started_at={:?})",
-                                j.id, j.started_at
+                            tracing::warn!(
+                                job_id = j.id,
+                                started_at = ?j.started_at,
+                                "indexworker_embed_job_timing_out"
                             );
                             if let Err(e) = sdb.fail_embed_job(j.id, "timeout").await {
-                                eprintln!("IndexWorker: fail_embed_job({}) failed: {e}", j.id);
+                                tracing::error!(
+                                    job_id = j.id,
+                                    error = %e,
+                                    "indexworker_fail_embed_job_failed"
+                                );
                             }
                         }
                     }
@@ -171,7 +182,7 @@ impl IndexWorker {
                             .close_index_job(id, None)
                             .await
                         {
-                            eprintln!("IndexWorker: close_index_job({id}) failed: {e}");
+                            tracing::error!(job_id = id, error = %e, "indexworker_close_index_job_failed");
                         }
                     }
                 }
@@ -179,7 +190,7 @@ impl IndexWorker {
                     if let Ok(ids) = sdb.list_archivable_embed_jobs(close_grace).await {
                         for id in ids {
                             if let Err(e) = sdb.close_embed_job(id, None).await {
-                                eprintln!("IndexWorker: close_embed_job({id}) failed: {e}");
+                                tracing::error!(job_id = id, error = %e, "indexworker_close_embed_job_failed");
                             }
                         }
                     }
@@ -208,7 +219,10 @@ impl IndexWorker {
         if delta_interval_secs > 0 {
             tokio::spawn(async move {
                 let interval = Duration::from_secs(delta_interval_secs);
-                eprintln!("IndexWorker: delta walk cron active — every {delta_interval_secs}s");
+                tracing::info!(
+                    interval_s = delta_interval_secs,
+                    "indexworker_delta_cron_active"
+                );
                 // Stagger the first delta so it doesn't race the initial
                 // full walk.
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -220,16 +234,18 @@ impl IndexWorker {
                     {
                         Ok((id, is_new)) => {
                             if is_new {
-                                eprintln!("IndexWorker: delta cron — queued job {id}");
+                                tracing::info!(job_id = id, "indexworker_delta_cron_queued");
                             }
                         }
-                        Err(e) => eprintln!("IndexWorker: delta cron enqueue failed: {e}"),
+                        Err(e) => {
+                            tracing::error!(error = %e, "indexworker_delta_cron_enqueue_failed")
+                        }
                     }
                     tokio::time::sleep(interval).await;
                 }
             });
         } else {
-            eprintln!("IndexWorker: delta walk cron disabled (interval=0)");
+            tracing::info!("indexworker_delta_cron_disabled");
         }
 
         // Main poll loop.
@@ -239,7 +255,7 @@ impl IndexWorker {
             tokio::time::sleep(Duration::from_secs(10)).await;
 
             if let Err(e) = worker.maybe_enqueue_initial_walk().await {
-                eprintln!("IndexWorker: maybe_enqueue_initial_walk failed (non-fatal): {e}");
+                tracing::error!(error = %e, "indexworker_initial_walk_enqueue_failed");
             }
             worker.poll_loop().await;
         })
@@ -260,7 +276,7 @@ impl IndexWorker {
             .create_index_job("all", "both", "startup")
             .await?;
         if is_new {
-            eprintln!("IndexWorker: enqueued initial full walk (job {id})");
+            tracing::info!(job_id = id, "indexworker_initial_full_walk_enqueued");
         }
         Ok(())
     }
@@ -271,7 +287,7 @@ impl IndexWorker {
                 Ok(Some(job)) => self.handle_job(job).await,
                 Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
                 Err(e) => {
-                    eprintln!("IndexWorker: claim_next_index_job error: {e}");
+                    tracing::error!(error = %e, "indexworker_claim_next_index_job_error");
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
             }
@@ -279,9 +295,12 @@ impl IndexWorker {
     }
 
     async fn handle_job(&self, job: IndexJob) {
-        eprintln!(
-            "IndexWorker: processing job {} scope={} kind={} triggered_by={}",
-            job.id, job.scope, job.kind, job.triggered_by
+        tracing::info!(
+            job_id = job.id,
+            scope = %job.scope,
+            kind = %job.kind,
+            triggered_by = %job.triggered_by,
+            "indexworker_processing_job"
         );
         let result = self.process_job(&job).await;
         // If the job was cancelled mid-walk, the cancel endpoint already
@@ -294,13 +313,13 @@ impl IndexWorker {
             match &result {
                 Ok(()) => self.index_db.complete_index_job(job.id, None).await,
                 Err(e) => {
-                    eprintln!("IndexWorker: job {} failed: {e}", job.id);
+                    tracing::error!(job_id = job.id, error = %e, "indexworker_job_failed");
                     self.index_db.complete_index_job(job.id, Some(e)).await
                 }
             }
         };
         if let Err(e) = outcome {
-            eprintln!("IndexWorker: job {} completion update failed: {e}", job.id);
+            tracing::error!(job_id = job.id, error = %e, "indexworker_job_completion_update_failed");
         }
     }
 
@@ -328,17 +347,29 @@ impl IndexWorker {
         }
     }
 
-    /// Initial full walk — every shelf in globals → books → chapters →
-    /// pages. Also handles pages loose at the book root (no chapter).
-    /// Sets `index_meta.last_full_walk_at` on success.
+    /// Initial full walk — every shelf the index token can see → books →
+    /// chapters → pages. Also handles pages loose at the book root (no
+    /// chapter). Sets `index_meta.last_full_walk_at` on success.
+    ///
+    /// Issue #122: walks every visible shelf unconditionally. The interim
+    /// `GlobalSettings::indexed_shelves` field added by #119 (and itself a
+    /// replacement for the v0.12.x `hive_shelf_id` / `user_journals_shelf_id`
+    /// fields) is gone. Scope is a per-call concern now — callers narrow
+    /// results via `semantic_search`'s `shelf_ids` / `book_ids` /
+    /// `chapter_ids` / `page_ids` / `scopes` params (issue #80).
     async fn walk_all(&self, job_id: i64) -> Result<(), String> {
-        let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let shelves: Vec<i64> = [globals.hive_shelf_id, globals.user_journals_shelf_id]
-            .into_iter()
-            .flatten()
-            .collect();
+        let shelves: Vec<i64> = match self.bs_client.list_all_shelves().await {
+            Ok(all) => {
+                tracing::info!(shelf_count = all.len(), "indexworker_full_walk_all_shelves");
+                all
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "indexworker_full_walk_list_shelves_failed");
+                return Err(format!("list_all_shelves: {e}"));
+            }
+        };
         if shelves.is_empty() {
-            eprintln!("IndexWorker: no shelves configured in globals — full walk does nothing");
+            tracing::warn!("indexworker_full_walk_no_shelves_visible");
             self.stamp_full_walk_done().await?;
             return Ok(());
         }
@@ -350,16 +381,16 @@ impl IndexWorker {
             // intentional, so a user-issued cancel takes effect at the
             // next yield point rather than waiting for the whole walk.
             if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
-                eprintln!("IndexWorker: job {job_id} stopped — bailing out of walk_all");
+                tracing::info!(job_id, walk = "all", "indexworker_walk_stopped");
                 return Ok(());
             }
-            match self.walk_shelf(shelf_id, &globals, job_id).await {
+            match self.walk_shelf(shelf_id, job_id).await {
                 Ok(n) => total_pages += n,
-                Err(e) => eprintln!("IndexWorker: walk_shelf({shelf_id}) failed (non-fatal): {e}"),
+                Err(e) => tracing::error!(shelf_id, error = %e, "indexworker_walk_shelf_failed"),
             }
         }
         self.stamp_full_walk_done().await?;
-        eprintln!("IndexWorker: full walk complete — {total_pages} pages reconciled");
+        tracing::info!(total_pages, "indexworker_full_walk_complete");
         Ok(())
     }
 
@@ -382,7 +413,7 @@ impl IndexWorker {
             None => match self.index_db.get_index_meta("last_full_walk_at").await? {
                 Some(v) => unix_to_iso(&v),
                 None => {
-                    eprintln!("IndexWorker: walk_delta — no last_full_walk_at; full walk first");
+                    tracing::info!("indexworker_walk_delta_skipped_no_full_walk_yet");
                     return Ok(());
                 }
             },
@@ -392,9 +423,10 @@ impl IndexWorker {
             .bs_client
             .list_pages_updated_since(&last_walk, 250)
             .await?;
-        eprintln!(
-            "IndexWorker: walk_delta since {last_walk} — {} candidate pages",
-            pages.len()
+        tracing::info!(
+            since = %last_walk,
+            candidate_pages = pages.len(),
+            "indexworker_walk_delta_started"
         );
 
         let mut newest_seen = last_walk.clone();
@@ -409,8 +441,11 @@ impl IndexWorker {
                 .map(String::from);
 
             if let Err(e) = self.reconcile_page(page_id).await {
-                eprintln!(
-                    "IndexWorker: walk_delta reconcile_page({page_id}) failed (non-fatal): {e}"
+                tracing::error!(
+                    walk = "delta",
+                    page_id,
+                    error = %e,
+                    "indexworker_reconcile_page_failed"
                 );
                 continue;
             }
@@ -434,26 +469,21 @@ impl IndexWorker {
         self.index_db
             .set_index_meta("last_delta_walk_at", &advance_to)
             .await?;
-        eprintln!(
-            "IndexWorker: walk_delta complete — {reconciled} reconciled, advanced to {advance_to}"
+        tracing::info!(
+            reconciled,
+            advanced_to = %advance_to,
+            "indexworker_walk_delta_complete"
         );
         Ok(())
     }
 
-    async fn walk_shelf(
-        &self,
-        shelf_id: i64,
-        globals: &GlobalSettings,
-        job_id: i64,
-    ) -> Result<usize, String> {
+    async fn walk_shelf(&self, shelf_id: i64, job_id: i64) -> Result<usize, String> {
         let shelf = self.bs_client.get_shelf(shelf_id).await?;
         let name = string_field(&shelf, "name");
         let slug = string_field(&shelf, "slug");
-        let shelf_kind = classify_shelf(
-            shelf_id,
-            globals.hive_shelf_id,
-            globals.user_journals_shelf_id,
-        );
+        // Issue #119: every shelf is `Unclassified` now — see `classify_shelf`
+        // for why the helper survives as a constant.
+        let shelf_kind = classify_shelf(shelf_id);
         self.index_db
             .upsert_indexed_shelf(&IndexedShelf {
                 shelf_id,
@@ -476,7 +506,7 @@ impl IndexWorker {
         let mut count = 0usize;
         for book_id in books {
             if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
-                eprintln!("IndexWorker: job {job_id} stopped — bailing out of walk_shelf");
+                tracing::info!(job_id, walk = "shelf", "indexworker_walk_stopped");
                 return Ok(count);
             }
             match self
@@ -484,7 +514,7 @@ impl IndexWorker {
                 .await
             {
                 Ok(n) => count += n,
-                Err(e) => eprintln!("IndexWorker: walk_book({book_id}) failed (non-fatal): {e}"),
+                Err(e) => tracing::error!(book_id, error = %e, "indexworker_walk_book_failed"),
             }
         }
         Ok(count)
@@ -533,7 +563,7 @@ impl IndexWorker {
         let mut idx = 0usize;
         for item in contents {
             if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
-                eprintln!("IndexWorker: job {job_id} stopped — bailing out of walk_book");
+                tracing::info!(job_id, walk = "book", "indexworker_walk_stopped");
                 return Ok(count);
             }
             match item.get("type").and_then(|v| v.as_str()) {
@@ -550,8 +580,10 @@ impl IndexWorker {
                             .await
                         {
                             Ok(n) => count += n,
-                            Err(e) => eprintln!(
-                                "IndexWorker: walk_chapter({chapter_id}) failed (non-fatal): {e}"
+                            Err(e) => tracing::error!(
+                                chapter_id,
+                                error = %e,
+                                "indexworker_walk_chapter_failed"
                             ),
                         }
                     }
@@ -570,8 +602,10 @@ impl IndexWorker {
                             )
                             .await
                         {
-                            eprintln!(
-                                "IndexWorker: reconcile_page({page_id}) failed (non-fatal): {e}"
+                            tracing::error!(
+                                page_id,
+                                error = %e,
+                                "indexworker_reconcile_page_failed"
                             );
                         }
                         count += 1;
@@ -621,7 +655,7 @@ impl IndexWorker {
         let mut idx = 0usize;
         for page in pages {
             if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
-                eprintln!("IndexWorker: job {job_id} stopped — bailing out of walk_chapter");
+                tracing::info!(job_id, walk = "chapter", "indexworker_walk_stopped");
                 return Ok(count);
             }
             if let Some(page_id) = page.get("id").and_then(|v| v.as_i64()) {
@@ -637,7 +671,7 @@ impl IndexWorker {
                     )
                     .await
                 {
-                    eprintln!("IndexWorker: reconcile_page({page_id}) failed (non-fatal): {e}");
+                    tracing::error!(page_id, error = %e, "indexworker_reconcile_page_failed");
                 }
                 count += 1;
             }
@@ -750,31 +784,32 @@ impl IndexWorker {
             .await
     }
 
-    /// Single-book reconcile keyed off book id. When a configured global
+    /// Single-book reconcile keyed off book id. When a probe-discovered
     /// shelf claims this book and that shelf isn't in the index yet,
     /// cascades a `shelf:{id}` job and fails retryably. Otherwise upserts
-    /// the book row (and the manifest-derived identity_ouid for Identity
-    /// books). Descendants are not touched — the full walk or their own
-    /// per-id jobs handle that.
+    /// the book row. Descendants are not touched — the full walk or their
+    /// own per-id jobs handle that.
+    ///
+    /// Issue #122: parent-shelf attribution probes every visible shelf
+    /// unconditionally (the #119 `globals.indexed_shelves` short-circuit is
+    /// gone alongside the field itself). BookStack's `/api/books/{id}`
+    /// doesn't return the parent shelf, so the probe is unavoidable; the
+    /// cascade-on-miss path is rare (only fires when a webhook reaches us
+    /// before the initial walk landed the parent).
     async fn reconcile_book(&self, book_id: i64) -> Result<(), String> {
         let book = self.bs_client.get_book(book_id).await?;
-        // Best-effort shelf attribution: BookStack's `/api/books/{id}` does
-        // not return the parent shelf, so we probe each globally-configured
-        // shelf for this book id. If neither contains it (or globals are
-        // empty), the book is reconciled with shelf_id=None — the same
-        // shape `walk_book` uses when it can't classify a parent.
-        let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let candidate_shelves: Vec<i64> = [globals.hive_shelf_id, globals.user_journals_shelf_id]
-            .into_iter()
-            .flatten()
-            .collect();
+        let candidate_shelves: Vec<i64> =
+            self.bs_client.list_all_shelves().await.unwrap_or_default();
         let mut shelf_id: Option<i64> = None;
         for sid in &candidate_shelves {
             let shelf = match self.bs_client.get_shelf(*sid).await {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
-                        "IndexWorker: reconcile_book({book_id}) get_shelf({sid}) failed (non-fatal): {e}"
+                    tracing::error!(
+                        book_id,
+                        shelf_id = sid,
+                        error = %e,
+                        "indexworker_reconcile_book_get_shelf_failed"
                     );
                     continue;
                 }
@@ -806,11 +841,7 @@ impl IndexWorker {
             }
         }
 
-        let shelf_kind = classify_shelf(
-            shelf_id.unwrap_or(0),
-            globals.hive_shelf_id,
-            globals.user_journals_shelf_id,
-        );
+        let shelf_kind = classify_shelf(shelf_id.unwrap_or(0));
         let name = string_field(&book, "name");
         let slug = string_field(&book, "slug");
         let book_kind = classify_book(&name, shelf_kind);
@@ -837,12 +868,7 @@ impl IndexWorker {
     /// chain — no parent to check. Upserts only the shelf row.
     async fn reconcile_shelf(&self, shelf_id: i64) -> Result<(), String> {
         let shelf = self.bs_client.get_shelf(shelf_id).await?;
-        let globals = self.db.get_global_settings().await.unwrap_or_default();
-        let shelf_kind = classify_shelf(
-            shelf_id,
-            globals.hive_shelf_id,
-            globals.user_journals_shelf_id,
-        );
+        let shelf_kind = classify_shelf(shelf_id);
         self.index_db
             .upsert_indexed_shelf(&IndexedShelf {
                 shelf_id,
@@ -973,11 +999,11 @@ impl IndexWorker {
 
 // --- Job lifecycle reconciler (issue #54) ---
 
-pub async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize) {
+pub(crate) async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize) {
     let jobs = match db.list_failed_open_index_jobs().await {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("IndexWorker: list_failed_open_index_jobs failed: {e}");
+            tracing::error!(error = %e, "indexworker_list_failed_open_index_jobs_failed");
             return;
         }
     };
@@ -985,50 +1011,71 @@ pub async fn reconcile_failed_index_jobs(db: &Arc<dyn IndexDb>, max_chain: usize
         match db.has_successor_index_job(&j.scope, j.id).await {
             Ok(true) => {
                 if let Err(e) = db.close_index_job(j.id, Some("superseded")).await {
-                    eprintln!(
-                        "IndexWorker: close_index_job({}) superseded failed: {e}",
-                        j.id
+                    tracing::error!(
+                        job_id = j.id,
+                        error = %e,
+                        "indexworker_close_index_job_superseded_failed"
                     );
                 }
                 continue;
             }
             Err(e) => {
-                eprintln!("IndexWorker: has_successor_index_job({}) failed: {e}", j.id);
+                tracing::error!(
+                    job_id = j.id,
+                    error = %e,
+                    "indexworker_has_successor_index_job_failed"
+                );
                 continue;
             }
             Ok(false) => {}
         }
         let chain_len = db.index_job_retry_chain_len(j.id).await.unwrap_or(1);
         if chain_len >= max_chain {
-            eprintln!(
-                "IndexWorker: index job {} retry chain length {chain_len} >= {max_chain} — giving up",
-                j.id
+            tracing::warn!(
+                job_id = j.id,
+                chain_len,
+                max_chain,
+                "indexworker_index_job_giving_up"
             );
             if let Err(e) = db.close_index_job(j.id, Some("gave_up")).await {
-                eprintln!("IndexWorker: close_index_job({}) gave_up failed: {e}", j.id);
+                tracing::error!(
+                    job_id = j.id,
+                    error = %e,
+                    "indexworker_close_index_job_gave_up_failed"
+                );
             }
             continue;
         }
         match db.create_retry_index_job(&j.scope, &j.kind, j.id).await {
             Ok(new_id) => {
-                eprintln!(
-                    "IndexWorker: queued retry index job {new_id} for {} (chain={chain_len})",
-                    j.id
+                tracing::info!(
+                    new_job_id = new_id,
+                    of_job_id = j.id,
+                    chain_len,
+                    "indexworker_retry_index_job_queued"
                 );
                 if let Err(e) = db.close_index_job(j.id, Some("retried")).await {
-                    eprintln!("IndexWorker: close_index_job({}) retried failed: {e}", j.id);
+                    tracing::error!(
+                        job_id = j.id,
+                        error = %e,
+                        "indexworker_close_index_job_retried_failed"
+                    );
                 }
             }
-            Err(e) => eprintln!("IndexWorker: create_retry_index_job({}) failed: {e}", j.id),
+            Err(e) => tracing::error!(
+                job_id = j.id,
+                error = %e,
+                "indexworker_create_retry_index_job_failed"
+            ),
         }
     }
 }
 
-pub async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: usize) {
+pub(crate) async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: usize) {
     let jobs = match db.list_failed_open_embed_jobs().await {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("IndexWorker: list_failed_open_embed_jobs failed: {e}");
+            tracing::error!(error = %e, "indexworker_list_failed_open_embed_jobs_failed");
             return;
         }
     };
@@ -1036,41 +1083,62 @@ pub async fn reconcile_failed_embed_jobs(db: &Arc<dyn SemanticDb>, max_chain: us
         match db.has_successor_embed_job(&j.scope, j.id).await {
             Ok(true) => {
                 if let Err(e) = db.close_embed_job(j.id, Some("superseded")).await {
-                    eprintln!(
-                        "IndexWorker: close_embed_job({}) superseded failed: {e}",
-                        j.id
+                    tracing::error!(
+                        job_id = j.id,
+                        error = %e,
+                        "indexworker_close_embed_job_superseded_failed"
                     );
                 }
                 continue;
             }
             Err(e) => {
-                eprintln!("IndexWorker: has_successor_embed_job({}) failed: {e}", j.id);
+                tracing::error!(
+                    job_id = j.id,
+                    error = %e,
+                    "indexworker_has_successor_embed_job_failed"
+                );
                 continue;
             }
             Ok(false) => {}
         }
         let chain_len = db.embed_job_retry_chain_len(j.id).await.unwrap_or(1);
         if chain_len >= max_chain {
-            eprintln!(
-                "IndexWorker: embed job {} retry chain length {chain_len} >= {max_chain} — giving up",
-                j.id
+            tracing::warn!(
+                job_id = j.id,
+                chain_len,
+                max_chain,
+                "indexworker_embed_job_giving_up"
             );
             if let Err(e) = db.close_embed_job(j.id, Some("gave_up")).await {
-                eprintln!("IndexWorker: close_embed_job({}) gave_up failed: {e}", j.id);
+                tracing::error!(
+                    job_id = j.id,
+                    error = %e,
+                    "indexworker_close_embed_job_gave_up_failed"
+                );
             }
             continue;
         }
         match db.create_retry_embed_job(&j.scope, j.id).await {
             Ok(new_id) => {
-                eprintln!(
-                    "IndexWorker: queued retry embed job {new_id} for {} (chain={chain_len})",
-                    j.id
+                tracing::info!(
+                    new_job_id = new_id,
+                    of_job_id = j.id,
+                    chain_len,
+                    "indexworker_retry_embed_job_queued"
                 );
                 if let Err(e) = db.close_embed_job(j.id, Some("retried")).await {
-                    eprintln!("IndexWorker: close_embed_job({}) retried failed: {e}", j.id);
+                    tracing::error!(
+                        job_id = j.id,
+                        error = %e,
+                        "indexworker_close_embed_job_retried_failed"
+                    );
                 }
             }
-            Err(e) => eprintln!("IndexWorker: create_retry_embed_job({}) failed: {e}", j.id),
+            Err(e) => tracing::error!(
+                job_id = j.id,
+                error = %e,
+                "indexworker_create_retry_embed_job_failed"
+            ),
         }
     }
 }
@@ -1111,12 +1179,19 @@ async fn cascade_missing_parent(
         .create_index_job(parent_scope, "both", triggered_by)
         .await?;
     if is_new {
-        eprintln!(
-            "IndexWorker: {subject} missing in index — enqueued cascade job {job_id} for {parent_scope} ({triggered_by})"
+        tracing::info!(
+            subject = %subject,
+            parent_scope = %parent_scope,
+            triggered_by = %triggered_by,
+            job_id,
+            "indexworker_cascade_missing_parent_enqueued"
         );
     } else {
-        eprintln!(
-            "IndexWorker: {subject} missing in index — coalesced onto existing cascade job {job_id} for {parent_scope}"
+        tracing::debug!(
+            subject = %subject,
+            parent_scope = %parent_scope,
+            job_id,
+            "indexworker_cascade_missing_parent_coalesced"
         );
     }
     Err(format!(

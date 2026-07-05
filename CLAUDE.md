@@ -40,18 +40,23 @@ crates/
     src/staging.rs       File staging for upload_image / upload_attachment
     src/migrate.rs       SQLite → PostgreSQL migration tool
 
-  bsmcp-embedder/        Embedder binary (pluggable backends)
-    src/main.rs          Job queue worker + HTTP /embed endpoint + provider selection
+  bsmcp-embedder/        Embedder + reconciliation worker binary
+                         (folded in v0.13.0; closes #56). Role-selected
+                         at run-time via --role={embedder|worker|both}
+                         (CLI flag, primary) or BSMCP_ROLE env (fallback).
+                         Default: embedder.
+    src/main.rs          Role dispatcher + embedder body (provider
+                         selection, HTTP /embed + /rerank + /health,
+                         job queue worker) + worker body (token + delta
+                         interval wiring, IndexWorker spawn).
     src/embed.rs         Embedder trait + implementations (LocalEmbedder, OllamaEmbedder, OpenAIEmbedder)
     src/pipeline.rs      Embedding pipeline (fetch pages, chunk, embed, store)
-
-  bsmcp-worker/          Reconciliation worker binary
-    src/main.rs          Env wiring, db init, BookStackClient, IndexWorker spawn
-    src/lib.rs           IndexWorker — owns the index_jobs queue. Initial full
-                         walk on cold start, polls for webhook + cron jobs,
-                         runs the periodic delta walk. Same database as the
-                         server (server's webhook handler enqueues; worker
-                         consumes).
+    src/worker.rs        IndexWorker — owns the index_jobs queue. Initial
+                         full walk on cold start, polls for webhook + cron
+                         jobs, runs the periodic delta walk + lifecycle
+                         housekeeper across index_jobs and embed_jobs.
+                         Same database as the server (server's webhook
+                         handler enqueues; worker role consumes).
 ```
 
 **Two transports:**
@@ -115,10 +120,7 @@ All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 
 Browser-based admin config page. Token-gated via the `/authorize` form — when `?return_to=/settings` is set, the server validates the BookStack API token and issues a settings-session cookie (HttpOnly, 8h TTL, in-memory store) instead of running the full OAuth code dance.
 
-The page is admin-only — non-admin saves silently drop every field. Surfaces only the global server fields the index worker still needs:
-
-- `hive_shelf_id`
-- `user_journals_shelf_id`
+The page is admin-only — non-admin saves silently drop every field. Surfaces only the precision-cascade pool multipliers + named-scopes (`kb_scopes_json`) map from issue #80. There is no global indexed-shelves cut: the worker walks every visible shelf on every full walk (issue #122), and per-call scoping via `semantic_search`'s `shelf_ids` / `book_ids` / `chapter_ids` / `page_ids` / `scopes` params (issue #80) is the only scope surface. The v0.12.x `hive_shelf_id` + `user_journals_shelf_id` config and the v0.13.0-RC `indexed_shelves` interim are both gone.
 
 There is no MCP write path for global settings — they must be configured via `/settings` by an admin. Per-user settings have been removed; the server holds no per-caller state beyond OAuth tokens.
 

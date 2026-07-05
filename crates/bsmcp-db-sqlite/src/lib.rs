@@ -48,10 +48,18 @@ impl SqliteDb {
              CREATE INDEX IF NOT EXISTS idx_refresh_tokens_created ON refresh_tokens(created_at);
              CREATE TABLE IF NOT EXISTS global_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
-                 hive_shelf_id INTEGER,
-                 user_journals_shelf_id INTEGER,
                  set_by_token_hash TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT 0
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 /* Issue #80 — named scope cuts (HashMap<String, ScopeDef>)
+                    and the precision-cascade pool multipliers, persisted as
+                    JSON blobs. Empty/NULL means: use defaults. */
+                 kb_scopes_json TEXT,
+                 cascade_multipliers_json TEXT
+                 /* Issue #122 — the v0.13.0-RC `indexed_shelves_json` column
+                    (and the v0.12.x `hive_shelf_id` + `user_journals_shelf_id`
+                    columns it replaced) are dropped via the migration block
+                    below. The indexer now walks every shelf the token can see
+                    unconditionally; scope is per-call only. */
              );
              INSERT OR IGNORE INTO global_settings (id, updated_at) VALUES (1, 0);
              DROP TABLE IF EXISTS registrations;
@@ -189,6 +197,26 @@ impl SqliteDb {
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_page_id",
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_name",
             "ALTER TABLE global_settings DROP COLUMN default_ai_identity_ouid",
+            // Issue #80 — add the kb_scopes + cascade-multipliers JSON
+            // columns on existing databases. Duplicate-column errors swallowed
+            // via .ok() (same pattern as the v0.8.0 block).
+            "ALTER TABLE global_settings ADD COLUMN kb_scopes_json TEXT",
+            "ALTER TABLE global_settings ADD COLUMN cascade_multipliers_json TEXT",
+            // Issue #122 — drop the v0.13.0-RC `indexed_shelves_json` column
+            // (added by #120 to replace the v0.12.x `hive_shelf_id` +
+            // `user_journals_shelf_id` pair, themselves dropped here). The
+            // indexer now walks every visible shelf unconditionally; scope is
+            // a per-call concern on `semantic_search`. SQLite 3.35+ supports
+            // bare `ALTER TABLE ... DROP COLUMN` (matching the v0.10.0 block
+            // above) but doesn't carry IF EXISTS — duplicate/missing-column
+            // errors are swallowed via .ok() so the migration is idempotent
+            // both on re-runs and on databases that never had the column.
+            "ALTER TABLE global_settings DROP COLUMN indexed_shelves_json",
+            // Also clean up the v0.12.x columns if a database somehow skipped
+            // the #120 migration window entirely (fresh install on v0.13.0
+            // proper never sees them, but defensive idempotence is cheap).
+            "ALTER TABLE global_settings DROP COLUMN hive_shelf_id",
+            "ALTER TABLE global_settings DROP COLUMN user_journals_shelf_id",
         ] {
             conn.execute_batch(sql).ok();
         }
@@ -271,14 +299,15 @@ impl SqliteDb {
         if backups.len() > 3 {
             for entry in &backups[..backups.len() - 3] {
                 if let Err(e) = std::fs::remove_file(entry.path()) {
-                    eprintln!(
-                        "Failed to remove old backup {}: {e}",
-                        entry.path().display()
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "sqlite_backup_remove_old_failed"
                     );
                 } else {
-                    eprintln!(
-                        "Removed old backup: {}",
-                        entry.file_name().to_string_lossy()
+                    tracing::info!(
+                        file = %entry.file_name().to_string_lossy(),
+                        "sqlite_backup_removed_old"
                     );
                 }
             }
@@ -483,16 +512,26 @@ impl DbBackend for SqliteDb {
             let conn = conn.lock().unwrap();
             let row = conn
                 .query_row(
-                    "SELECT hive_shelf_id, user_journals_shelf_id,
-                        set_by_token_hash, updated_at
+                    "SELECT set_by_token_hash, updated_at,
+                        kb_scopes_json, cascade_multipliers_json
                  FROM global_settings WHERE id = 1",
                     [],
                     |row| {
+                        let kb_scopes_json: Option<String> = row.get(2)?;
+                        let cascade_json: Option<String> = row.get(3)?;
+                        let kb_scopes = kb_scopes_json
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
+                        let cascade_multipliers = cascade_json
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
                         Ok(GlobalSettings {
-                            hive_shelf_id: row.get::<_, Option<i64>>(0)?,
-                            user_journals_shelf_id: row.get::<_, Option<i64>>(1)?,
-                            set_by_token_hash: row.get::<_, Option<String>>(2)?,
-                            updated_at: row.get::<_, i64>(3)?,
+                            set_by_token_hash: row.get::<_, Option<String>>(0)?,
+                            updated_at: row.get::<_, i64>(1)?,
+                            kb_scopes,
+                            cascade_multipliers,
                         })
                     },
                 )
@@ -511,6 +550,21 @@ impl DbBackend for SqliteDb {
         let conn = self.conn.clone();
         let s = settings.clone();
         let setter = set_by_token_hash.to_string();
+        // Serialize the JSON blobs outside the blocking closure so a malformed
+        // map surfaces as a clean error before we touch SQLite. Empty
+        // map/defaults → NULL so the "use defaults" path stays cheap.
+        let kb_scopes_json = if s.kb_scopes.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&s.kb_scopes)
+                    .map_err(|e| format!("save_global_settings: serialize kb_scopes: {e}"))?,
+            )
+        };
+        let cascade_multipliers_json =
+            Some(serde_json::to_string(&s.cascade_multipliers).map_err(|e| {
+                format!("save_global_settings: serialize cascade_multipliers: {e}")
+            })?);
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let existing_setter: Option<String> = conn
@@ -524,16 +578,16 @@ impl DbBackend for SqliteDb {
             let final_setter = existing_setter.unwrap_or(setter);
             conn.execute(
                 "UPDATE global_settings
-                 SET hive_shelf_id = ?1,
-                     user_journals_shelf_id = ?2,
-                     set_by_token_hash = ?3,
-                     updated_at = ?4
+                 SET set_by_token_hash = ?1,
+                     updated_at = ?2,
+                     kb_scopes_json = ?3,
+                     cascade_multipliers_json = ?4
                  WHERE id = 1",
                 params![
-                    s.hive_shelf_id,
-                    s.user_journals_shelf_id,
                     final_setter,
                     SqliteDb::now_secs(),
+                    kb_scopes_json,
+                    cascade_multipliers_json,
                 ],
             )
             .map_err(|e| format!("save_global_settings: {e}"))?;
@@ -576,7 +630,7 @@ impl DbBackend for SqliteDb {
             .map_err(|e| format!("VACUUM INTO failed: {e}"))?;
 
             drop(conn);
-            eprintln!("Backup created: {}", backup_file.display());
+            tracing::info!(path = %backup_file.display(), "sqlite_backup_created");
 
             SqliteDb::cleanup_old_backups(&backup_dir);
             Ok(())
@@ -688,7 +742,26 @@ impl SemanticDb for SqliteDb {
                  );"
             ).map_err(|e| format!("Failed to create ACL tables: {e}"))?;
 
-            eprintln!("Semantic: tables initialized");
+            // Permission cache (issue #58 lever a): per-token, per-page
+            // viewable verdict. The in-memory cache in `SemanticState` is L1;
+            // this table is L2 so cold-cache after restart still skips the
+            // HTTP fan-out for known-cached tokens. `token_hash` is
+            // `SHA256(token_id)` so a raw credential identifier never lands
+            // on disk — same hygiene as `set_by_token_hash` on
+            // `global_settings`.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS permission_cache (
+                     token_hash TEXT NOT NULL,
+                     page_id    INTEGER NOT NULL,
+                     viewable   INTEGER NOT NULL,
+                     cached_at  INTEGER NOT NULL,
+                     PRIMARY KEY (token_hash, page_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_permission_cache_cached_at
+                     ON permission_cache(cached_at);"
+            ).map_err(|e| format!("Failed to create permission_cache: {e}"))?;
+
+            tracing::info!(backend = "sqlite", "semantic_tables_initialized");
             Ok(())
         })
         .await
@@ -881,7 +954,12 @@ impl SemanticDb for SqliteDb {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![page_id, chunk.chunk_index as i64, chunk.heading_path, chunk.content, chunk.content_hash, blob],
                 ) {
-                    eprintln!("DB: insert chunk {} for page {page_id}: {e}", chunk.chunk_index);
+                    tracing::error!(
+                        chunk_index = chunk.chunk_index,
+                        page_id,
+                        error = %e,
+                        "sqlite_insert_chunk_failed"
+                    );
                 }
             }
             tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
@@ -1538,34 +1616,70 @@ impl SemanticDb for SqliteDb {
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
-        book_ids: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
     ) -> Result<Vec<SearchHit>, String> {
         let conn = self.conn.clone();
         let query_embedding = query_embedding.to_vec();
-        // Materialize the optional filter into a Vec the closure can own. Empty
-        // slice means "no filter", same as None.
-        let book_filter: Option<Vec<i64>> = match book_ids {
-            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
-            _ => None,
-        };
+        // Materialize the scope filter into an owned struct the closure can
+        // hold. An all-empty filter collapses to "no scope" (full corpus).
+        let scope_owned: Option<ScopeFilter> = scope.filter(|s| !s.is_empty()).map(|s| {
+            let mut f = s.clone();
+            f.dedup();
+            f
+        });
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ref ids) = book_filter {
-                let placeholders = std::iter::repeat_n("?", ids.len())
-                    .collect::<Vec<_>>()
-                    .join(",");
+            let all_chunks: Vec<(i64, i64, Vec<u8>)> = if let Some(ref f) = scope_owned {
+                // Union semantics: a chunk qualifies if its parent page
+                // matches any of the supplied book/chapter/page IDs.
+                // Shelf-level IDs are not evaluated here — the caller must
+                // resolve shelves → books before invoking the search.
+                let mut where_parts: Vec<String> = Vec::new();
+                let mut params: Vec<i64> = Vec::new();
+                if !f.book_ids.is_empty() {
+                    let placeholders = std::iter::repeat_n("?", f.book_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    where_parts.push(format!("p.book_id IN ({placeholders})"));
+                    params.extend(f.book_ids.iter().copied());
+                }
+                if !f.chapter_ids.is_empty() {
+                    let placeholders = std::iter::repeat_n("?", f.chapter_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    where_parts.push(format!("p.chapter_id IN ({placeholders})"));
+                    params.extend(f.chapter_ids.iter().copied());
+                }
+                if !f.page_ids.is_empty() {
+                    let placeholders = std::iter::repeat_n("?", f.page_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    where_parts.push(format!("p.page_id IN ({placeholders})"));
+                    params.extend(f.page_ids.iter().copied());
+                }
+
+                // If only shelf_ids were supplied (which we can't resolve at
+                // this layer) we collapse to a no-match query — the cascade
+                // caller is expected to have expanded shelves into books
+                // before reaching here. Returning zero rows is safer than
+                // silently widening the scope.
+                if where_parts.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let where_clause = where_parts.join(" OR ");
                 let sql = format!(
                     "SELECT c.id, c.page_id, c.embedding
                      FROM chunks c JOIN pages p ON c.page_id = p.page_id
-                     WHERE p.book_id IN ({placeholders})"
+                     WHERE {where_clause}"
                 );
                 let mut stmt = conn
                     .prepare(&sql)
                     .map_err(|e| format!("Prepare failed: {e}"))?;
                 let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    params.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                 let out: Vec<(i64, i64, Vec<u8>)> = stmt
                     .query_map(params_vec.as_slice(), |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1690,7 +1804,12 @@ impl SemanticDb for SqliteDb {
             }
             tx.commit().map_err(|e| format!("commit: {e}"))?;
 
-            eprintln!("Semantic: computed {total_inserted} similar-page relationships (top_k={top_k}, threshold={threshold})");
+            tracing::info!(
+                inserted = total_inserted,
+                top_k,
+                threshold,
+                "semantic_similar_pages_computed"
+            );
             Ok(total_inserted)
         })
         .await
@@ -1806,6 +1925,207 @@ impl SemanticDb for SqliteDb {
                 .filter_map(|r| r.ok())
                 .collect();
             Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn prefilter_pages_by_roles(
+        &self,
+        page_ids: &[i64],
+        role_ids: &[i64],
+    ) -> Result<Vec<(i64, AclPrefilter)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let page_ids = page_ids.to_vec();
+        let role_ids = role_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            const CHUNK: usize = 400;
+            let mut out: Vec<(i64, AclPrefilter)> = Vec::new();
+            for window in page_ids.chunks(CHUNK) {
+                // Build placeholder lists for both page_ids and role_ids.
+                // Page-id placeholders start at ?1 .. ?N. Role-id placeholders
+                // continue at ?N+1 .. ?N+M. Empty role list → the EXISTS clause
+                // evaluates false, which is the correct "no role match" state.
+                let page_ph: String = (1..=window.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut all_params: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(window.len() + role_ids.len());
+                for pid in window {
+                    all_params.push(pid);
+                }
+                let sql = if role_ids.is_empty() {
+                    format!(
+                        "SELECT page_id, acl_computed_at, acl_default_open, 0 AS has_role_match \
+                         FROM pages WHERE page_id IN ({page_ph})"
+                    )
+                } else {
+                    let role_ph: String = ((window.len() + 1)..=(window.len() + role_ids.len()))
+                        .map(|i| format!("?{i}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    for rid in &role_ids {
+                        all_params.push(rid);
+                    }
+                    format!(
+                        "SELECT p.page_id, p.acl_computed_at, p.acl_default_open, \
+                                EXISTS ( \
+                                    SELECT 1 FROM page_view_acl pva \
+                                    WHERE pva.page_id = p.page_id \
+                                      AND pva.role_id IN ({role_ph}) \
+                                ) AS has_role_match \
+                         FROM pages p WHERE p.page_id IN ({page_ph})"
+                    )
+                };
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("prefilter prepare: {e}"))?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(all_params.iter().copied()),
+                        |row| {
+                            let page_id: i64 = row.get(0)?;
+                            let acl_computed_at: Option<i64> = row.get(1)?;
+                            let acl_default_open: Option<i64> = row.get(2)?;
+                            let has_role_match: i64 = row.get(3)?;
+                            Ok((
+                                page_id,
+                                acl_computed_at,
+                                acl_default_open.unwrap_or(0) != 0,
+                                has_role_match != 0,
+                            ))
+                        },
+                    )
+                    .map_err(|e| format!("prefilter query: {e}"))?;
+                for r in rows {
+                    let (pid, computed_at, default_open, has_match) =
+                        r.map_err(|e| format!("prefilter row: {e}"))?;
+                    let verdict = if computed_at.is_none() {
+                        AclPrefilter::Uncomputed
+                    } else if default_open {
+                        AclPrefilter::DefaultOpen
+                    } else if has_match {
+                        AclPrefilter::Allow
+                    } else {
+                        AclPrefilter::Deny
+                    };
+                    out.push((pid, verdict));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn get_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        page_ids: &[i64],
+        min_cached_at: i64,
+    ) -> Result<Vec<(i64, bool)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let token_hash = token_hash.to_string();
+        let page_ids = page_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // SQLite max host params default 32766; chunk just in case of
+            // very large candidate sets.
+            const CHUNK: usize = 500;
+            let mut out: Vec<(i64, bool)> = Vec::new();
+            for window in page_ids.chunks(CHUNK) {
+                let placeholders: String = (0..window.len())
+                    .map(|i| format!("?{}", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT page_id, viewable FROM permission_cache \
+                     WHERE token_hash = ?1 AND cached_at >= ?2 AND page_id IN ({placeholders})"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("permission_cache prepare: {e}"))?;
+                let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(window.len() + 2);
+                params.push(&token_hash);
+                params.push(&min_cached_at);
+                for pid in window {
+                    params.push(pid);
+                }
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params.iter().copied()), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0))
+                    })
+                    .map_err(|e| format!("permission_cache query: {e}"))?;
+                for r in rows {
+                    let row = r.map_err(|e| format!("permission_cache row: {e}"))?;
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn upsert_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        entries: &[(i64, bool)],
+        cached_at: i64,
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        let token_hash = token_hash.to_string();
+        let entries = entries.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("permission_cache upsert tx: {e}"))?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO permission_cache (token_hash, page_id, viewable, cached_at) \
+                         VALUES (?1, ?2, ?3, ?4) \
+                         ON CONFLICT(token_hash, page_id) DO UPDATE SET \
+                         viewable = excluded.viewable, cached_at = excluded.cached_at",
+                    )
+                    .map_err(|e| format!("permission_cache upsert prepare: {e}"))?;
+                for (pid, viewable) in &entries {
+                    let v: i64 = if *viewable { 1 } else { 0 };
+                    stmt.execute(params![token_hash, pid, v, cached_at])
+                        .map_err(|e| format!("permission_cache upsert exec: {e}"))?;
+                }
+            }
+            tx.commit()
+                .map_err(|e| format!("permission_cache upsert commit: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn evict_stale_permission_cache(&self, older_than: i64) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count = conn
+                .execute(
+                    "DELETE FROM permission_cache WHERE cached_at < ?1",
+                    params![older_than],
+                )
+                .map_err(|e| format!("permission_cache evict: {e}"))?;
+            Ok(count)
         })
         .await
         .map_err(|e| format!("Task failed: {e}"))?
@@ -2803,6 +3123,86 @@ impl IndexDb for SqliteDb {
         .await
         .map_err(|e| format!("Task failed: {e}"))?
     }
+
+    // --- Directory tree (issue #69) ---
+
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+                     FROM bookstack_shelves WHERE deleted = 0
+                     ORDER BY name",
+                )
+                .map_err(|e| format!("list_indexed_shelves prepare: {e}"))?;
+            let rows = stmt
+                .query_map(params![], |r| {
+                    let kind_str: String = r.get(3)?;
+                    Ok(IndexedShelf {
+                        shelf_id: r.get(0)?,
+                        name: r.get(1)?,
+                        slug: r.get(2)?,
+                        shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                        indexed_at: r.get(4)?,
+                        deleted: r.get::<_, i64>(5)? != 0,
+                    })
+                })
+                .map_err(|e| format!("list_indexed_shelves query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("list_indexed_shelves collect: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn list_indexed_books_unshelved(&self) -> Result<Vec<IndexedBook>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+                     FROM bookstack_books WHERE shelf_id IS NULL AND deleted = 0
+                     ORDER BY name",
+                )
+                .map_err(|e| format!("list_indexed_books_unshelved prepare: {e}"))?;
+            let rows = stmt
+                .query_map(params![], |r| {
+                    let kind_str: String = r.get(5)?;
+                    Ok(IndexedBook {
+                        book_id: r.get(0)?,
+                        name: r.get(1)?,
+                        slug: r.get(2)?,
+                        shelf_id: r.get(3)?,
+                        identity_ouid: r.get(4)?,
+                        book_kind: kind_str.parse().unwrap_or(BookKind::Unclassified),
+                        indexed_at: r.get(6)?,
+                        deleted: r.get::<_, i64>(7)? != 0,
+                    })
+                })
+                .map_err(|e| format!("list_indexed_books_unshelved query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("list_indexed_books_unshelved collect: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
+    async fn read_directory_tree(
+        &self,
+        scope: DirectoryScope,
+        depth: Option<u32>,
+    ) -> Result<Vec<DirectoryNode>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            read_directory_tree_sync(&conn, scope, depth)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
 }
 
 // --- Helpers shared across IndexDb impl methods ---
@@ -2867,6 +3267,381 @@ fn indexed_pages_by_predicate(
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("indexed_pages_by_predicate collect: {e}"))
 }
+
+// --- read_directory_tree (issue #69) ---
+//
+// The whole walk runs inside one `spawn_blocking` + one connection lock, so
+// we keep it synchronous and chase the parent → children relation with three
+// prepared statements (books by shelf, chapters by book, pages by chapter +
+// pages at book root). Depth is decremented on each descent; `Some(0)` cuts
+// children off at that level, `None` walks all the way down.
+
+const SHELF_NAME_UNSHELVED: &str = "Unshelved";
+
+fn read_directory_tree_sync(
+    conn: &rusqlite::Connection,
+    scope: DirectoryScope,
+    depth: Option<u32>,
+) -> Result<Vec<DirectoryNode>, String> {
+    match scope {
+        DirectoryScope::All => {
+            let mut shelves_stmt = conn
+                .prepare(
+                    "SELECT shelf_id, name, slug FROM bookstack_shelves
+                     WHERE deleted = 0 ORDER BY name",
+                )
+                .map_err(|e| format!("read_directory_tree shelves: {e}"))?;
+            let shelf_rows: Vec<(i64, String, String)> = shelves_stmt
+                .query_map(params![], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("read_directory_tree shelves query: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read_directory_tree shelves collect: {e}"))?;
+
+            let mut out: Vec<DirectoryNode> = Vec::with_capacity(shelf_rows.len() + 1);
+            for (shelf_id, name, slug) in shelf_rows {
+                let children = if depth_allows_descent(depth) {
+                    list_books_in_shelf(conn, shelf_id)?
+                        .into_iter()
+                        .map(|b| book_node(conn, b, decrement_depth(depth)))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    Vec::new()
+                };
+                out.push(DirectoryNode {
+                    kind: DirectoryNodeKind::Shelf,
+                    id: shelf_id,
+                    name,
+                    slug,
+                    page_kind: None,
+                    children,
+                });
+            }
+
+            // Synthetic "Unshelved" pseudo-shelf so books without a shelf
+            // assignment aren't invisible in the All view. Only emitted when
+            // there's at least one such book.
+            let unshelved = list_books_unshelved(conn)?;
+            if !unshelved.is_empty() {
+                let children = if depth_allows_descent(depth) {
+                    unshelved
+                        .into_iter()
+                        .map(|b| book_node(conn, b, decrement_depth(depth)))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    Vec::new()
+                };
+                out.push(DirectoryNode {
+                    kind: DirectoryNodeKind::Shelf,
+                    id: 0,
+                    name: SHELF_NAME_UNSHELVED.to_string(),
+                    slug: "unshelved".to_string(),
+                    page_kind: None,
+                    children,
+                });
+            }
+            Ok(out)
+        }
+        DirectoryScope::Shelf(shelf_id) => {
+            let (name, slug) = shelf_name_slug(conn, shelf_id)?
+                .ok_or_else(|| format!("shelf {shelf_id} not found"))?;
+            let children = if depth_allows_descent(depth) {
+                list_books_in_shelf(conn, shelf_id)?
+                    .into_iter()
+                    .map(|b| book_node(conn, b, decrement_depth(depth)))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            Ok(vec![DirectoryNode {
+                kind: DirectoryNodeKind::Shelf,
+                id: shelf_id,
+                name,
+                slug,
+                page_kind: None,
+                children,
+            }])
+        }
+        DirectoryScope::Book(book_id) => {
+            let book =
+                get_book_row(conn, book_id)?.ok_or_else(|| format!("book {book_id} not found"))?;
+            Ok(vec![book_node(conn, book, depth)?])
+        }
+        DirectoryScope::Chapter(chapter_id) => {
+            let chap = get_chapter_row(conn, chapter_id)?
+                .ok_or_else(|| format!("chapter {chapter_id} not found"))?;
+            Ok(vec![chapter_node(conn, chap, depth)?])
+        }
+    }
+}
+
+fn depth_allows_descent(depth: Option<u32>) -> bool {
+    match depth {
+        None => true,
+        Some(0) => false,
+        Some(_) => true,
+    }
+}
+
+fn decrement_depth(depth: Option<u32>) -> Option<u32> {
+    depth.map(|d| d.saturating_sub(1))
+}
+
+fn list_books_in_shelf(
+    conn: &rusqlite::Connection,
+    shelf_id: i64,
+) -> Result<Vec<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT book_id, name, slug FROM bookstack_books
+             WHERE shelf_id = ?1 AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_books_in_shelf prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![shelf_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("list_books_in_shelf query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_books_in_shelf collect: {e}"))
+}
+
+fn list_books_unshelved(conn: &rusqlite::Connection) -> Result<Vec<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT book_id, name, slug FROM bookstack_books
+             WHERE shelf_id IS NULL AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_books_unshelved prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("list_books_unshelved query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_books_unshelved collect: {e}"))
+}
+
+fn shelf_name_slug(
+    conn: &rusqlite::Connection,
+    shelf_id: i64,
+) -> Result<Option<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name, slug FROM bookstack_shelves WHERE shelf_id = ?1 AND deleted = 0")
+        .map_err(|e| format!("shelf_name_slug prepare: {e}"))?;
+    let row = stmt.query_row(params![shelf_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    });
+    match row {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("shelf_name_slug: {e}")),
+    }
+}
+
+fn get_book_row(
+    conn: &rusqlite::Connection,
+    book_id: i64,
+) -> Result<Option<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT book_id, name, slug FROM bookstack_books WHERE book_id = ?1 AND deleted = 0",
+        )
+        .map_err(|e| format!("get_book_row prepare: {e}"))?;
+    let row = stmt.query_row(params![book_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    });
+    match row {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("get_book_row: {e}")),
+    }
+}
+
+fn get_chapter_row(
+    conn: &rusqlite::Connection,
+    chapter_id: i64,
+) -> Result<Option<(i64, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT chapter_id, name, slug FROM bookstack_chapters
+             WHERE chapter_id = ?1 AND deleted = 0",
+        )
+        .map_err(|e| format!("get_chapter_row prepare: {e}"))?;
+    let row = stmt.query_row(params![chapter_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    });
+    match row {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("get_chapter_row: {e}")),
+    }
+}
+
+fn book_node(
+    conn: &rusqlite::Connection,
+    book: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (book_id, name, slug) = book;
+    let children = if depth_allows_descent(depth) {
+        let child_depth = decrement_depth(depth);
+
+        // Chapters
+        let mut chap_stmt = conn
+            .prepare(
+                "SELECT chapter_id, name, slug FROM bookstack_chapters
+                 WHERE book_id = ?1 AND deleted = 0 ORDER BY name",
+            )
+            .map_err(|e| format!("book_node chapters prepare: {e}"))?;
+        let chap_rows: Vec<(i64, String, String)> = chap_stmt
+            .query_map(params![book_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("book_node chapters query: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("book_node chapters collect: {e}"))?;
+
+        let mut children: Vec<DirectoryNode> = Vec::with_capacity(chap_rows.len());
+        for c in chap_rows {
+            children.push(chapter_node(conn, c, child_depth)?);
+        }
+
+        // Book-root (chapter-less) pages
+        for p in list_pages_at_book_root(conn, book_id)? {
+            children.push(page_node(p));
+        }
+
+        children
+    } else {
+        Vec::new()
+    };
+
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Book,
+        id: book_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+fn chapter_node(
+    conn: &rusqlite::Connection,
+    chap: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (chapter_id, name, slug) = chap;
+    let children = if depth_allows_descent(depth) {
+        list_pages_in_chapter(conn, chapter_id)?
+            .into_iter()
+            .map(page_node)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Chapter,
+        id: chapter_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+fn page_node(p: (i64, String, String, String)) -> DirectoryNode {
+    let (id, name, slug, page_kind) = p;
+    DirectoryNode {
+        kind: DirectoryNodeKind::Page,
+        id,
+        name,
+        slug,
+        page_kind: Some(page_kind),
+        children: Vec::new(),
+    }
+}
+
+fn list_pages_at_book_root(
+    conn: &rusqlite::Connection,
+    book_id: i64,
+) -> Result<Vec<(i64, String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE book_id = ?1 AND chapter_id IS NULL AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_pages_at_book_root prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![book_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| format!("list_pages_at_book_root query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_pages_at_book_root collect: {e}"))
+}
+
+fn list_pages_in_chapter(
+    conn: &rusqlite::Connection,
+    chapter_id: i64,
+) -> Result<Vec<(i64, String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE chapter_id = ?1 AND deleted = 0 ORDER BY name",
+        )
+        .map_err(|e| format!("list_pages_in_chapter prepare: {e}"))?;
+    let rows = stmt
+        .query_map(params![chapter_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| format!("list_pages_in_chapter query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list_pages_in_chapter collect: {e}"))
+}
+
+// Note: `list_books_in_shelf`/`list_books_unshelved`/`get_book_row` above
+// return condensed (id, name, slug) tuples — that's all the tree node needs.
+// The `IndexedBook` / `IndexedChapter` / `IndexedPage` types carry more data
+// (identity_ouid, kind, archive_year, ...) which isn't used by the directory
+// surface today; if a caller needs that downstream, the existing
+// `get_indexed_book` / `get_indexed_chapter` lookups remain available.
 
 fn index_job_from_row(r: &rusqlite::Row) -> rusqlite::Result<IndexJob> {
     Ok(IndexJob {
@@ -3070,7 +3845,15 @@ mod lifecycle_tests {
                 .unwrap();
             assert_eq!(exists, 0, "global_settings.{col} should be dropped");
         }
-        for col in ["hive_shelf_id", "user_journals_shelf_id"] {
+        // Issue #122 — every shelf-cut column the briefing/RC era carried
+        // is dropped: both the v0.12.x named pair AND the v0.13.0-RC
+        // `indexed_shelves_json` field. The indexer walks every visible
+        // shelf unconditionally now.
+        for col in [
+            "hive_shelf_id",
+            "user_journals_shelf_id",
+            "indexed_shelves_json",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = ?1",
@@ -3078,10 +3861,120 @@ mod lifecycle_tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(exists, 1, "global_settings.{col} should be retained");
+            assert_eq!(
+                exists, 0,
+                "global_settings.{col} should be dropped (issue #122)"
+            );
         }
 
         drop(conn);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Issue #122 — opening a v0.13.0-RC database that still carries
+    /// `indexed_shelves_json` cleanly drops the column on startup. The
+    /// settings load doesn't reference it and the schema migration block
+    /// removes it via `DROP COLUMN IF EXISTS` (SQLite 3.35+).
+    #[tokio::test]
+    async fn v0_13_0_migration_drops_indexed_shelves_json_column() {
+        let dir = env::temp_dir();
+        let unique = format!(
+            "bsmcp-test-mig122-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = dir.join(&unique);
+
+        // Pre-create the v0.13.0-RC shape — `indexed_shelves_json` populated
+        // with a non-default value an operator might have set via `/settings`.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE global_settings (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 indexed_shelves_json TEXT NOT NULL DEFAULT '[]',
+                 set_by_token_hash TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 kb_scopes_json TEXT,
+                 cascade_multipliers_json TEXT
+             );
+             INSERT INTO global_settings (id, indexed_shelves_json, updated_at)
+                 VALUES (1, '[42, 87]', 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // First open — runs the migration, drops the column.
+        let db = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+        let _ = bsmcp_common::db::DbBackend::get_global_settings(&db)
+            .await
+            .unwrap();
+        drop(db);
+
+        // Verify the column is gone.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('global_settings') WHERE name = 'indexed_shelves_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 0,
+            "indexed_shelves_json must be dropped on startup (issue #122)"
+        );
+        drop(conn);
+
+        // Second open — idempotent: a DB with no `indexed_shelves_json`
+        // (post-drop) and no legacy columns reopens without error and
+        // returns sane defaults.
+        let db2 = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+        let g2 = bsmcp_common::db::DbBackend::get_global_settings(&db2)
+            .await
+            .unwrap();
+        assert_eq!(g2.updated_at, 0);
+        assert!(g2.kb_scopes.is_empty());
+        drop(db2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Issue #122 — a fresh v0.13.0 database opens cleanly: no
+    /// `indexed_shelves_json`, no v0.12.x columns, and `get_global_settings`
+    /// returns the default record without reference to either.
+    #[tokio::test]
+    async fn v0_13_0_fresh_open_settings_round_trip() {
+        let dir = env::temp_dir();
+        let unique = format!(
+            "bsmcp-test-mig122-fresh-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = dir.join(&unique);
+
+        let db = SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long");
+        let g = bsmcp_common::db::DbBackend::get_global_settings(&db)
+            .await
+            .unwrap();
+        assert_eq!(g.updated_at, 0);
+        assert!(g.kb_scopes.is_empty());
+
+        // Save + reload must work without the dropped column being in play.
+        bsmcp_common::db::DbBackend::save_global_settings(&db, &g, "test-hash")
+            .await
+            .unwrap();
+        let g2 = bsmcp_common::db::DbBackend::get_global_settings(&db)
+            .await
+            .unwrap();
+        assert!(g2.updated_at > 0, "save bumps updated_at");
+
+        drop(db);
         std::fs::remove_file(&path).ok();
     }
 
@@ -3372,5 +4265,265 @@ mod lifecycle_tests {
             .expect("job should still exist");
         assert_eq!(job.status, "cancelled");
         assert_eq!(job.resolved_status.as_deref(), Some("cancelled"));
+    }
+
+    // --- read_directory_tree (issue #69) ---
+
+    /// Build a small fixture: one shelf, two books on it (one with a chapter
+    /// and two pages, one book-root page), and one unshelved book. Returns
+    /// the populated db plus a handful of ids we lean on in assertions.
+    async fn populate_fixture(db: &SqliteDb) -> DirectoryFixtureIds {
+        // Shelf
+        let shelf = IndexedShelf {
+            shelf_id: 100,
+            name: "Personal".to_string(),
+            slug: "personal".to_string(),
+            shelf_kind: ShelfKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_shelf(db, &shelf).await.unwrap();
+
+        // Book A on shelf 100: has one chapter (with 2 pages) + 1 book-root page.
+        let book_a = IndexedBook {
+            book_id: 200,
+            name: "Household".to_string(),
+            slug: "household".to_string(),
+            shelf_id: Some(100),
+            identity_ouid: None,
+            book_kind: BookKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_book(db, &book_a).await.unwrap();
+
+        // Book B on shelf 100: empty (no chapters, no pages).
+        let book_b = IndexedBook {
+            book_id: 201,
+            name: "Finance".to_string(),
+            slug: "finance".to_string(),
+            shelf_id: Some(100),
+            identity_ouid: None,
+            book_kind: BookKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_book(db, &book_b).await.unwrap();
+
+        // Unshelved book C.
+        let book_c = IndexedBook {
+            book_id: 202,
+            name: "Drafts".to_string(),
+            slug: "drafts".to_string(),
+            shelf_id: None,
+            identity_ouid: None,
+            book_kind: BookKind::Unclassified,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_book(db, &book_c).await.unwrap();
+
+        // Chapter inside book A.
+        let chap = IndexedChapter {
+            chapter_id: 300,
+            book_id: 200,
+            name: "Routines".to_string(),
+            slug: "routines".to_string(),
+            identity_ouid: None,
+            chapter_kind: ChapterKind::Unclassified,
+            archive_year: None,
+            indexed_at: 1,
+            deleted: false,
+        };
+        IndexDb::upsert_indexed_chapter(db, &chap).await.unwrap();
+
+        // Pages: two in the chapter, one at book A root.
+        for (pid, name, chapter_id) in [
+            (400, "Morning", Some(300)),
+            (401, "Evening", Some(300)),
+            (402, "Pinned Note", None),
+        ] {
+            let page = IndexedPage {
+                page_id: pid,
+                book_id: 200,
+                chapter_id,
+                name: name.to_string(),
+                slug: name.to_lowercase().replace(' ', "-"),
+                url: None,
+                page_created_at: None,
+                page_updated_at: None,
+                identity_ouid: None,
+                page_kind: PageKind::Unclassified,
+                page_key: None,
+                archive_year: None,
+                indexed_at: 1,
+                deleted: false,
+            };
+            IndexDb::upsert_indexed_page(db, &page, None).await.unwrap();
+        }
+
+        DirectoryFixtureIds {
+            shelf_id: 100,
+            book_a: 200,
+            book_b: 201,
+            book_c: 202,
+            chapter_id: 300,
+            page_morning: 400,
+            page_evening: 401,
+            page_root: 402,
+        }
+    }
+
+    struct DirectoryFixtureIds {
+        shelf_id: i64,
+        book_a: i64,
+        book_b: i64,
+        book_c: i64,
+        chapter_id: i64,
+        page_morning: i64,
+        page_evening: i64,
+        page_root: i64,
+    }
+
+    #[tokio::test]
+    async fn directory_tree_all_scope_returns_full_shape() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::All, None)
+            .await
+            .unwrap();
+
+        // Two shelves at the top: the real one + synthetic "Unshelved".
+        assert_eq!(tree.len(), 2, "expected real shelf + Unshelved synthetic");
+        let real = tree.iter().find(|n| n.id == ids.shelf_id).unwrap();
+        assert_eq!(real.kind, DirectoryNodeKind::Shelf);
+        assert_eq!(real.children.len(), 2, "expected 2 books on shelf");
+
+        let book_a = real.children.iter().find(|b| b.id == ids.book_a).unwrap();
+        // Book A has 1 chapter + 1 book-root page → 2 immediate children.
+        assert_eq!(book_a.children.len(), 2);
+        let chap = book_a
+            .children
+            .iter()
+            .find(|c| c.kind == DirectoryNodeKind::Chapter)
+            .unwrap();
+        assert_eq!(chap.id, ids.chapter_id);
+        assert_eq!(chap.children.len(), 2, "expected 2 pages in chapter");
+        let root_page = book_a
+            .children
+            .iter()
+            .find(|c| c.kind == DirectoryNodeKind::Page)
+            .unwrap();
+        assert_eq!(root_page.id, ids.page_root);
+
+        // Book B is empty (no chapters or pages) — still present at this stage.
+        let book_b = real.children.iter().find(|b| b.id == ids.book_b).unwrap();
+        assert!(book_b.children.is_empty());
+
+        // Unshelved bucket carries Book C.
+        let unshelved = tree.iter().find(|n| n.id == 0).unwrap();
+        assert_eq!(unshelved.name, "Unshelved");
+        assert_eq!(unshelved.children.len(), 1);
+        assert_eq!(unshelved.children[0].id, ids.book_c);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_depth_zero_returns_roots_only() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::All, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 2);
+        for node in &tree {
+            assert!(
+                node.children.is_empty(),
+                "depth=0 must not expand children, got {node:?}"
+            );
+        }
+        // Roots still address the right entities.
+        assert!(tree.iter().any(|n| n.id == ids.shelf_id));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_depth_one_stops_at_books() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::All, Some(1))
+            .await
+            .unwrap();
+        let real = tree.iter().find(|n| n.id == ids.shelf_id).unwrap();
+        assert_eq!(real.children.len(), 2);
+        for book in &real.children {
+            assert_eq!(book.kind, DirectoryNodeKind::Book);
+            assert!(
+                book.children.is_empty(),
+                "depth=1 must stop at books, got {book:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_tree_scope_book_returns_just_that_book() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::Book(ids.book_a), None)
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 1);
+        let book = &tree[0];
+        assert_eq!(book.kind, DirectoryNodeKind::Book);
+        assert_eq!(book.id, ids.book_a);
+        // Chapter + root page.
+        assert_eq!(book.children.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_scope_chapter_returns_just_pages() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::Chapter(ids.chapter_id), None)
+            .await
+            .unwrap();
+        assert_eq!(tree.len(), 1);
+        let chap = &tree[0];
+        assert_eq!(chap.kind, DirectoryNodeKind::Chapter);
+        assert_eq!(chap.children.len(), 2);
+        let page_ids: Vec<i64> = chap.children.iter().map(|p| p.id).collect();
+        assert!(page_ids.contains(&ids.page_morning));
+        assert!(page_ids.contains(&ids.page_evening));
+        // The book-root page must NOT appear here.
+        assert!(!page_ids.contains(&ids.page_root));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_skips_soft_deleted_rows() {
+        let db = temp_db();
+        let ids = populate_fixture(&db).await;
+        IndexDb::soft_delete_indexed_page(&db, ids.page_evening)
+            .await
+            .unwrap();
+
+        let tree = IndexDb::read_directory_tree(&db, DirectoryScope::Chapter(ids.chapter_id), None)
+            .await
+            .unwrap();
+        let chap = &tree[0];
+        assert_eq!(chap.children.len(), 1);
+        assert_eq!(chap.children[0].id, ids.page_morning);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_unknown_scope_errors_clearly() {
+        let db = temp_db();
+        // No fixture — pure error path.
+        let err = IndexDb::read_directory_tree(&db, DirectoryScope::Book(9999), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("book 9999"));
     }
 }

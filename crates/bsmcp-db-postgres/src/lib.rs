@@ -78,10 +78,18 @@ impl PostgresDb {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS global_settings (
                 id INT PRIMARY KEY CHECK (id = 1),
-                hive_shelf_id BIGINT,
-                user_journals_shelf_id BIGINT,
                 set_by_token_hash TEXT,
-                updated_at BIGINT NOT NULL DEFAULT 0
+                updated_at BIGINT NOT NULL DEFAULT 0,
+                /* Issue #80 — named scope cuts (HashMap<String, ScopeDef>)
+                   and the precision-cascade pool multipliers, persisted as
+                   JSON blobs. Empty/NULL means: use defaults. */
+                kb_scopes_json TEXT,
+                cascade_multipliers_json TEXT
+                /* Issue #122 — the v0.13.0-RC `indexed_shelves_json` column
+                   (and the v0.12.x `hive_shelf_id` + `user_journals_shelf_id`
+                   columns it replaced) are dropped via the migration block
+                   below. The indexer walks every visible shelf
+                   unconditionally; scope is per-call only. */
             )",
         )
         .execute(&pool)
@@ -111,6 +119,20 @@ impl PostgresDb {
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_page_id",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_name",
             "ALTER TABLE global_settings DROP COLUMN IF EXISTS default_ai_identity_ouid",
+            // Issue #80 — additive JSON columns for kb_scopes + cascade
+            // multipliers. IF NOT EXISTS keeps the migration idempotent.
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS kb_scopes_json TEXT",
+            "ALTER TABLE global_settings ADD COLUMN IF NOT EXISTS cascade_multipliers_json TEXT",
+            // Issue #122 — drop the v0.13.0-RC `indexed_shelves_json` column
+            // (#120, which itself replaced the v0.12.x `hive_shelf_id` +
+            // `user_journals_shelf_id` pair, also dropped here). The indexer
+            // now walks every visible shelf unconditionally; per-call scope
+            // on `semantic_search` is the only scope surface. Postgres native
+            // `DROP COLUMN IF EXISTS` makes this idempotent on re-runs and a
+            // no-op on fresh installs that never had the column.
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS indexed_shelves_json",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS hive_shelf_id",
+            "ALTER TABLE global_settings DROP COLUMN IF EXISTS user_journals_shelf_id",
         ] {
             sqlx::query(sql).execute(&pool).await.ok();
         }
@@ -439,14 +461,14 @@ impl DbBackend for PostgresDb {
     }
 
     async fn backup(&self, _path: &Path) -> Result<(), String> {
-        eprintln!("Backup: PostgreSQL backups should use pg_dump externally");
+        tracing::info!("postgres_backup_no_op (use pg_dump externally)");
         Ok(())
     }
 
     async fn get_global_settings(&self) -> Result<GlobalSettings, String> {
         let row = sqlx::query(
-            "SELECT hive_shelf_id, user_journals_shelf_id,
-                    set_by_token_hash, updated_at
+            "SELECT set_by_token_hash, updated_at,
+                    kb_scopes_json, cascade_multipliers_json
              FROM global_settings WHERE id = 1",
         )
         .fetch_optional(&self.pool)
@@ -454,11 +476,23 @@ impl DbBackend for PostgresDb {
         .map_err(|e| format!("get_global_settings: {e}"))?;
 
         Ok(row
-            .map(|r| GlobalSettings {
-                hive_shelf_id: r.get("hive_shelf_id"),
-                user_journals_shelf_id: r.get("user_journals_shelf_id"),
-                set_by_token_hash: r.get("set_by_token_hash"),
-                updated_at: r.get("updated_at"),
+            .map(|r| {
+                let kb_scopes_json: Option<String> = r.get("kb_scopes_json");
+                let cascade_json: Option<String> = r.get("cascade_multipliers_json");
+                let kb_scopes = kb_scopes_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                let cascade_multipliers = cascade_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                GlobalSettings {
+                    set_by_token_hash: r.get("set_by_token_hash"),
+                    updated_at: r.get("updated_at"),
+                    kb_scopes,
+                    cascade_multipliers,
+                }
             })
             .unwrap_or_default())
     }
@@ -477,18 +511,31 @@ impl DbBackend for PostgresDb {
         .flatten();
         let final_setter = existing_setter.unwrap_or_else(|| set_by_token_hash.to_string());
 
+        let kb_scopes_json = if settings.kb_scopes.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&settings.kb_scopes)
+                    .map_err(|e| format!("save_global_settings: serialize kb_scopes: {e}"))?,
+            )
+        };
+        let cascade_multipliers_json = Some(
+            serde_json::to_string(&settings.cascade_multipliers)
+                .map_err(|e| format!("save_global_settings: serialize cascade_multipliers: {e}"))?,
+        );
+
         sqlx::query(
             "UPDATE global_settings
-             SET hive_shelf_id = $1,
-                 user_journals_shelf_id = $2,
-                 set_by_token_hash = $3,
-                 updated_at = $4
+             SET set_by_token_hash = $1,
+                 updated_at = $2,
+                 kb_scopes_json = $3,
+                 cascade_multipliers_json = $4
              WHERE id = 1",
         )
-        .bind(settings.hive_shelf_id)
-        .bind(settings.user_journals_shelf_id)
         .bind(&final_setter)
         .bind(Self::now_secs())
+        .bind(&kb_scopes_json)
+        .bind(&cascade_multipliers_json)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_global_settings: {e}"))?;
@@ -624,7 +671,32 @@ impl SemanticDb for PostgresDb {
         .await
         .map_err(|e| format!("Failed to create acl_reconcile_state: {e}"))?;
 
-        eprintln!("Semantic: PostgreSQL tables initialized");
+        // Permission cache (issue #58 lever a): per-token, per-page viewable
+        // verdict. L2 below the in-memory L1 in `SemanticState` so cold-cache
+        // after restart skips the HTTP fan-out for known-cached tokens.
+        // `token_hash` is `SHA256(token_id)` so a raw credential identifier
+        // never lands on disk.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS permission_cache (
+                token_hash TEXT NOT NULL,
+                page_id    BIGINT NOT NULL,
+                viewable   BOOLEAN NOT NULL,
+                cached_at  BIGINT NOT NULL,
+                PRIMARY KEY (token_hash, page_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to create permission_cache: {e}"))?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_permission_cache_cached_at \
+             ON permission_cache(cached_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
+
+        tracing::info!(backend = "postgres", "semantic_tables_initialized");
         Ok(())
     }
 
@@ -1304,7 +1376,7 @@ impl SemanticDb for PostgresDb {
         query_embedding: &[f32],
         limit: usize,
         threshold: f32,
-        book_ids: Option<&[i64]>,
+        scope: Option<&ScopeFilter>,
     ) -> Result<Vec<SearchHit>, String> {
         // Sanity check: detect garbage embeddings (all zeros, NaN, etc.)
         let magnitude: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1327,45 +1399,95 @@ impl SemanticDb for PostgresDb {
             .await
             .ok();
 
-        // Optional book scope. When set, restrict candidates to chunks whose
-        // page lives in one of the requested books. Empty slice = full corpus.
-        let book_filter: Option<Vec<i64>> = match book_ids {
-            Some(ids) if !ids.is_empty() => Some(ids.to_vec()),
-            _ => None,
-        };
+        // Optional scope filter. Union semantics: a chunk qualifies if its
+        // parent page matches any of the supplied book/chapter/page lists.
+        // Shelf-level IDs are not evaluated here — the caller must resolve
+        // shelves → books before invoking the search.
+        let scope_owned: Option<ScopeFilter> = scope.filter(|s| !s.is_empty()).map(|s| {
+            let mut f = s.clone();
+            f.dedup();
+            f
+        });
 
-        let rows =
-            match book_filter {
-                Some(books) => sqlx::query(
+        let rows = match scope_owned {
+            Some(f) => {
+                // Build a union of `p.<col> = ANY(...)` clauses for the
+                // non-empty ID lists. Bind each list as its own $N to keep
+                // sqlx's parameter typing happy.
+                let mut clauses: Vec<String> = Vec::new();
+                let mut next_param: usize = 4; // $1=vec, $2=threshold, $3=limit
+                let book_param = if !f.book_ids.is_empty() {
+                    let p = next_param;
+                    next_param += 1;
+                    clauses.push(format!("p.book_id = ANY(${p})"));
+                    Some(p)
+                } else {
+                    None
+                };
+                let chapter_param = if !f.chapter_ids.is_empty() {
+                    let p = next_param;
+                    next_param += 1;
+                    clauses.push(format!("p.chapter_id = ANY(${p})"));
+                    Some(p)
+                } else {
+                    None
+                };
+                let page_param = if !f.page_ids.is_empty() {
+                    let p = next_param;
+                    clauses.push(format!("p.page_id = ANY(${p})"));
+                    Some(p)
+                } else {
+                    None
+                };
+
+                if clauses.is_empty() {
+                    // shelf-only filter that the caller didn't expand —
+                    // return zero rows rather than silently widening.
+                    tx.commit().await.ok();
+                    return Ok(Vec::new());
+                }
+
+                let scope_clause = clauses.join(" OR ");
+                let sql = format!(
                     "SELECT c.id, c.page_id, (1 - (c.embedding <=> $1::vector))::FLOAT4 AS score
-                 FROM chunks c
-                 JOIN pages p ON c.page_id = p.page_id
-                 WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
-                   AND p.book_id = ANY($4)
-                 ORDER BY c.embedding <=> $1::vector
+                     FROM chunks c
+                     JOIN pages p ON c.page_id = p.page_id
+                     WHERE 1 - (c.embedding <=> $1::vector) > $2::FLOAT8
+                       AND ({scope_clause})
+                     ORDER BY c.embedding <=> $1::vector
+                     LIMIT $3"
+                );
+
+                let mut q = sqlx::query(&sql)
+                    .bind(&vec)
+                    .bind(threshold)
+                    .bind(limit as i64);
+                if book_param.is_some() {
+                    q = q.bind(&f.book_ids);
+                }
+                if chapter_param.is_some() {
+                    q = q.bind(&f.chapter_ids);
+                }
+                if page_param.is_some() {
+                    q = q.bind(&f.page_ids);
+                }
+                q.fetch_all(&mut *tx).await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
+                 FROM chunks
+                 WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
+                 ORDER BY embedding <=> $1::vector
                  LIMIT $3",
                 )
                 .bind(&vec)
                 .bind(threshold)
                 .bind(limit as i64)
-                .bind(&books)
                 .fetch_all(&mut *tx)
-                .await,
-                None => {
-                    sqlx::query(
-                        "SELECT id, page_id, (1 - (embedding <=> $1::vector))::FLOAT4 AS score
-                 FROM chunks
-                 WHERE 1 - (embedding <=> $1::vector) > $2::FLOAT8
-                 ORDER BY embedding <=> $1::vector
-                 LIMIT $3",
-                    )
-                    .bind(&vec)
-                    .bind(threshold)
-                    .bind(limit as i64)
-                    .fetch_all(&mut *tx)
-                    .await
-                }
-            };
+                .await
+            }
+        };
         let rows = rows.map_err(|e| format!("vector_search failed: {e}"))?;
 
         tx.commit().await.ok();
@@ -1386,7 +1508,7 @@ impl SemanticDb for PostgresDb {
                 .await
                 .unwrap_or((0,));
             if chunk_count.0 == 0 {
-                eprintln!("vector_search: 0 results — chunks table is EMPTY (embeddings may have been cleared)");
+                tracing::warn!("postgres_vector_search_chunks_empty");
             } else {
                 // Check max score to see if threshold is the issue
                 let top: Option<(f32,)> = sqlx::query_as(
@@ -1398,8 +1520,13 @@ impl SemanticDb for PostgresDb {
                 .ok()
                 .flatten();
                 let max_score = top.map(|t| t.0).unwrap_or(0.0);
-                eprintln!("vector_search: 0 results — {count} chunks exist, threshold={threshold:.3}, max_score={max_score:.3}, dims={dims}",
-                    count = chunk_count.0, dims = query_embedding.len());
+                tracing::warn!(
+                    chunks = chunk_count.0,
+                    threshold = format!("{threshold:.3}"),
+                    max_score = format!("{max_score:.3}"),
+                    dims = query_embedding.len(),
+                    "postgres_vector_search_no_results"
+                );
             }
         }
 
@@ -1416,9 +1543,10 @@ impl SemanticDb for PostgresDb {
             .fetch_one(&self.pool)
             .await
             .unwrap_or((0,));
-        eprintln!(
-            "clear_all_embeddings: clearing {} pages, {} chunks",
-            pages.0, chunks.0
+        tracing::info!(
+            pages = pages.0,
+            chunks = chunks.0,
+            "postgres_clear_all_embeddings"
         );
 
         sqlx::query("DELETE FROM relationships")
@@ -1455,7 +1583,7 @@ impl SemanticDb for PostgresDb {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("recreate index: {e}"))?;
-        eprintln!("PostgreSQL: embedding column altered to vector({dims})");
+        tracing::info!(dims, "postgres_embedding_column_altered");
         Ok(())
     }
 
@@ -1496,7 +1624,7 @@ impl SemanticDb for PostgresDb {
             .map_err(|e| format!("compute_similar_pages: {e}"))?;
 
         let count = result.rows_affected() as usize;
-        eprintln!("Semantic: computed {count} similar-page relationships (top_k={top_k}, threshold={threshold})");
+        tracing::info!(count, top_k, threshold, "semantic_similar_pages_computed");
         Ok(count)
     }
 
@@ -1581,6 +1709,119 @@ impl SemanticDb for PostgresDb {
                 .await
                 .map_err(|e| format!("list_acl_page_ids: {e}"))?;
         Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    async fn prefilter_pages_by_roles(
+        &self,
+        page_ids: &[i64],
+        role_ids: &[i64],
+    ) -> Result<Vec<(i64, AclPrefilter)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Single roundtrip via ANY(array). Postgres planner handles a
+        // 50-row IN list as efficiently as the SQL-IN form.
+        let rows: Vec<(i64, Option<i64>, Option<bool>, bool)> = if role_ids.is_empty() {
+            sqlx::query_as(
+                "SELECT page_id, acl_computed_at, acl_default_open, FALSE AS has_role_match \
+                 FROM pages WHERE page_id = ANY($1)",
+            )
+            .bind(page_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("prefilter_pages_by_roles: {e}"))?
+        } else {
+            sqlx::query_as(
+                "SELECT p.page_id, p.acl_computed_at, p.acl_default_open, \
+                        EXISTS ( \
+                            SELECT 1 FROM page_view_acl pva \
+                            WHERE pva.page_id = p.page_id \
+                              AND pva.role_id = ANY($2) \
+                        ) AS has_role_match \
+                 FROM pages p WHERE p.page_id = ANY($1)",
+            )
+            .bind(page_ids)
+            .bind(role_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("prefilter_pages_by_roles: {e}"))?
+        };
+        let mut out: Vec<(i64, AclPrefilter)> = Vec::with_capacity(rows.len());
+        for (pid, computed_at, default_open, has_match) in rows {
+            let verdict = if computed_at.is_none() {
+                AclPrefilter::Uncomputed
+            } else if default_open.unwrap_or(false) {
+                AclPrefilter::DefaultOpen
+            } else if has_match {
+                AclPrefilter::Allow
+            } else {
+                AclPrefilter::Deny
+            };
+            out.push((pid, verdict));
+        }
+        Ok(out)
+    }
+
+    async fn get_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        page_ids: &[i64],
+        min_cached_at: i64,
+    ) -> Result<Vec<(i64, bool)>, String> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(i64, bool)> = sqlx::query_as(
+            "SELECT page_id, viewable FROM permission_cache \
+             WHERE token_hash = $1 AND cached_at >= $2 AND page_id = ANY($3)",
+        )
+        .bind(token_hash)
+        .bind(min_cached_at)
+        .bind(page_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("get_permission_cache_batch: {e}"))?;
+        Ok(rows)
+    }
+
+    async fn upsert_permission_cache_batch(
+        &self,
+        token_hash: &str,
+        entries: &[(i64, bool)],
+        cached_at: i64,
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Build parallel arrays for an UNNEST-driven bulk upsert. Single
+        // roundtrip regardless of batch size; conflict-resolves to the
+        // freshest viewable + cached_at per (token_hash, page_id).
+        let page_ids: Vec<i64> = entries.iter().map(|(p, _)| *p).collect();
+        let viewables: Vec<bool> = entries.iter().map(|(_, v)| *v).collect();
+        sqlx::query(
+            "INSERT INTO permission_cache (token_hash, page_id, viewable, cached_at) \
+             SELECT $1, p, v, $2 \
+             FROM UNNEST($3::BIGINT[], $4::BOOLEAN[]) AS t(p, v) \
+             ON CONFLICT (token_hash, page_id) DO UPDATE SET \
+             viewable = EXCLUDED.viewable, cached_at = EXCLUDED.cached_at",
+        )
+        .bind(token_hash)
+        .bind(cached_at)
+        .bind(&page_ids)
+        .bind(&viewables)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("upsert_permission_cache_batch: {e}"))?;
+        Ok(())
+    }
+
+    async fn evict_stale_permission_cache(&self, older_than: i64) -> Result<usize, String> {
+        let result = sqlx::query("DELETE FROM permission_cache WHERE cached_at < $1")
+            .bind(older_than)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("evict_stale_permission_cache: {e}"))?;
+        Ok(result.rows_affected() as usize)
     }
 }
 
@@ -2353,6 +2594,351 @@ impl IndexDb for PostgresDb {
         .await
         .map_err(|e| format!("set_index_meta: {e}"))?;
         Ok(())
+    }
+
+    // --- Directory tree (issue #69) ---
+
+    async fn list_indexed_shelves(&self) -> Result<Vec<IndexedShelf>, String> {
+        let rows = sqlx::query(
+            "SELECT shelf_id, name, slug, shelf_kind, indexed_at, deleted
+             FROM bookstack_shelves WHERE deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_shelves: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let kind_str: String = r.get("shelf_kind");
+                IndexedShelf {
+                    shelf_id: r.get("shelf_id"),
+                    name: r.get("name"),
+                    slug: r.get("slug"),
+                    shelf_kind: kind_str.parse().unwrap_or(ShelfKind::Unclassified),
+                    indexed_at: r.get("indexed_at"),
+                    deleted: r.get("deleted"),
+                }
+            })
+            .collect())
+    }
+
+    async fn list_indexed_books_unshelved(&self) -> Result<Vec<IndexedBook>, String> {
+        let rows = sqlx::query(
+            "SELECT book_id, name, slug, shelf_id, identity_ouid, book_kind, indexed_at, deleted
+             FROM bookstack_books WHERE shelf_id IS NULL AND deleted = FALSE
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_indexed_books_unshelved: {e}"))?;
+        Ok(rows.into_iter().map(book_from_row).collect())
+    }
+
+    async fn read_directory_tree(
+        &self,
+        scope: DirectoryScope,
+        depth: Option<u32>,
+    ) -> Result<Vec<DirectoryNode>, String> {
+        match scope {
+            DirectoryScope::All => {
+                let shelves: Vec<(i64, String, String)> = sqlx::query(
+                    "SELECT shelf_id, name, slug FROM bookstack_shelves
+                     WHERE deleted = FALSE ORDER BY name",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree shelves: {e}"))?
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<i64, _>("shelf_id"),
+                        r.get::<String, _>("name"),
+                        r.get::<String, _>("slug"),
+                    )
+                })
+                .collect();
+
+                let mut out: Vec<DirectoryNode> = Vec::with_capacity(shelves.len() + 1);
+                for (shelf_id, name, slug) in shelves {
+                    let children = if depth_allows_descent(depth) {
+                        build_shelf_children(&self.pool, shelf_id, decrement_depth(depth)).await?
+                    } else {
+                        Vec::new()
+                    };
+                    out.push(DirectoryNode {
+                        kind: DirectoryNodeKind::Shelf,
+                        id: shelf_id,
+                        name,
+                        slug,
+                        page_kind: None,
+                        children,
+                    });
+                }
+
+                let unshelved: Vec<(i64, String, String)> = sqlx::query(
+                    "SELECT book_id, name, slug FROM bookstack_books
+                     WHERE shelf_id IS NULL AND deleted = FALSE ORDER BY name",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree unshelved books: {e}"))?
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<i64, _>("book_id"),
+                        r.get::<String, _>("name"),
+                        r.get::<String, _>("slug"),
+                    )
+                })
+                .collect();
+
+                if !unshelved.is_empty() {
+                    let mut children: Vec<DirectoryNode> = Vec::with_capacity(unshelved.len());
+                    if depth_allows_descent(depth) {
+                        let child_depth = decrement_depth(depth);
+                        for b in unshelved {
+                            children.push(build_book_node(&self.pool, b, child_depth).await?);
+                        }
+                    }
+                    out.push(DirectoryNode {
+                        kind: DirectoryNodeKind::Shelf,
+                        id: 0,
+                        name: SHELF_NAME_UNSHELVED.to_string(),
+                        slug: "unshelved".to_string(),
+                        page_kind: None,
+                        children,
+                    });
+                }
+                Ok(out)
+            }
+            DirectoryScope::Shelf(shelf_id) => {
+                let shelf = sqlx::query(
+                    "SELECT name, slug FROM bookstack_shelves
+                     WHERE shelf_id = $1 AND deleted = FALSE",
+                )
+                .bind(shelf_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree shelf: {e}"))?;
+                let (name, slug) = match shelf {
+                    Some(r) => (r.get::<String, _>("name"), r.get::<String, _>("slug")),
+                    None => return Err(format!("shelf {shelf_id} not found")),
+                };
+                let children = if depth_allows_descent(depth) {
+                    build_shelf_children(&self.pool, shelf_id, decrement_depth(depth)).await?
+                } else {
+                    Vec::new()
+                };
+                Ok(vec![DirectoryNode {
+                    kind: DirectoryNodeKind::Shelf,
+                    id: shelf_id,
+                    name,
+                    slug,
+                    page_kind: None,
+                    children,
+                }])
+            }
+            DirectoryScope::Book(book_id) => {
+                let row = sqlx::query(
+                    "SELECT book_id, name, slug FROM bookstack_books
+                     WHERE book_id = $1 AND deleted = FALSE",
+                )
+                .bind(book_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree book: {e}"))?
+                .ok_or_else(|| format!("book {book_id} not found"))?;
+                let b = (
+                    row.get::<i64, _>("book_id"),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("slug"),
+                );
+                Ok(vec![build_book_node(&self.pool, b, depth).await?])
+            }
+            DirectoryScope::Chapter(chapter_id) => {
+                let row = sqlx::query(
+                    "SELECT chapter_id, name, slug FROM bookstack_chapters
+                     WHERE chapter_id = $1 AND deleted = FALSE",
+                )
+                .bind(chapter_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("read_directory_tree chapter: {e}"))?
+                .ok_or_else(|| format!("chapter {chapter_id} not found"))?;
+                let c = (
+                    row.get::<i64, _>("chapter_id"),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("slug"),
+                );
+                Ok(vec![build_chapter_node(&self.pool, c, depth).await?])
+            }
+        }
+    }
+}
+
+// --- Directory tree helpers (issue #69) ---
+
+const SHELF_NAME_UNSHELVED: &str = "Unshelved";
+
+fn depth_allows_descent(depth: Option<u32>) -> bool {
+    match depth {
+        None => true,
+        Some(0) => false,
+        Some(_) => true,
+    }
+}
+
+fn decrement_depth(depth: Option<u32>) -> Option<u32> {
+    depth.map(|d| d.saturating_sub(1))
+}
+
+async fn build_shelf_children(
+    pool: &PgPool,
+    shelf_id: i64,
+    child_depth: Option<u32>,
+) -> Result<Vec<DirectoryNode>, String> {
+    let books: Vec<(i64, String, String)> = sqlx::query(
+        "SELECT book_id, name, slug FROM bookstack_books
+         WHERE shelf_id = $1 AND deleted = FALSE ORDER BY name",
+    )
+    .bind(shelf_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("build_shelf_children: {e}"))?
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<i64, _>("book_id"),
+            r.get::<String, _>("name"),
+            r.get::<String, _>("slug"),
+        )
+    })
+    .collect();
+    let mut out: Vec<DirectoryNode> = Vec::with_capacity(books.len());
+    for b in books {
+        out.push(build_book_node(pool, b, child_depth).await?);
+    }
+    Ok(out)
+}
+
+async fn build_book_node(
+    pool: &PgPool,
+    book: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (book_id, name, slug) = book;
+    let children = if depth_allows_descent(depth) {
+        let child_depth = decrement_depth(depth);
+
+        let chap_rows: Vec<(i64, String, String)> = sqlx::query(
+            "SELECT chapter_id, name, slug FROM bookstack_chapters
+             WHERE book_id = $1 AND deleted = FALSE ORDER BY name",
+        )
+        .bind(book_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("build_book_node chapters: {e}"))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("chapter_id"),
+                r.get::<String, _>("name"),
+                r.get::<String, _>("slug"),
+            )
+        })
+        .collect();
+
+        let mut children: Vec<DirectoryNode> = Vec::with_capacity(chap_rows.len());
+        for c in chap_rows {
+            children.push(build_chapter_node(pool, c, child_depth).await?);
+        }
+
+        // Book-root (chapter-less) pages.
+        let root_pages: Vec<(i64, String, String, String)> = sqlx::query(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE book_id = $1 AND chapter_id IS NULL AND deleted = FALSE ORDER BY name",
+        )
+        .bind(book_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("build_book_node root pages: {e}"))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("page_id"),
+                r.get::<String, _>("name"),
+                r.get::<String, _>("slug"),
+                r.get::<String, _>("page_kind"),
+            )
+        })
+        .collect();
+        for p in root_pages {
+            children.push(page_node(p));
+        }
+
+        children
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Book,
+        id: book_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+async fn build_chapter_node(
+    pool: &PgPool,
+    chap: (i64, String, String),
+    depth: Option<u32>,
+) -> Result<DirectoryNode, String> {
+    let (chapter_id, name, slug) = chap;
+    let children = if depth_allows_descent(depth) {
+        let pages: Vec<(i64, String, String, String)> = sqlx::query(
+            "SELECT page_id, name, slug, page_kind FROM bookstack_pages
+             WHERE chapter_id = $1 AND deleted = FALSE ORDER BY name",
+        )
+        .bind(chapter_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("build_chapter_node pages: {e}"))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("page_id"),
+                r.get::<String, _>("name"),
+                r.get::<String, _>("slug"),
+                r.get::<String, _>("page_kind"),
+            )
+        })
+        .collect();
+        pages.into_iter().map(page_node).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryNode {
+        kind: DirectoryNodeKind::Chapter,
+        id: chapter_id,
+        name,
+        slug,
+        page_kind: None,
+        children,
+    })
+}
+
+fn page_node(p: (i64, String, String, String)) -> DirectoryNode {
+    let (id, name, slug, page_kind) = p;
+    DirectoryNode {
+        kind: DirectoryNodeKind::Page,
+        id,
+        name,
+        slug,
+        page_kind: Some(page_kind),
+        children: Vec::new(),
     }
 }
 
