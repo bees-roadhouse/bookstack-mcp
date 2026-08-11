@@ -225,6 +225,13 @@ async fn main() {
         "timezone_resolved"
     );
 
+    // Per-token cap on concurrent legacy SSE sessions (issue #138). Streamable
+    // notification GETs no longer consume a slot, but a host running several
+    // MCP clients on one BookStack token can still want more headroom than the
+    // default 5.
+    let max_sessions_per_token = sse::max_sessions_per_token_from_env();
+    tracing::info!(max_sessions_per_token, "session_cap_resolved");
+
     let state = sse::AppState::new(
         bookstack_url,
         db,
@@ -234,6 +241,7 @@ async fn main() {
         backup_path,
         semantic,
         timezone,
+        max_sessions_per_token,
     );
     state.spawn_cleanup();
     state.spawn_backup();
