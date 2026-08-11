@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::bookstack::{BookStackClient, CredentialCheck};
 use bsmcp_common::config::access_token_ttl;
 
 use crate::sse::AppState;
@@ -345,8 +345,20 @@ pub async fn handle_authorize_submit(
         &form.token_secret,
         state.http_client.clone(),
     );
-    if let Err(e) = bs_client.validate().await {
-        tracing::warn!(error = %e, "oauth_credential_validation_failed");
+    // Don't blame the pasted token when BookStack simply couldn't answer —
+    // the user would rotate a perfectly good API token chasing it (#139).
+    let form_error = match bs_client.validate().await {
+        CredentialCheck::Valid => None,
+        CredentialCheck::Rejected(e) => {
+            tracing::warn!(error = %e, "oauth_credential_validation_rejected");
+            Some("Invalid API token. Check your Token ID and Secret.")
+        }
+        CredentialCheck::Unavailable(e) => {
+            tracing::warn!(error = %e, "oauth_credential_validation_unavailable");
+            Some("Couldn't reach BookStack to check that token. Try again in a moment.")
+        }
+    };
+    if let Some(msg) = form_error {
         let params = AuthorizeParams {
             response_type: form.response_type.clone(),
             client_id: form.client_id.clone(),
@@ -356,12 +368,7 @@ pub async fn handle_authorize_submit(
             code_challenge_method: form.code_challenge_method.clone(),
             return_to: form.return_to.clone(),
         };
-        return Html(render_login_form(
-            &params,
-            &state.bookstack_url,
-            Some("Invalid API token. Check your Token ID and Secret."),
-        ))
-        .into_response();
+        return Html(render_login_form(&params, &state.bookstack_url, Some(msg))).into_response();
     }
 
     // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
@@ -558,13 +565,20 @@ async fn handle_token_authorization_code(
             &client_secret,
             state.http_client.clone(),
         );
-        if let Err(e) = bs_client.validate().await {
-            tracing::warn!(error = %e, "oauth_bookstack_credential_validation_failed");
-            return oauth_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                Some("Invalid BookStack credentials"),
-            );
+        match bs_client.validate().await {
+            CredentialCheck::Valid => {}
+            CredentialCheck::Rejected(e) => {
+                tracing::warn!(error = %e, "oauth_bookstack_credential_validation_rejected");
+                return oauth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    Some("Invalid BookStack credentials"),
+                );
+            }
+            CredentialCheck::Unavailable(e) => {
+                tracing::warn!(error = %e, "oauth_bookstack_credential_validation_unavailable");
+                return temporarily_unavailable();
+            }
         }
 
         tracing::debug!(
@@ -616,15 +630,28 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
         &token_secret,
         state.http_client.clone(),
     );
-    if let Err(e) = bs_client.validate().await {
-        tracing::warn!(error = %e, "oauth_stored_credentials_invalid");
-        // Consume the invalid refresh token
-        state.db.delete_refresh_token(&old_refresh).await.ok();
-        return oauth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_grant",
-            Some("BookStack API credentials are no longer valid. Please re-authenticate with new credentials."),
-        );
+    match bs_client.validate().await {
+        CredentialCheck::Valid => {}
+        CredentialCheck::Rejected(e) => {
+            tracing::warn!(error = %e, "oauth_stored_credentials_rejected");
+            // BookStack answered and said no. The stored credentials this
+            // refresh token wraps are dead, so the token is worthless —
+            // consume it.
+            state.db.delete_refresh_token(&old_refresh).await.ok();
+            return oauth_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_grant",
+                Some("BookStack API credentials are no longer valid. Please re-authenticate with new credentials."),
+            );
+        }
+        CredentialCheck::Unavailable(e) => {
+            // We never got an answer. Deleting here destroys a valid 90-day
+            // refresh token over a restart or a proxy blip and forces a full
+            // browser re-auth with no recovery path — the core of #139.
+            // Keep the token, tell the client to retry.
+            tracing::warn!(error = %e, "oauth_stored_credentials_unavailable");
+            return temporarily_unavailable();
+        }
     }
 
     // Consume the old refresh token (rotation)
@@ -783,4 +810,20 @@ fn oauth_error(status: StatusCode, error: &str, description: Option<&str>) -> Re
         body["error_description"] = json!(desc);
     }
     (status, Json(body)).into_response()
+}
+
+/// RFC 6749 §4.1.2.1 `temporarily_unavailable` — the token endpoint's way of
+/// saying "not your credentials, try again". Distinct from `invalid_grant`,
+/// which tells the client its token is dead and to start over (#139).
+fn temporarily_unavailable() -> Response {
+    let mut resp = oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+        Some("BookStack is unreachable — retry shortly. Your token is still valid."),
+    );
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        crate::sse::RETRY_AFTER_SECS.parse().unwrap(),
+    );
+    resp
 }
