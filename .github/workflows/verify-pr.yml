@@ -1,15 +1,15 @@
 name: Verify PR
 
 # PR-time gating signal: cargo check + cargo clippy + cargo test on
-# ubuntu-latest. Image builds run out-of-band on push to development /
-# release (build-development.yml / release.yml). This workflow is the
+# ubuntu-latest. Image builds run out-of-band on push to main
+# (build-main.yml) and on v* tags (release.yml). This workflow is the
 # "does it compile, lint, test" gate — not "does the image build."
 #
 # Pinned to GitHub-hosted runners. No self-hosted dependency.
 
 on:
   pull_request:
-    branches: [development, release]
+    branches: [main]
     types: [opened, synchronize, reopened]
 
 concurrency:

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Optional, vestigial. CI builds images on push to development / release
-# via build-development.yml / release.yml — there is no PR-time image
-# build and no per-PR tag in the current model. This script tags images
+# Optional, vestigial. CI builds images on push to main via build-main.yml
+# and on `v*` tags via release.yml — there is no PR-time image build and
+# no per-PR tag in the current model. This script tags images
 # with `{version}-{slug}` / `{version}-{slug}-{sha}` for local
 # experimentation only; nothing in the normal flow consumes those tags.
 #
@@ -10,10 +10,10 @@
 #   - Reproducing a specific tree's image locally for debugging.
 #
 # For "emergency rebuild when CI is broken" use `workflow_dispatch` on
-# build-development.yml instead — it produces the canonical :dev tags.
+# build-main.yml instead — it produces the canonical :dev tags.
 #
-# Path-aware fast path: when the branch's diff against `origin/development`
-# (or `origin/release` when targeting that) doesn't touch any file that
+# Path-aware fast path: when the branch's diff against `origin/main`
+# doesn't touch any file that
 # affects a given binary, we skip the rebuild and instead retag the
 # latest published `:dev` image as the per-PR tags. Tag-only ops are
 # free; full builds on linux/arm64 take 15+ minutes.
@@ -65,18 +65,17 @@ if ! docker buildx version >/dev/null 2>&1; then
   exit 1
 fi
 
-# Resolve the merge-base ref to diff against. PRs typically target
-# `development`; the release flow targets `release`. We pick whichever
-# remote ref is reachable from HEAD with the shortest history — falls
-# back to development when neither is local.
+# Resolve the merge-base ref to diff against. Under single `main` every
+# PR targets `main`, so there is only one candidate — the loop is kept so
+# a clone without the remote ref still gets a sane fallback.
 resolve_diff_base() {
-  for candidate in origin/development origin/release; do
+  for candidate in origin/main; do
     if git rev-parse --verify "$candidate" >/dev/null 2>&1; then
       echo "$candidate"
       return 0
     fi
   done
-  echo "origin/development"
+  echo "origin/main"
 }
 
 DIFF_BASE=$(resolve_diff_base)
@@ -200,17 +199,17 @@ for arg in "$@"; do
   esac
 done
 
-# Auto-force a real build when publishing directly from development or
-# release. The path-aware fast path's retag-from-dev mode is correct for
+# Auto-force a real build when publishing directly from `main`. The
+# path-aware fast path's retag-from-dev mode is correct for
 # PR work (the merge commit's tree matches the PR head, and the
 # contributor's per-PR image is the right artifact), but for a direct
-# push to development/release we want the resulting image's
+# push to main we want the resulting image's
 # `org.opencontainers.image.revision` label to match the SHA actually
 # being pushed — otherwise label-SHA and tag-SHA can drift on pure
 # CI/docs commits that piggyback an existing image. Always rebuild on
-# the canonical branches; keep the fast path for everything else.
+# the canonical branch; keep the fast path for everything else.
 case "$BRANCH" in
-  development|release)
+  main)
     if [ "$FORCE_REBUILD" != "1" ]; then
       echo "Branch=$BRANCH: forcing rebuild so the image's revision label matches the push SHA."
       echo

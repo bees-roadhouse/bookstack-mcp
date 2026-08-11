@@ -1,8 +1,16 @@
-name: Build Development
+name: Build Main
 
-# Build images on every push to `development`. PR squash-merges arrive
-# as push events and take the same path. There is no PR-time image build
-# and no retag-on-merge step (see issue #96).
+# Build images on every push to `main`. PR squash-merges arrive as push
+# events and take the same path. There is no PR-time image build and no
+# retag-on-merge step (see issue #96).
+#
+# Under the single-`main` model the merge IS the deploy — there is no
+# promote step. The `:dev` tag family below is kept deliberately: the
+# compose files in docker/ and the Portainer stacks pin `:dev`, so
+# renaming the tags here would break every running deployment. The tag
+# name is now a stream label ("the rolling build off main"), not a claim
+# about which branch produced it. Versioned/`:latest` images come from a
+# `v*` tag push via release.yml.
 #
 # `workflow_dispatch` stays as a manual rebuild escape hatch.
 #
@@ -12,7 +20,7 @@ name: Build Development
 
 on:
   push:
-    branches: [development]
+    branches: [main]
   workflow_dispatch:
     inputs:
       reason:
@@ -25,7 +33,7 @@ env:
   REPO_URL: https://github.com/bees-roadhouse/bookstack-mcp
 
 concurrency:
-  group: build-development-${{ github.ref }}
+  group: build-main-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

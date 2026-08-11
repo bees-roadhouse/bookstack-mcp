@@ -2,26 +2,27 @@ name: Release
 
 # Release-stream concerns. Triggers:
 #
-#   1. push: release          → build and push the release-stream images
-#                               (`:{version}`, `:{version}-{sha}`, `:release`,
-#                               `:latest`), create the v{version} GitHub
-#                               Release entry, attach native bsmcp-server
-#                               binaries for 5 targets.
+#   1. push: tag v*           → build and push the release-stream images
+#                               (`:{version}`, `:{version}-{sha}`,
+#                               `:release`, `:latest`), create the
+#                               v{version} GitHub Release entry, attach
+#                               native bsmcp-server binaries for 5 targets.
 #
-#   2. push: tag v*           → emergency hotfix path. Builds and pushes
-#                               semver-tagged images directly, then
-#                               creates the matching GitHub Release.
-#                               Use only when the normal release flow
-#                               (PR development → release, then merge)
-#                               isn't available — typically because a
-#                               regression on `release` needs a bypass.
+#   2. workflow_dispatch      → manual recovery path.
 #
-#   3. workflow_dispatch       → manual recovery path.
+# Under the single-`main` model (org migration 2026-07-05) there is no
+# `release` branch to push to, so a `v*` tag IS the release trigger — not
+# the emergency bypass it used to be. Cutting a release is:
+#
+#   git tag v0.14.0 && git push origin v0.14.0
+#
+# The tag must match the workspace version in Cargo.toml; tag-release
+# fails the run if it doesn't.
 #
 # verify-pr.yml is the PR-time gating workflow (cargo test/clippy).
-# build-development.yml is the development-stream image builder. This
-# workflow owns the release stream end-to-end (build + release entry +
-# native binaries).
+# build-main.yml is the rolling image builder off `main` (the `:dev` tag
+# family). This workflow owns the release stream end-to-end (build +
+# release entry + native binaries).
 #
 # Canonical references:
 #   https://kb.beesroadhouse.com/books/developer-operations-devops/page/docker-image-build-workflows (1905)
@@ -29,7 +30,6 @@ name: Release
 
 on:
   push:
-    branches: [release]
     tags:
       - 'v*'
   workflow_dispatch:
@@ -38,279 +38,8 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # Image build on push: release. Builds + pushes the release-stream
-  # tags (:{version}, :{version}-{sha}, :release, :latest). Pinned to
-  # ubuntu-latest; no self-hosted dependency.
-  build-release-images:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: bsmcp-server
-            dockerfile: docker/Dockerfile.server
-            scope: server
-          - image: bsmcp-embedder
-            dockerfile: docker/Dockerfile.embedder
-            scope: embedder
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version + sha
-        id: vars
-        run: |
-          set -euo pipefail
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          SHORT_SHA=${GITHUB_SHA:0:7}
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:${{ steps.vars.outputs.version }}
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short_sha }}
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:release
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/bees-roadhouse/bookstack-mcp
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.scope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
-
-  # Transition alias for v0.13.0 ONLY (closes #56). The standalone
-  # bsmcp-worker image is dropped from the build matrix in v0.13.0; this
-  # job publishes `ghcr.io/bees-roadhouse/bsmcp-worker:<tag>` as an
-  # additional name pointing at the same `bsmcp-embedder:<tag>` manifest
-  # so existing compose files keep pulling without a hard break.
-  #
-  # `docker buildx imagetools create` preserves the multi-arch manifest
-  # list (linux/amd64 + linux/arm64) — it's a registry-side rewrite, no
-  # rebuild needed.
-  #
-  # **Delete this job in v0.14.0.** Operators get one release cycle to
-  # update their compose files; after that, `bsmcp-worker:<tag>` will 404.
-  alias-worker-to-embedder:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release'
-    needs: [build-release-images]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version + sha
-        id: vars
-        run: |
-          set -euo pipefail
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          SHORT_SHA=${GITHUB_SHA:0:7}
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag embedder as worker (transition alias)
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.vars.outputs.version }}"
-          SHORT_SHA="${{ steps.vars.outputs.short_sha }}"
-          for TAG in "${VERSION}" "${VERSION}-${SHORT_SHA}" "release" "latest"; do
-            echo "Aliasing bsmcp-worker:${TAG} -> bsmcp-embedder:${TAG}"
-            docker buildx imagetools create \
-              -t "${{ env.REGISTRY }}/bees-roadhouse/bsmcp-worker:${TAG}" \
-              "${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder:${TAG}"
-          done
-
-  # GitHub Release entry on push: release. Runs in parallel with
-  # build-release-images (the Release body references tags by name, which
-  # resolve to manifests when users pull). Creates the v{version} git
-  # tag (if missing) and the GitHub Release entry; release-binaries-on-
-  # merge attaches native binaries.
-  github-release-on-merge:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    outputs:
-      tag: ${{ steps.vars.outputs.tag }}
-      version: ${{ steps.vars.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Resolve version + tag
-        id: vars
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-          TAG="v${VERSION}"
-          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
-            NEEDS_TAG=false
-          else
-            NEEDS_TAG=true
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "needs_tag=${NEEDS_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push tag
-        if: steps.vars.outputs.needs_tag == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.vars.outputs.tag }}" -m "Release ${{ steps.vars.outputs.tag }}"
-          git push origin "${{ steps.vars.outputs.tag }}"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: bookstack-mcp ${{ steps.vars.outputs.tag }}
-          tag_name: ${{ steps.vars.outputs.tag }}
-          generate_release_notes: true
-          body: |
-            ## Container images
-
-            ```
-            docker pull ghcr.io/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}
-            docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}
-            ```
-
-            Or pin to the rolling release tag:
-
-            ```
-            docker pull ghcr.io/bees-roadhouse/bsmcp-server:release
-            docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:release
-            ```
-
-            > **Breaking change (v0.13.0):** `bsmcp-worker` was folded into `bsmcp-embedder`. The embedder image now accepts `--role={embedder|worker|both}` (CLI flag, primary) or `BSMCP_ROLE` (env fallback); default is `embedder`. For one release only, `ghcr.io/bees-roadhouse/bsmcp-worker:<tag>` is published as a registry alias of `ghcr.io/bees-roadhouse/bsmcp-embedder:<tag>` so existing compose files keep pulling. The alias is removed in v0.14.0. See the README's "From v0.12.x to v0.13.0" entry for compose changes.
-
-            ## Native binaries (`bsmcp-server` only)
-
-            Server binaries for common platforms are attached below. The embedder is not released as a bare binary because of its ONNX Runtime dependency — use the container image instead.
-
-  release-binaries-on-merge:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release'
-    needs: [github-release-on-merge]
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            archive: tar.gz
-            cross: true
-          # Cross-compiled from the Apple-Silicon runner. macos-13 (Intel)
-          # stalls indefinitely at `cargo build` here; macos-14 + the
-          # x86_64-apple-darwin rustup target builds it in minutes. The
-          # macOS SDK ships both arch slices, so cc/openssl-src/bundled
-          # SQLite cross-compile with no extra linker config.
-          - target: x86_64-apple-darwin
-            runner: macos-14
-            archive: tar.gz
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2022
-            archive: zip
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation toolchain (Linux aarch64 only)
-        if: matrix.cross == true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<EOF
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-          # openssl-src (vendored) and cc-rs need to know which compiler/archiver
-          # to use for the target arch. Without this, openssl-src builds host-arch
-          # binaries that link-error against the aarch64 linker output. The
-          # `_aarch64_unknown_linux_gnu` suffix matches cargo's TARGET triple
-          # underscore form (per cc-rs env var convention).
-          {
-            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
-            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
-            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
-          } >> "$GITHUB_ENV"
-
-      - name: Build server binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p bsmcp-server
-
-      - name: Package archive (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        run: |
-          STAGE=bsmcp-server-${{ needs.github-release-on-merge.outputs.tag }}-${{ matrix.target }}
-          mkdir "$STAGE"
-          cp target/${{ matrix.target }}/release/bsmcp-server "$STAGE/"
-          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
-          tar czf "$STAGE.tar.gz" "$STAGE"
-          echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package archive (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $stage = "bsmcp-server-${{ needs.github-release-on-merge.outputs.tag }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/bsmcp-server.exe" "$stage/"
-          if (Test-Path README.md) { Copy-Item README.md "$stage/" }
-          if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
-          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
-          "ARCHIVE=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Attach archive to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.github-release-on-merge.outputs.tag }}
-          files: ${{ env.ARCHIVE }}
-
-  # Emergency hotfix path: a `v*` tag was pushed directly. Build the
-  # semver-tagged images and create the GitHub Release. Pinned to
-  # ubuntu-latest; no self-hosted dependency.
+  # A `v*` tag was pushed. Build the semver-tagged images and create the
+  # GitHub Release. Pinned to ubuntu-latest; no self-hosted dependency.
   tag-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

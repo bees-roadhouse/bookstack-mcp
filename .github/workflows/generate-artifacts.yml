@@ -1,24 +1,22 @@
 name: Generate Repo Artifacts
 
 # Regenerates SBOM.md and STRUCTURE.md and commits any diff back to the PR
-# source branch. Fires on the same trigger family as the image build:
-# `pull_request: opened/synchronize/reopened` against development or release.
-# That way the regenerated artifacts are part of the PR being reviewed/merged
-# — not retroactively dropped onto development after the fact.
+# source branch. Fires on `pull_request: opened/synchronize/reopened`
+# against main. That way the regenerated artifacts are part of the PR being
+# reviewed/merged — not retroactively dropped onto main after the fact.
 #
 # The re-fire loop is broken by `paths-ignore: [SBOM.md, STRUCTURE.md]` on
 # the `pull_request` trigger below — the auto-commit only touches those two
 # files, so the trigger doesn't fire again. No `[skip ci]` keyword in the
-# commit message: it inherits through squash-merge bodies into the release-
-# branch push event and can suppress `release.yml`'s github-release-on-merge
-# job (issue #73).
+# commit message: it inherits through squash-merge bodies into the push
+# event on main and can suppress the image build (issue #73).
 #
 # For external fork PRs, GITHUB_TOKEN cannot push back to the fork; the
 # job is skipped in that case (the contributor regenerates locally).
 
 on:
   pull_request:
-    branches: [development, release]
+    branches: [main]
     types: [opened, synchronize, reopened]
     paths-ignore:
       - 'SBOM.md'
