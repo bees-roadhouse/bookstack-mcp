@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use zeroize::Zeroize;
 
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::bookstack::{BookStackClient, CredentialCheck};
 use bsmcp_common::db::DbBackend;
 use bsmcp_common::time::TimezoneConfig;
 
@@ -28,6 +28,9 @@ const MAX_SESSIONS_PER_TOKEN: usize = 5;
 const MAX_TOTAL_SESSIONS: usize = 1000;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const MAX_REQUESTS_PER_MINUTE: u32 = 100;
+/// `Retry-After` on a 503 when an upstream is unreachable. Long enough to
+/// cover a container restart, short enough that clients don't stall.
+pub(crate) const RETRY_AFTER_SECS: &str = "5";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -233,6 +236,17 @@ fn unauthorized(hint: &str, headers: &HeaderMap, known_urls: &[String]) -> Respo
     resp
 }
 
+/// BookStack couldn't answer. Deliberately *not* a 401: no
+/// `WWW-Authenticate`, so clients hold onto their token and retry instead of
+/// tearing down and re-running OAuth (#139).
+fn upstream_unavailable(hint: &str) -> Response {
+    let body = serde_json::json!({"error": "upstream_unavailable", "hint": hint});
+    let mut resp = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, RETRY_AFTER_SECS.parse().unwrap());
+    resp
+}
+
 pub async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,
@@ -264,7 +278,14 @@ pub async fn resolve_credentials(
         }
         Ok(None) => {}
         Err(e) => {
+            // Same trap as #139, one layer down: a DB blip says nothing
+            // about the token. Falling through to the 401 below would tell
+            // every connected client at once that its token is invalid and
+            // stampede them all into re-auth.
             tracing::error!(error = %e, "auth_token_lookup_error");
+            return Err(upstream_unavailable(
+                "Token store is unavailable — retry shortly",
+            ));
         }
     }
 
@@ -291,13 +312,20 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
         state.http_client.clone(),
     );
 
-    if let Err(e) = client.validate().await {
-        tracing::warn!(error = %e, "credential_validation_failed");
-        return unauthorized(
-            "BookStack credentials are invalid or expired — please re-authenticate",
-            &headers,
-            &state.known_urls,
-        );
+    match client.validate().await {
+        CredentialCheck::Valid => {}
+        CredentialCheck::Rejected(e) => {
+            tracing::warn!(error = %e, "credential_validation_rejected");
+            return unauthorized(
+                "BookStack credentials are invalid or expired — please re-authenticate",
+                &headers,
+                &state.known_urls,
+            );
+        }
+        CredentialCheck::Unavailable(e) => {
+            tracing::warn!(error = %e, "credential_validation_unavailable");
+            return upstream_unavailable("BookStack is unreachable — retry shortly");
+        }
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -518,13 +546,20 @@ pub async fn handle_streamable(
     let method = request["method"].as_str().unwrap_or("");
 
     if method == "initialize" {
-        if let Err(e) = client.validate().await {
-            tracing::warn!(error = %e, "streamable_credential_validation_failed");
-            return unauthorized(
-                "BookStack credentials are invalid or expired — please re-authenticate",
-                &headers,
-                &state.known_urls,
-            );
+        match client.validate().await {
+            CredentialCheck::Valid => {}
+            CredentialCheck::Rejected(e) => {
+                tracing::warn!(error = %e, "streamable_credential_validation_rejected");
+                return unauthorized(
+                    "BookStack credentials are invalid or expired — please re-authenticate",
+                    &headers,
+                    &state.known_urls,
+                );
+            }
+            CredentialCheck::Unavailable(e) => {
+                tracing::warn!(error = %e, "streamable_credential_validation_unavailable");
+                return upstream_unavailable("BookStack is unreachable — retry shortly");
+            }
         }
     }
 

@@ -217,6 +217,38 @@ pub struct UserIdentity {
     pub name: String,
 }
 
+/// Outcome of `BookStackClient::validate()`. See that method for why the
+/// two failure arms must stay distinct.
+#[derive(Clone, Debug)]
+pub enum CredentialCheck {
+    /// BookStack accepted the credentials.
+    Valid,
+    /// BookStack answered 401/403 — the credentials are genuinely bad.
+    /// Re-authenticating is the fix.
+    Rejected(String),
+    /// BookStack could not be reached or could not answer. Says nothing
+    /// about the credentials; the caller should retry, not re-authenticate.
+    Unavailable(String),
+}
+
+impl CredentialCheck {
+    /// Classify a non-success status from BookStack.
+    ///
+    /// Only 401/403 — BookStack answering "no" — is a credential problem.
+    /// Everything else means we didn't get a usable answer: 5xx from a
+    /// restarting instance or the proxy in front of it, 429, or a 404 from a
+    /// misconfigured `BSMCP_BOOKSTACK_URL`. Re-authenticating fixes none of
+    /// those, so they must not be reported as auth failures (#139).
+    pub fn from_error_status(status: reqwest::StatusCode) -> Self {
+        match status {
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                CredentialCheck::Rejected(format!("BookStack rejected the credentials: {status}"))
+            }
+            _ => CredentialCheck::Unavailable(format!("BookStack API error: {status}")),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BookStackClient {
     client: Client,
@@ -487,8 +519,59 @@ impl BookStackClient {
 
     // --- Validation ---
 
-    pub async fn validate(&self) -> Result<Value, String> {
-        self.get("books", &[("count", "1")]).await
+    /// Check the configured credentials against BookStack.
+    ///
+    /// The Rejected/Unavailable split is load-bearing, not cosmetic. Only
+    /// `Rejected` means BookStack answered and said no — the sole case where
+    /// a client should be told to re-authenticate. `Unavailable` means we
+    /// never got an answer: BookStack restarting, a proxy 5xx, a timeout, a
+    /// misconfigured base URL. Collapsing the two into one error (as this
+    /// did before #139) makes every BookStack blip look like an expired
+    /// token, and the callers that acted on it issued 401 +
+    /// `WWW-Authenticate` or deleted a still-valid refresh token.
+    pub async fn validate(&self) -> CredentialCheck {
+        let builder = self
+            .client
+            .get(format!("{}/api/books", self.base_url))
+            .header("Authorization", self.auth_header())
+            .query(&[("count", "1")]);
+
+        let resp = match self.send_with_retry(builder).await {
+            Ok(resp) => resp,
+            // Transport failure, or 429 with the retry budget spent. Never a
+            // statement about the credentials.
+            Err(e) => return CredentialCheck::Unavailable(e),
+        };
+
+        if resp.status().is_success() {
+            // A 2xx alone isn't proof we reached BookStack. An auth portal or
+            // misconfigured proxy in front of it happily answers 200 with an
+            // HTML login page; treating that as Valid would admit a session
+            // whose every tool call then fails. Requiring parseable JSON
+            // keeps the old `get()` strictness — but classifies the failure
+            // as Unavailable, since an interceptor says nothing about
+            // whether the credentials are good.
+            return match Self::read_json(resp).await {
+                Ok(_) => CredentialCheck::Valid,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bookstack_non_json_success_response");
+                    CredentialCheck::Unavailable(
+                        "BookStack returned a non-JSON response — check for a proxy or auth portal in front of the API".to_string(),
+                    )
+                }
+            };
+        }
+
+        let status = resp.status();
+        let body = Self::read_error_body(resp).await;
+        let check = CredentialCheck::from_error_status(status);
+        match check {
+            CredentialCheck::Rejected(_) => {
+                tracing::warn!(%status, body = %body, "bookstack_credentials_rejected")
+            }
+            _ => tracing::warn!(%status, body = %body, "bookstack_unavailable"),
+        }
+        check
     }
 
     /// Heuristic admin check: BookStack returns 403 from `/api/users` for
@@ -1228,6 +1311,7 @@ fn flatten_book_pages(book: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
     use serde_json::json;
 
     fn fixture_book() -> Value {
@@ -1293,5 +1377,43 @@ mod tests {
             ]
         });
         assert!(flatten_book_pages(&book).is_empty());
+    }
+
+    // #139: only BookStack answering 401/403 may be reported as a credential
+    // problem. Anything else must stay Unavailable — callers turn Rejected
+    // into a 401 + WWW-Authenticate and delete refresh tokens on it.
+    #[test]
+    fn only_401_and_403_are_credential_rejections() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert!(
+                matches!(
+                    CredentialCheck::from_error_status(status),
+                    CredentialCheck::Rejected(_)
+                ),
+                "{status} should be Rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_failures_are_not_credential_rejections() {
+        let transient = [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            // A misconfigured BSMCP_BOOKSTACK_URL, not a bad token.
+            StatusCode::NOT_FOUND,
+        ];
+        for status in transient {
+            assert!(
+                matches!(
+                    CredentialCheck::from_error_status(status),
+                    CredentialCheck::Unavailable(_)
+                ),
+                "{status} must not be reported as a credential failure"
+            );
+        }
     }
 }
