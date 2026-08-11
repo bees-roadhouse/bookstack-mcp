@@ -544,7 +544,22 @@ impl BookStackClient {
         };
 
         if resp.status().is_success() {
-            return CredentialCheck::Valid;
+            // A 2xx alone isn't proof we reached BookStack. An auth portal or
+            // misconfigured proxy in front of it happily answers 200 with an
+            // HTML login page; treating that as Valid would admit a session
+            // whose every tool call then fails. Requiring parseable JSON
+            // keeps the old `get()` strictness — but classifies the failure
+            // as Unavailable, since an interceptor says nothing about
+            // whether the credentials are good.
+            return match Self::read_json(resp).await {
+                Ok(_) => CredentialCheck::Valid,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bookstack_non_json_success_response");
+                    CredentialCheck::Unavailable(
+                        "BookStack returned a non-JSON response — check for a proxy or auth portal in front of the API".to_string(),
+                    )
+                }
+            };
         }
 
         let status = resp.status();
