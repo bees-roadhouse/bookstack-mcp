@@ -428,8 +428,16 @@ pub async fn run_pipeline(
             all_page_ids.push(pid);
         }
 
-        let total_in_response = list.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
-        offset += 100;
+        // Advance by rows actually returned, not by the count we asked
+        // for — BookStack clamps `count` to API_MAX_ITEM_COUNT, and a
+        // fixed stride would skip rows on an instance capped below it.
+        // A response missing `total` falls through to the empty-page
+        // check at the top of the loop instead of truncating here.
+        offset += pages.len() as i64;
+        let total_in_response = list
+            .get("total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MAX);
         if offset >= total_in_response {
             break;
         }
