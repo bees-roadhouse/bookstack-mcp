@@ -70,6 +70,7 @@ jobs:
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -85,10 +86,22 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}
+          # `latest=auto` is metadata-action's default, stated explicitly so
+          # the contract is readable here: a `v*` semver tag gets `:latest`,
+          # a prerelease tag (v1.0.0-rc1) does not.
+          flavor: |
+            latest=auto
+          # The semver hierarchy plus the two tags this workflow's header and
+          # DEVELOPMENT.md have always promised but never actually pushed:
+          # `:release` and `:{version}-{sha}`. Their absence left `:release`
+          # stranded on 0.13.0 after the release-branch workflow that used to
+          # publish it was retired in the single-`main` migration.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=raw,value=${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short_sha }}
+            type=raw,value=release
 
       - name: Build and push tagged image
         uses: docker/build-push-action@v6
