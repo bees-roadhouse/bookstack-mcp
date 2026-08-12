@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -1994,7 +1995,77 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
     instructions
 }
 
+const DEFAULT_STRUCTURE_CACHE_TTL_SECS: u64 = 60;
+
+/// Rendered `build_structure` output, keyed by BookStack instance + API token
+/// and stamped with the time it was built.
+///
+/// Every MCP `initialize` runs `build_instructions` → `build_structure`, which
+/// costs one `list_shelves`, one `get_shelf` *per shelf*, and one
+/// `list_chapters`. On an instance with ~24 shelves that is ~26 BookStack API
+/// calls per client connect, and every reconnect re-runs the whole sweep.
+/// Measured on a live instance: 1326 `/api/shelves/{id}` calls in one hour,
+/// all from this server, which saturated BookStack's php-fpm pool
+/// (`pm.max_children = 5`) and starved its liveness probe into a restart loop.
+///
+/// The key MUST carry the token id. Shelf visibility is per-token, so a
+/// globally-keyed cache would serve one caller's structure to another —
+/// trading a load bug for a permissions bug.
+static STRUCTURE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+
+/// `BSMCP_STRUCTURE_CACHE_TTL_SECS`, default 60. Zero disables caching, so an
+/// operator who needs the structure blurb to reflect a write immediately has a
+/// lever without a redeploy.
+fn structure_cache_ttl() -> Duration {
+    let secs = env::var("BSMCP_STRUCTURE_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STRUCTURE_CACHE_TTL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Instance + token. See [`STRUCTURE_CACHE`] on why the token id is load-bearing.
+fn structure_cache_key(base_url: &str, token_id: &str) -> String {
+    format!("{base_url}|{token_id}")
+}
+
+fn cached_structure(key: &str, ttl: Duration) -> Option<String> {
+    if ttl.is_zero() {
+        return None;
+    }
+    let guard = STRUCTURE_CACHE.get_or_init(Default::default).lock().ok()?;
+    let (built_at, structure) = guard.get(key)?;
+    (built_at.elapsed() < ttl).then(|| structure.clone())
+}
+
+fn store_structure(key: &str, structure: &str, ttl: Duration) {
+    if ttl.is_zero() {
+        return;
+    }
+    let Ok(mut guard) = STRUCTURE_CACHE.get_or_init(Default::default).lock() else {
+        return;
+    };
+    // Evict expired entries on write so a rotating set of tokens can't grow
+    // the map without bound.
+    guard.retain(|_, (built_at, _)| built_at.elapsed() < ttl);
+    guard.insert(key.to_string(), (Instant::now(), structure.to_string()));
+}
+
 async fn build_structure(client: &BookStackClient) -> Option<String> {
+    let ttl = structure_cache_ttl();
+    let key = structure_cache_key(client.base_url(), client.token_id());
+
+    if let Some(hit) = cached_structure(&key, ttl) {
+        tracing::debug!("structure_cache_hit");
+        return Some(hit);
+    }
+
+    let structure = build_structure_uncached(client).await?;
+    store_structure(&key, &structure, ttl);
+    Some(structure)
+}
+
+async fn build_structure_uncached(client: &BookStackClient) -> Option<String> {
     let shelves = client.list_shelves(500, 0).await.ok()?;
     let shelf_list = shelves["data"].as_array()?;
 
@@ -2612,6 +2683,66 @@ fn update_schema(id_name: &str, fields: &[&str]) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // --- Structure cache (initialize fan-out, issue #143) ---
+    //
+    // STRUCTURE_CACHE is process-global and these tests run in parallel, so
+    // each one uses a distinct key.
+
+    #[test]
+    fn structure_cache_key_separates_tokens_on_one_instance() {
+        // The permissions-critical property: shelf visibility is per-token, so
+        // two tokens against the same BookStack must never collide on a key.
+        let a = structure_cache_key("https://kb.example.com", "token-aaa");
+        let b = structure_cache_key("https://kb.example.com", "token-bbb");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn structure_cache_key_separates_instances_on_one_token() {
+        let a = structure_cache_key("https://kb-one.example.com", "token-aaa");
+        let b = structure_cache_key("https://kb-two.example.com", "token-aaa");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn structure_cache_returns_stored_value_within_ttl() {
+        let ttl = Duration::from_secs(60);
+        let key = structure_cache_key("https://kb.example.com", "within-ttl");
+        store_structure(&key, "Shelf: Ops (ID: 1)\n", ttl);
+        assert_eq!(
+            cached_structure(&key, ttl).as_deref(),
+            Some("Shelf: Ops (ID: 1)\n")
+        );
+    }
+
+    #[test]
+    fn structure_cache_misses_once_the_entry_is_older_than_the_ttl() {
+        // Stored under a long TTL, read back under a tiny one: freshness is
+        // judged at read time, so this exercises expiry without a sleep.
+        let key = structure_cache_key("https://kb.example.com", "expired");
+        store_structure(&key, "Shelf: Ops (ID: 1)\n", Duration::from_secs(60));
+        assert_eq!(cached_structure(&key, Duration::from_nanos(1)), None);
+    }
+
+    #[test]
+    fn structure_cache_never_serves_one_tokens_structure_to_another() {
+        let ttl = Duration::from_secs(60);
+        let mine = structure_cache_key("https://kb.example.com", "leak-mine");
+        let theirs = structure_cache_key("https://kb.example.com", "leak-theirs");
+        store_structure(&mine, "Shelf: Private (ID: 9)\n", ttl);
+        assert_eq!(cached_structure(&theirs, ttl), None);
+    }
+
+    #[test]
+    fn zero_ttl_disables_the_cache_in_both_directions() {
+        let key = structure_cache_key("https://kb.example.com", "disabled");
+        store_structure(&key, "Shelf: Ops (ID: 1)\n", Duration::ZERO);
+        // Nothing stored, and even a populated entry is not served at TTL 0.
+        assert_eq!(cached_structure(&key, Duration::ZERO), None);
+        store_structure(&key, "Shelf: Ops (ID: 1)\n", Duration::from_secs(60));
+        assert_eq!(cached_structure(&key, Duration::ZERO), None);
+    }
 
     /// v0.10.0 surface lock + issue #69: 59 BookStack CRUD plus 1 directory
     /// tool plus 3 semantic tools equals 63. Anything extra means a
