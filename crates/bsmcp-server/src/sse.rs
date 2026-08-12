@@ -24,13 +24,50 @@ use crate::mcp;
 use crate::oauth::{AuthCode, AUTH_CODE_TTL};
 use crate::semantic::SemanticState;
 
-const MAX_SESSIONS_PER_TOKEN: usize = 5;
+/// Default per-token cap on concurrent legacy SSE sessions. Overridable at
+/// startup via `BSMCP_MAX_SESSIONS_PER_TOKEN` (issue #138) — a workstation
+/// running two MCP clients against one BookStack API token outgrows 5.
+const DEFAULT_MAX_SESSIONS_PER_TOKEN: usize = 5;
 const MAX_TOTAL_SESSIONS: usize = 1000;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const MAX_REQUESTS_PER_MINUTE: u32 = 100;
 /// `Retry-After` on a 503 when an upstream is unreachable. Long enough to
 /// cover a container restart, short enough that clients don't stall.
 pub(crate) const RETRY_AFTER_SECS: &str = "5";
+
+/// Resolve the per-token legacy-SSE session cap from
+/// `BSMCP_MAX_SESSIONS_PER_TOKEN`, falling back to
+/// [`DEFAULT_MAX_SESSIONS_PER_TOKEN`] when the value is absent, unparseable,
+/// or zero. A typo in the env should not lock every client out of the server.
+pub fn max_sessions_per_token_from_env() -> usize {
+    parse_max_sessions_per_token(
+        std::env::var("BSMCP_MAX_SESSIONS_PER_TOKEN")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Split out from the env read so the fallback rules stay unit-testable
+/// without mutating process-global state mid-test-run.
+fn parse_max_sessions_per_token(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_SESSIONS_PER_TOKEN)
+}
+
+/// Streamable HTTP (MCP 2025-03-26) clients open the server→client
+/// notification stream with a GET on the *same* endpoint they POST to,
+/// carrying the `Mcp-Session-Id` they were issued on `initialize`. A legacy
+/// SSE client (MCP 2024-11-05) never sends that header — it learns its
+/// session id from the `endpoint` event the handshake pushes back. The
+/// header is therefore a reliable discriminator between the two transports
+/// sharing the `/mcp/sse` route.
+fn is_streamable_notification_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| !s.trim().is_empty())
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,6 +81,10 @@ pub struct AppState {
     pub register_rate_limit: Arc<Mutex<RateLimit>>,
     streamable_rate_limits: Arc<RwLock<HashMap<String, Arc<Mutex<RateLimit>>>>>,
     streamable_sessions: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Per-token cap on concurrent *legacy* SSE sessions, resolved once at
+    /// startup from `BSMCP_MAX_SESSIONS_PER_TOKEN` (issue #138). Streamable
+    /// notification streams are deliberately not counted against it.
+    max_sessions_per_token: usize,
     backup_interval_hours: Option<u64>,
     backup_path: PathBuf,
     pub semantic: Option<Arc<SemanticState>>,
@@ -113,6 +154,7 @@ impl AppState {
         backup_path: PathBuf,
         semantic: Option<Arc<SemanticState>>,
         timezone: Arc<TimezoneConfig>,
+        max_sessions_per_token: usize,
     ) -> Self {
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -130,6 +172,7 @@ impl AppState {
             register_rate_limit: Arc::new(Mutex::new(RateLimit::new(10))),
             streamable_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             streamable_sessions: Arc::new(RwLock::new(HashMap::new())),
+            max_sessions_per_token,
             backup_interval_hours,
             backup_path,
             semantic,
@@ -299,11 +342,38 @@ pub async fn resolve_credentials(
 
 pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
     tracing::debug!(method = "GET", route = "/mcp/sse", "sse_connect_attempt");
-    let (token_id, token_secret) =
+    let (mut token_id, mut token_secret) =
         match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
             Ok(creds) => creds,
             Err(resp) => return resp,
         };
+
+    // Issue #138: a streamable-HTTP client's notification GET is not a legacy
+    // handshake. Allocating a `Session` for it burned a slot in the per-token
+    // cap, so two MCP clients sharing one BookStack token exhausted all five
+    // and every later GET got a 429 — cosmetic in the client log, but it also
+    // meant a wasted `validate()` round-trip against BookStack per reconnect.
+    //
+    // Serve an inert stream instead. The spec allows answering this GET with
+    // 405 too, and current rmcp maps that onto `ServerDoesNotSupportSse` and
+    // carries on, so 405 is a legitimate — arguably tidier — answer that would
+    // also avoid holding a connection per client. The inert stream is chosen
+    // defensively: `text/event-stream` is the branch every client handles,
+    // whereas correct 405 handling varies by client and version, and this
+    // server has nothing to push either way. See the follow-up issue on
+    // revisiting 405 and capping these streams.
+    //
+    // The incoming id is deliberately not checked against `streamable_sessions`:
+    // that map is empty after a restart while clients still hold ids, and
+    // rejecting them would trade the 429 for a 404. `resolve_credentials` above
+    // is the real gate; the header is only a transport discriminator.
+    if is_streamable_notification_stream(&headers) {
+        tracing::debug!("streamable_notification_stream_opened");
+        // No `Session` is constructed on this path, so its `Drop` never runs.
+        token_id.zeroize();
+        token_secret.zeroize();
+        return notification_stream_response();
+    }
 
     let client = BookStackClient::new(
         &state.bookstack_url,
@@ -343,7 +413,7 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
 
         let count = sessions.values().filter(|s| s.token_id == token_id).count();
-        if count >= MAX_SESSIONS_PER_TOKEN {
+        if count >= state.max_sessions_per_token {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({"error": "Too many sessions for this token"})),
@@ -371,6 +441,27 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
         .await;
 
     let stream = ReceiverStream::new(rx);
+    let mut resp = Sse::new(stream)
+        .keep_alive(KeepAlive::default().interval(Duration::from_secs(15)))
+        .into_response();
+
+    let hdrs = resp.headers_mut();
+    hdrs.insert(header::CACHE_CONTROL, "no-cache, no-store".parse().unwrap());
+    hdrs.insert("X-Accel-Buffering", "no".parse().unwrap());
+
+    resp
+}
+
+/// Inert `text/event-stream` for a streamable-HTTP client's notification
+/// channel. Allocates no [`Session`] and counts against no cap: the server has
+/// no server→client messages to push, so the stream carries only the keepalive
+/// comments `KeepAlive` injects. `futures::stream::pending()` never yields; the
+/// response body is dropped when hyper sees the peer close the connection
+/// (measured at ~60ms, on both graceful FIN and RST), so teardown does not wait
+/// on a keepalive write failing. The keepalive is the backstop for half-open
+/// peers behind a proxy, not the primary disconnect detector.
+fn notification_stream_response() -> Response {
+    let stream = futures::stream::pending::<Result<Event, Infallible>>();
     let mut resp = Sse::new(stream)
         .keep_alive(KeepAlive::default().interval(Duration::from_secs(15)))
         .into_response();
@@ -615,5 +706,68 @@ pub async fn handle_streamable(
             http_resp
         }
         None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_session(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("mcp-session-id", value.parse().unwrap());
+        h
+    }
+
+    // Issue #138: this predicate is what keeps a streamable client's
+    // notification GET from consuming a legacy per-token session slot.
+    #[test]
+    fn streamable_get_is_detected_by_session_header() {
+        let h = headers_with_session("8acb2c83-0d1e-4f4a-9d21-1b2c3d4e5f60");
+        assert!(is_streamable_notification_stream(&h));
+    }
+
+    #[test]
+    fn legacy_sse_handshake_sends_no_session_header() {
+        assert!(!is_streamable_notification_stream(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn blank_session_header_falls_through_to_legacy() {
+        // An empty or whitespace-only header is not a resumable streamable
+        // session, so it must take the legacy path rather than silently
+        // opening an inert stream a legacy client would wait on forever.
+        assert!(!is_streamable_notification_stream(&headers_with_session(
+            ""
+        )));
+        assert!(!is_streamable_notification_stream(&headers_with_session(
+            "   "
+        )));
+    }
+
+    #[test]
+    fn session_cap_defaults_when_unset() {
+        assert_eq!(
+            parse_max_sessions_per_token(None),
+            DEFAULT_MAX_SESSIONS_PER_TOKEN
+        );
+    }
+
+    #[test]
+    fn session_cap_reads_a_valid_override() {
+        assert_eq!(parse_max_sessions_per_token(Some("25")), 25);
+        assert_eq!(parse_max_sessions_per_token(Some("  12  ")), 12);
+    }
+
+    #[test]
+    fn session_cap_rejects_zero_and_garbage() {
+        // A bad value must not lock every client out of the server.
+        for raw in ["0", "-1", "many", ""] {
+            assert_eq!(
+                parse_max_sessions_per_token(Some(raw)),
+                DEFAULT_MAX_SESSIONS_PER_TOKEN,
+                "raw = {raw:?}"
+            );
+        }
     }
 }

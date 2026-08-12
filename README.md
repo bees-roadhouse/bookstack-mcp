@@ -143,6 +143,8 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
 | `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` | No | `180` | Per-process BookStack API request cap. Lower if multiple processes share a token and you see 429s. |
+| `BSMCP_MAX_SESSIONS_PER_TOKEN` | No | `5` | Concurrent legacy SSE sessions allowed per API token. Raise it when one token is shared by several MCP clients on a host. Zero or unparseable values fall back to the default. |
+| `BSMCP_STRUCTURE_CACHE_TTL_SECS` | No | `60` | How long the `initialize` structure blurb is cached, per instance + API token. Without it every client connect re-enumerates the whole shelf tree (~1 API call per shelf). `0` disables caching. Tool responses are never cached, and a sweep that hit upstream errors is never cached. The cache is per process, so at N replicas expect the hit rate to divide by N. |
 
 #### Embedder Variables
 

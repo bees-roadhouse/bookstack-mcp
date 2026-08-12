@@ -3722,16 +3722,25 @@ mod lifecycle_tests {
     use super::*;
     use bsmcp_common::db::{IndexDb, SemanticDb};
     use std::env;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Bumped per `temp_db()` call. pid + wall-clock alone is not unique
+    /// inside one test binary: these tests run in parallel, and two that call
+    /// `temp_db()` within the same clock tick got the same path and silently
+    /// shared a database, which made the job-lifecycle assertions flaky. The
+    /// timestamp still separates one `cargo test` run from the next.
+    static TEMP_DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db() -> SqliteDb {
         let dir = env::temp_dir();
         let unique = format!(
-            "bsmcp-test-{}-{}.db",
+            "bsmcp-test-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_DB_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let path = dir.join(unique);
         SqliteDb::open(&path, "test-encryption-key-thirty-two-chars-long")
