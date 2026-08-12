@@ -744,6 +744,37 @@ impl BookStackClient {
         .await
     }
 
+    /// Every book id the token can see, paginated. Mirrors
+    /// `list_all_shelves`. The index worker's full walk is shelf-rooted, so
+    /// this is how it reaches books that sit on no shelf at all (issue #147).
+    pub async fn list_all_books(&self) -> Result<Vec<i64>, String> {
+        const PAGE_SIZE: i64 = 500;
+        let mut ids = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = self.list_books(PAGE_SIZE, offset).await?;
+            let arr = page
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if arr.is_empty() {
+                break;
+            }
+            let page_len = arr.len() as i64;
+            for book in arr {
+                if let Some(id) = book.get("id").and_then(|v| v.as_i64()) {
+                    ids.push(id);
+                }
+            }
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+        Ok(ids)
+    }
+
     pub async fn get_book(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("books/{id}"), &[]).await
     }
