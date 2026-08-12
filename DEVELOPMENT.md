@@ -162,14 +162,13 @@ branch — and is kept because the compose files and Portainer stacks pin it:
 - `{version}-dev` — version-level rolling
 - `{version}-dev-{sha}` — version-level immutable
 
-Release stream (pushed by `release.yml`'s `tag-release` on a `v*` tag push):
-- `latest` — rolling, latest release
+Release stream (pushed by `release.yml`'s `tag-release` on a `v*` tag push).
+One trigger, one tag set — the whole list below lands on every `v*` tag:
+- `latest` — rolling, latest release. Skipped on a prerelease tag (`v1.0.0-rc1`) via `latest=auto`.
 - `release` — alias for `latest`
-- `{version}` — pinned semver (e.g., `0.11.0`)
-- `{version}-{sha}` — immutable per-release-merge
-
-Tag-push hotfix (`v*` tag → `release.yml` `tag-release`):
-- `{version}`, `{major}.{minor}`, `{major}` — full semver hierarchy
+- `{version}` — pinned semver (e.g., `0.13.1`)
+- `{major}.{minor}` and `{major}` — the rest of the semver hierarchy
+- `{version}-{sha}` — immutable per-release-commit
 
 Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`. For v0.13.0 only, `ghcr.io/bees-roadhouse/bsmcp-worker:<tag>` is published as a transitional registry alias of `ghcr.io/bees-roadhouse/bsmcp-embedder:<tag>` so existing compose files keep pulling — operators must still set `--role=worker` on the running container. The alias is removed in v0.14.0.
 
