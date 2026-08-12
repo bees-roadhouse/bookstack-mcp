@@ -10,6 +10,43 @@ use crate::rate_limit::{self, RateLimiter};
 /// Maximum size for file content fetched from URLs (50MB).
 const MAX_FILE_CONTENT_SIZE: usize = 50 * 1024 * 1024;
 
+/// Rows requested per page when sweeping a list endpoint to exhaustion.
+///
+/// Matches BookStack's default `API_MAX_ITEM_COUNT`. An instance
+/// configured lower simply returns short pages — `paginate_step` advances
+/// by what actually came back, so a mismatch costs extra round trips but
+/// never skips or truncates.
+const LIST_PAGE_SIZE: i64 = 500;
+
+/// One step of a paginated sweep: the entity ids on this page, and the
+/// offset the next request should start at (`None` once the sweep is done).
+///
+/// The offset advances by the number of rows the server **actually
+/// returned**, never by the count we asked for. BookStack clamps `count`
+/// to the instance's `API_MAX_ITEM_COUNT`, so an over-large request comes
+/// back short — advancing by the requested size would skip rows, and
+/// treating a short page as "last page" would silently truncate the sweep
+/// after a single request. Termination is an empty page, or `total` being
+/// reached; a response missing `total` falls through to the empty-page
+/// check rather than stopping early.
+fn paginate_step(page: &Value, offset: i64) -> (Vec<i64>, Option<i64>) {
+    let Some(arr) = page.get("data").and_then(|v| v.as_array()) else {
+        return (Vec::new(), None);
+    };
+    if arr.is_empty() {
+        return (Vec::new(), None);
+    }
+    let ids: Vec<i64> = arr
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|v| v.as_i64()))
+        .collect();
+    let next = offset + arr.len() as i64;
+    match page.get("total").and_then(|v| v.as_i64()) {
+        Some(total) if next >= total => (ids, None),
+        _ => (ids, Some(next)),
+    }
+}
+
 /// Check if an IP address is in a private, loopback, or link-local range.
 fn is_restricted_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -682,29 +719,16 @@ impl BookStackClient {
     /// branching). BookStack's `/api/shelves` caps at 500 per page; we page
     /// until `data` comes back empty.
     pub async fn list_all_shelves(&self) -> Result<Vec<i64>, String> {
-        const PAGE_SIZE: i64 = 500;
         let mut ids = Vec::new();
         let mut offset = 0i64;
         loop {
-            let page = self.list_shelves(PAGE_SIZE, offset).await?;
-            let arr = page
-                .get("data")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if arr.is_empty() {
-                break;
+            let page = self.list_shelves(LIST_PAGE_SIZE, offset).await?;
+            let (page_ids, next) = paginate_step(&page, offset);
+            ids.extend(page_ids);
+            match next {
+                Some(n) => offset = n,
+                None => break,
             }
-            let page_len = arr.len() as i64;
-            for shelf in arr {
-                if let Some(id) = shelf.get("id").and_then(|v| v.as_i64()) {
-                    ids.push(id);
-                }
-            }
-            if page_len < PAGE_SIZE {
-                break;
-            }
-            offset += PAGE_SIZE;
         }
         Ok(ids)
     }
@@ -742,6 +766,24 @@ impl BookStackClient {
             ],
         )
         .await
+    }
+
+    /// Every book id the token can see, paginated. Mirrors
+    /// `list_all_shelves`. The index worker's full walk is shelf-rooted, so
+    /// this is how it reaches books that sit on no shelf at all (issue #147).
+    pub async fn list_all_books(&self) -> Result<Vec<i64>, String> {
+        let mut ids = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = self.list_books(LIST_PAGE_SIZE, offset).await?;
+            let (page_ids, next) = paginate_step(&page, offset);
+            ids.extend(page_ids);
+            match next {
+                Some(n) => offset = n,
+                None => break,
+            }
+        }
+        Ok(ids)
     }
 
     pub async fn get_book(&self, id: i64) -> Result<Value, String> {
@@ -1313,6 +1355,94 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
     use serde_json::json;
+
+    /// Simulate a BookStack list endpoint: `server_cap` is the instance's
+    /// `API_MAX_ITEM_COUNT`, which clamps whatever `count` we asked for.
+    fn fake_list_page(total: usize, offset: i64, requested: i64, server_cap: i64) -> Value {
+        let granted = requested.min(server_cap).max(0) as usize;
+        let start = (offset.max(0) as usize).min(total);
+        let end = (start + granted).min(total);
+        let rows: Vec<Value> = (start..end)
+            .map(|i| json!({ "id": i as i64 + 1 }))
+            .collect();
+        json!({ "data": rows, "total": total as i64 })
+    }
+
+    /// Drive `paginate_step` the way `list_all_books` does.
+    fn sweep(total: usize, requested: i64, server_cap: i64) -> (Vec<i64>, usize) {
+        let mut ids = Vec::new();
+        let mut offset = 0i64;
+        let mut requests = 0usize;
+        loop {
+            let page = fake_list_page(total, offset, requested, server_cap);
+            requests += 1;
+            assert!(requests < 1000, "sweep failed to terminate");
+            let (page_ids, next) = paginate_step(&page, offset);
+            ids.extend(page_ids);
+            match next {
+                Some(n) => offset = n,
+                None => break,
+            }
+        }
+        (ids, requests)
+    }
+
+    /// The regression that motivated `paginate_step`: asking for more than
+    /// the instance's `API_MAX_ITEM_COUNT` used to break the sweep after
+    /// one page, because a clamped response looks like a short final page.
+    /// Every id must still be collected.
+    #[test]
+    fn sweep_survives_a_server_side_count_clamp() {
+        let (ids, requests) = sweep(1200, 1000, 500);
+        assert_eq!(ids.len(), 1200, "clamped sweep must not truncate");
+        assert_eq!(ids.first(), Some(&1));
+        assert_eq!(ids.last(), Some(&1200));
+        // 500 + 500 + 200 — the short final page ends it, no wasted request.
+        assert_eq!(requests, 3);
+    }
+
+    #[test]
+    fn sweep_collects_everything_when_request_matches_cap() {
+        let (ids, requests) = sweep(1200, 500, 500);
+        assert_eq!(ids.len(), 1200);
+        assert_eq!(requests, 3);
+    }
+
+    /// An exact multiple of the page size must not spin forever or drop
+    /// the tail — `total` ends it without a trailing empty request.
+    #[test]
+    fn sweep_handles_exact_multiple_of_page_size() {
+        let (ids, requests) = sweep(1000, 500, 500);
+        assert_eq!(ids.len(), 1000);
+        assert_eq!(requests, 2);
+    }
+
+    #[test]
+    fn sweep_handles_empty_and_single_page_instances() {
+        assert_eq!(sweep(0, 500, 500).0.len(), 0);
+        assert_eq!(sweep(1, 500, 500).0.len(), 1);
+        assert_eq!(sweep(499, 500, 500).0.len(), 499);
+    }
+
+    /// A response with no `total` must fall through to the empty-page
+    /// check rather than stopping after the first page.
+    #[test]
+    fn paginate_step_without_total_keeps_going() {
+        let page = json!({ "data": [{ "id": 7 }, { "id": 8 }] });
+        assert_eq!(paginate_step(&page, 0), (vec![7, 8], Some(2)));
+
+        let empty = json!({ "data": [] });
+        assert_eq!(paginate_step(&empty, 2), (Vec::new(), None));
+    }
+
+    #[test]
+    fn paginate_step_tolerates_a_malformed_page() {
+        assert_eq!(paginate_step(&json!({}), 0), (Vec::new(), None));
+        // Rows without a usable id are skipped, but still advance the
+        // offset — otherwise the sweep would re-request them forever.
+        let page = json!({ "data": [{ "id": 3 }, { "name": "no id" }], "total": 9 });
+        assert_eq!(paginate_step(&page, 0), (vec![3], Some(2)));
+    }
 
     fn fixture_book() -> Value {
         // Mimics the shape of `GET /api/books/{id}` — top-level pages

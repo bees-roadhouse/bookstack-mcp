@@ -428,8 +428,16 @@ pub async fn run_pipeline(
             all_page_ids.push(pid);
         }
 
-        let total_in_response = list.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
-        offset += 100;
+        // Advance by rows actually returned, not by the count we asked
+        // for — BookStack clamps `count` to API_MAX_ITEM_COUNT, and a
+        // fixed stride would skip rows on an instance capped below it.
+        // A response missing `total` falls through to the empty-page
+        // check at the top of the loop instead of truncating here.
+        offset += pages.len() as i64;
+        let total_in_response = list
+            .get("total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MAX);
         if offset >= total_in_response {
             break;
         }
@@ -474,9 +482,23 @@ pub async fn run_pipeline(
         )
         .await
         {
-            Ok(()) => {
+            Ok(outcome) => {
                 succeeded += 1;
                 consecutive_failures = 0;
+                // One line per page at INFO — this is the progress readout
+                // for a running job. `page`/`total_pages` make it obvious
+                // how far along a multi-thousand-page walk is without
+                // polling /status.
+                tracing::info!(
+                    job_id,
+                    page = i + 1,
+                    total_pages,
+                    page_id = *page_id,
+                    name = %outcome.name,
+                    chunks = outcome.chunks,
+                    skipped = outcome.skipped,
+                    "pipeline_page_embedded"
+                );
             }
             Err(e) => {
                 tracing::error!(page_id = *page_id, error = %e, "pipeline_page_embed_failed");
@@ -527,6 +549,16 @@ pub async fn run_pipeline(
 
 /// Embed a single page: fetch, check hash, chunk, embed, store relationships.
 /// When `force` is true, skip the content hash check and always re-embed.
+/// What one page's embed pass actually did, so the caller can log
+/// per-page progress at INFO without re-fetching the page.
+struct PageOutcome {
+    name: String,
+    chunks: usize,
+    /// Content hash matched and the page was left alone. Only reachable
+    /// when `force` is false.
+    skipped: bool,
+}
+
 async fn embed_single_page(
     db: &Arc<dyn SemanticDb>,
     embedder: &Arc<dyn Embedder>,
@@ -535,7 +567,7 @@ async fn embed_single_page(
     force: bool,
     shelf_lookup: &HashMap<i64, String>,
     role_ctx: Option<&RoleContext>,
-) -> Result<(), String> {
+) -> Result<PageOutcome, String> {
     let page = client.get_page(page_id).await?;
 
     let html = page.get("html").and_then(|v| v.as_str()).unwrap_or("");
@@ -570,7 +602,11 @@ async fn embed_single_page(
     if !force {
         if let Ok(Some(existing_hash)) = db.get_page_content_hash(page_id).await {
             if existing_hash == content_hash {
-                return Ok(());
+                return Ok(PageOutcome {
+                    name: name.to_string(),
+                    chunks: 0,
+                    skipped: true,
+                });
             }
         }
     }
@@ -605,7 +641,11 @@ async fn embed_single_page(
             );
         }
         db.upsert_page(&meta).await?;
-        return Ok(());
+        return Ok(PageOutcome {
+            name: name.to_string(),
+            chunks: 0,
+            skipped: false,
+        });
     }
     tracing::debug!(
         page_id,
@@ -679,6 +719,7 @@ async fn embed_single_page(
         }
     }
     db.replace_relationships(page_id, &targets).await?;
+    let chunk_count = chunk_inserts.len();
 
     // Store final page metadata with real content_hash — this is the commit marker.
     db.upsert_page(&meta).await?;
@@ -700,5 +741,9 @@ async fn embed_single_page(
         }
     }
 
-    Ok(())
+    Ok(PageOutcome {
+        name: name.to_string(),
+        chunks: chunk_count,
+        skipped: false,
+    })
 }

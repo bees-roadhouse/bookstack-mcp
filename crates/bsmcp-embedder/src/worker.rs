@@ -31,6 +31,7 @@
 //! worker walks. Per-user content access for live MCP requests still uses
 //! the user's own token; the worker is structural reconciliation only.
 
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -369,11 +370,13 @@ impl IndexWorker {
             }
         };
         if shelves.is_empty() {
+            // Not fatal — the orphan sweep below still reaches every visible
+            // book. A token that sees books but no shelves is unusual enough
+            // to warn about, though.
             tracing::warn!("indexworker_full_walk_no_shelves_visible");
-            self.stamp_full_walk_done().await?;
-            return Ok(());
         }
         let mut total_pages = 0usize;
+        let mut walked_books: HashSet<i64> = HashSet::new();
         for shelf_id in shelves {
             // Per-shelf/book/chapter/page status check. This (and every
             // other should_stop_index_job call in walk_*) is a `WHERE id = ?`
@@ -384,14 +387,60 @@ impl IndexWorker {
                 tracing::info!(job_id, walk = "all", "indexworker_walk_stopped");
                 return Ok(());
             }
-            match self.walk_shelf(shelf_id, job_id).await {
+            match self.walk_shelf(shelf_id, job_id, &mut walked_books).await {
                 Ok(n) => total_pages += n,
                 Err(e) => tracing::error!(shelf_id, error = %e, "indexworker_walk_shelf_failed"),
             }
         }
+        total_pages += self.walk_orphan_books(job_id, &walked_books).await;
         self.stamp_full_walk_done().await?;
         tracing::info!(total_pages, "indexworker_full_walk_complete");
         Ok(())
+    }
+
+    /// Second pass of the full walk — books that sit on no shelf.
+    ///
+    /// BookStack doesn't require a book to be shelved, and `walk_all` above
+    /// only reaches books through a shelf's `books` array. Without this pass
+    /// an unshelved book never enters `bookstack_books`, so every page under
+    /// it trips the missing-parent check in `reconcile_page` on every single
+    /// delta walk, forever (issue #147).
+    ///
+    /// Indexed with `shelf_id: None`, matching what `reconcile_book` writes
+    /// when its shelf probe finds no owner. Failures are logged per-book and
+    /// don't abort the walk — same contract as `walk_shelf`.
+    async fn walk_orphan_books(&self, job_id: i64, walked: &HashSet<i64>) -> usize {
+        let all_books = match self.bs_client.list_all_books().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "indexworker_full_walk_list_books_failed");
+                return 0;
+            }
+        };
+        let orphans = orphan_book_ids(&all_books, walked);
+        if orphans.is_empty() {
+            return 0;
+        }
+        tracing::info!(
+            orphan_count = orphans.len(),
+            total_books = all_books.len(),
+            "indexworker_full_walk_orphan_books"
+        );
+        let mut count = 0usize;
+        for book_id in orphans {
+            if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
+                tracing::info!(job_id, walk = "orphan_books", "indexworker_walk_stopped");
+                return count;
+            }
+            match self
+                .walk_book(book_id, None, classify_shelf(0), job_id)
+                .await
+            {
+                Ok(n) => count += n,
+                Err(e) => tracing::error!(book_id, error = %e, "indexworker_walk_book_failed"),
+            }
+        }
+        count
     }
 
     async fn stamp_full_walk_done(&self) -> Result<(), String> {
@@ -431,6 +480,7 @@ impl IndexWorker {
 
         let mut newest_seen = last_walk.clone();
         let mut reconciled = 0usize;
+        let mut deferred = 0usize;
         for page in pages {
             let Some(page_id) = page.get("id").and_then(|v| v.as_i64()) else {
                 continue;
@@ -440,16 +490,21 @@ impl IndexWorker {
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            if let Err(e) = self.reconcile_page(page_id).await {
-                tracing::error!(
-                    walk = "delta",
-                    page_id,
-                    error = %e,
-                    "indexworker_reconcile_page_failed"
-                );
-                continue;
+            match self.reconcile_page(page_id).await {
+                Ok(()) => reconciled += 1,
+                Err(e) => {
+                    if defer_delta_page(&self.index_db, page_id, &e).await.is_err() {
+                        // The job queue is the only path back to this page,
+                        // and the checkpoint below would otherwise advance
+                        // past it. Stop the window here instead: `pages` is
+                        // sorted +updated_at, so leaving the checkpoint at
+                        // the last handed-off page re-lists this one and
+                        // everything after it on the next run.
+                        break;
+                    }
+                    deferred += 1;
+                }
             }
-            reconciled += 1;
             if let Some(ts) = updated_at {
                 if ts > newest_seen {
                     newest_seen = ts;
@@ -471,13 +526,22 @@ impl IndexWorker {
             .await?;
         tracing::info!(
             reconciled,
+            deferred,
             advanced_to = %advance_to,
             "indexworker_walk_delta_complete"
         );
         Ok(())
     }
 
-    async fn walk_shelf(&self, shelf_id: i64, job_id: i64) -> Result<usize, String> {
+    /// Walks one shelf. Every book id reached is recorded in `walked_books`
+    /// — books live on zero, one, or many shelves, and the orphan sweep in
+    /// `walk_orphan_books` needs to know which ones this pass covered.
+    async fn walk_shelf(
+        &self,
+        shelf_id: i64,
+        job_id: i64,
+        walked_books: &mut HashSet<i64>,
+    ) -> Result<usize, String> {
         let shelf = self.bs_client.get_shelf(shelf_id).await?;
         let name = string_field(&shelf, "name");
         let slug = string_field(&shelf, "slug");
@@ -509,6 +573,10 @@ impl IndexWorker {
                 tracing::info!(job_id, walk = "shelf", "indexworker_walk_stopped");
                 return Ok(count);
             }
+            // Recorded before the walk, not after: this tracks coverage, not
+            // success. A book whose walk failed here shouldn't be retried by
+            // the orphan sweep — it isn't an orphan.
+            walked_books.insert(book_id);
             match self
                 .walk_book(book_id, Some(shelf_id), shelf_kind, job_id)
                 .await
@@ -1199,6 +1267,72 @@ async fn cascade_missing_parent(
     ))
 }
 
+/// Hand a failed delta-walk page to the job queue.
+///
+/// `walk_delta` reconciles pages inline rather than as `page:{id}` jobs, so
+/// a failure there has no job row for the #54 retry-chain reconciler to pick
+/// up — and the delta checkpoint advances past it, dropping the page from
+/// every future window. Enqueueing a real job gives the failure an owner
+/// with bounded retries (issue #147).
+///
+/// Emits the `indexworker_reconcile_page_failed` line the inline path used
+/// to emit, now carrying the `job_id` that owns the retry. Repeat deferrals
+/// of the same page coalesce onto one job via `create_index_job`'s dedup.
+async fn defer_delta_page(
+    index_db: &Arc<dyn IndexDb>,
+    page_id: i64,
+    reconcile_error: &str,
+) -> Result<i64, String> {
+    match index_db
+        .create_index_job(&format!("page:{page_id}"), "both", "delta_retry")
+        .await
+    {
+        Ok((job_id, is_new)) => {
+            if is_new {
+                tracing::error!(
+                    walk = "delta",
+                    page_id,
+                    job_id,
+                    error = %reconcile_error,
+                    "indexworker_reconcile_page_failed"
+                );
+            } else {
+                tracing::debug!(
+                    walk = "delta",
+                    page_id,
+                    job_id,
+                    error = %reconcile_error,
+                    "indexworker_delta_page_retry_coalesced"
+                );
+            }
+            Ok(job_id)
+        }
+        Err(e) => {
+            tracing::error!(
+                walk = "delta",
+                page_id,
+                error = %reconcile_error,
+                enqueue_error = %e,
+                "indexworker_delta_page_retry_enqueue_failed"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Visible book ids that the shelf pass didn't reach, in listing order.
+///
+/// Also collapses duplicates: `list_all_books` pages by offset, so a book
+/// created mid-pagination can surface twice, and walking it twice is pure
+/// waste.
+fn orphan_book_ids(all: &[i64], walked: &HashSet<i64>) -> Vec<i64> {
+    let mut seen = HashSet::new();
+    all.iter()
+        .copied()
+        .filter(|id| !walked.contains(id) && seen.insert(*id))
+        .collect()
+}
+
 fn current_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1557,6 +1691,96 @@ mod reconcile_tests {
             book_jobs.len(),
             1,
             "failed-open parent job must absorb subsequent cascades, got {book_jobs:?}"
+        );
+    }
+
+    /// Issue #147 — a page that fails inside the delta walk must end up
+    /// owned by a real `page:{id}` job. `walk_delta` reconciles inline, so
+    /// without the hand-off the #54 reconciler never sees the failure and
+    /// the delta checkpoint advances past the page for good.
+    #[tokio::test]
+    async fn delta_page_failure_becomes_a_retryable_job() {
+        let db = temp_db();
+        let job_id = defer_delta_page(&db, 3172, "page 3172 parent book 72 not in index")
+            .await
+            .expect("enqueue succeeds");
+
+        let pending = db.list_pending_index_jobs(50).await.unwrap();
+        let page_jobs: Vec<_> = pending.iter().filter(|j| j.scope == "page:3172").collect();
+        assert_eq!(page_jobs.len(), 1, "one owner job, got {page_jobs:?}");
+        assert_eq!(page_jobs[0].id, job_id);
+        assert_eq!(page_jobs[0].kind, "both");
+        assert_eq!(page_jobs[0].triggered_by, "delta_retry");
+
+        // A later delta walk re-listing the same still-broken page must not
+        // stack a second job on top of the first.
+        let again = defer_delta_page(&db, 3172, "still missing")
+            .await
+            .expect("second deferral coalesces");
+        assert_eq!(again, job_id);
+        let pending = db.list_pending_index_jobs(50).await.unwrap();
+        assert_eq!(
+            pending.iter().filter(|j| j.scope == "page:3172").count(),
+            1,
+            "repeat deferrals coalesce onto the same job"
+        );
+    }
+
+    /// The deferred job is a normal queue citizen: when it fails, the #54
+    /// reconciler retries it like any other. This is what makes "will retry"
+    /// true for delta-walk failures.
+    #[tokio::test]
+    async fn deferred_delta_page_job_is_picked_up_by_the_retry_chain() {
+        let db = temp_db();
+        let job_id = defer_delta_page(&db, 3917, "parent book 85 not in index")
+            .await
+            .unwrap();
+        db.fail_index_job(job_id, "parent still missing")
+            .await
+            .unwrap();
+
+        reconcile_failed_index_jobs(&db, 5).await;
+
+        let listed = db.list_index_jobs(20).await.unwrap();
+        let original = listed.iter().find(|j| j.id == job_id).unwrap();
+        assert_eq!(original.resolved_status.as_deref(), Some("retried"));
+        let retry = listed
+            .iter()
+            .find(|j| j.retry_of == Some(job_id))
+            .expect("retry job queued");
+        assert_eq!(retry.scope, "page:3917");
+        assert_eq!(retry.status, "pending");
+    }
+
+    /// Issue #147 — books on no shelf are invisible to the shelf-rooted
+    /// walk, so the orphan sweep is the only thing that indexes them.
+    #[test]
+    fn orphan_book_ids_returns_only_unshelved_books() {
+        let walked: HashSet<i64> = [10, 11, 12].into_iter().collect();
+        assert_eq!(
+            orphan_book_ids(&[10, 11, 12, 72, 85], &walked),
+            vec![72, 85]
+        );
+    }
+
+    /// A book on two shelves is walked once per shelf by the shelf pass and
+    /// must not be swept again. An empty shelf pass makes every book an
+    /// orphan — that's the no-shelves-visible case, and indexing everything
+    /// we can see is the right answer there.
+    #[test]
+    fn orphan_book_ids_handles_multi_shelf_and_empty_walks() {
+        let walked: HashSet<i64> = [10].into_iter().collect();
+        assert!(orphan_book_ids(&[10], &walked).is_empty());
+        assert_eq!(orphan_book_ids(&[10, 72], &HashSet::new()), vec![10, 72]);
+    }
+
+    /// `list_all_books` pages by offset, so a book created mid-pagination
+    /// can appear in two pages. Walking it twice is wasted API calls.
+    #[test]
+    fn orphan_book_ids_dedupes_paginated_duplicates() {
+        assert_eq!(
+            orphan_book_ids(&[72, 85, 72, 85, 90], &HashSet::new()),
+            vec![72, 85, 90]
         );
     }
 
