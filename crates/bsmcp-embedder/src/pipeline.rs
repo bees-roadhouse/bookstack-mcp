@@ -356,15 +356,27 @@ pub async fn run_pipeline(
     // by the daily reconciliation cron — no embedding work, just refresh
     // page_view_acl for every previously-stored page.
     if scope == "acl_reconcile" {
-        match reconcile_all_pages(client, db).await {
-            Ok((processed, failed)) => {
-                tracing::info!(processed, failed, "pipeline_acl_reconcile_complete");
-                db.update_job_progress(job_id, processed as i64, (processed + failed) as i64)
-                    .await?;
+        match reconcile_all_pages(client, db, job_id).await {
+            Ok(outcome) => {
+                if outcome.aborted {
+                    tracing::info!(
+                        processed = outcome.processed,
+                        failed = outcome.failed,
+                        "pipeline_acl_reconcile_aborted"
+                    );
+                } else {
+                    tracing::info!(
+                        processed = outcome.processed,
+                        failed = outcome.failed,
+                        "pipeline_acl_reconcile_complete"
+                    );
+                }
+                // Progress is published inside reconcile_all_pages now,
+                // including the final and cancelled-part-way stamps.
                 return Ok(PipelineResult {
-                    succeeded: processed,
+                    succeeded: outcome.processed,
                     failed_pages: Vec::new(),
-                    aborted: false,
+                    aborted: outcome.aborted,
                 });
             }
             Err(e) => {

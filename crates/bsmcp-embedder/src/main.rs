@@ -267,6 +267,33 @@ async fn main() {
     }
 }
 
+/// Periodically hand failed-open embed jobs to the retry chain.
+///
+/// Mirrors the cadence and env knobs of the worker's lifecycle loop
+/// (`BSMCP_JOB_RECONCILE_SECS`, `BSMCP_JOB_MAX_RETRY_CHAIN`) so the two
+/// roles behave identically — only one of them runs it at a time.
+fn spawn_embed_job_reconciler(db: Arc<dyn SemanticDb>) {
+    let reconcile_secs: u64 = env::var("BSMCP_JOB_RECONCILE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let max_chain: usize = env::var("BSMCP_JOB_MAX_RETRY_CHAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    tracing::info!(
+        reconcile_secs,
+        max_chain,
+        "embedder_embed_job_reconciler_active"
+    );
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(reconcile_secs)).await;
+            worker::reconcile_failed_embed_jobs(&db, max_chain).await;
+        }
+    });
+}
+
 /// Worker role body — lifts `bsmcp-worker/src/main.rs` lines 41-119
 /// minus the duplicated DB/encryption_key bootstrap (the role dispatcher
 /// in `main` already opened the DB).
@@ -338,6 +365,20 @@ async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Ro
     db.init_semantic_tables()
         .await
         .expect("Failed to initialize semantic tables");
+
+    // The embed queue's retry chain. This used to run only from the worker
+    // role's lifecycle loop, so on a split deployment (embedder container +
+    // worker container) nothing ever retried a failed embed job unless the
+    // worker also had a semantic DB. A single failed-open `acl_reconcile`
+    // then blocked every subsequent cron enqueue via create_embed_job's
+    // dedup — observed stuck for 9 days (issue #148).
+    //
+    // Skipped under Role::Both: the worker side spawned alongside us
+    // already reconciles the same queue, and two reconcilers racing the
+    // same failed-open job would double-enqueue retries.
+    if role == Role::Embedder {
+        spawn_embed_job_reconciler(db.clone());
+    }
 
     // Select embedding provider
     let provider = env::var("BSMCP_EMBED_PROVIDER")

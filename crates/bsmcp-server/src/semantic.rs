@@ -662,8 +662,35 @@ impl SemanticState {
             tokio::time::sleep(Duration::from_secs(5 * 60)).await;
             loop {
                 match self.db.create_embed_job("acl_reconcile").await {
-                    Ok((job_id, is_new)) => {
-                        tracing::info!(job_id, is_new, "semantic_acl_reconcile_cron_queued")
+                    Ok((job_id, true)) => {
+                        tracing::info!(job_id, is_new = true, "semantic_acl_reconcile_cron_queued")
+                    }
+                    // Coalesced onto an existing job. Benign when that job
+                    // is pending/running, but `create_embed_job` also treats
+                    // failed-open as active — so a job that failed and never
+                    // got retried silently absorbs every subsequent cron
+                    // enqueue and ACL data goes stale indefinitely. Nine days
+                    // of that is what motivated issue #148; make it loud.
+                    Ok((job_id, false)) => {
+                        let blocker = self
+                            .db
+                            .list_failed_open_embed_jobs()
+                            .await
+                            .ok()
+                            .and_then(|jobs| jobs.into_iter().find(|j| j.id == job_id));
+                        match blocker {
+                            Some(j) => tracing::warn!(
+                                job_id,
+                                blocked_since = ?j.started_at,
+                                error = j.error.as_deref().unwrap_or("unknown"),
+                                "semantic_acl_reconcile_cron_starved"
+                            ),
+                            None => tracing::info!(
+                                job_id,
+                                is_new = false,
+                                "semantic_acl_reconcile_cron_queued"
+                            ),
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "semantic_acl_reconcile_cron_queue_failed")

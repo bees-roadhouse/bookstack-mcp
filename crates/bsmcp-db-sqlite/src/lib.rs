@@ -4150,6 +4150,81 @@ mod lifecycle_tests {
         assert_eq!(j_dup, j1);
     }
 
+    /// Issue #148 — the signal `reconcile_all_pages` polls per page. The
+    /// ACL reconcile loop had no cancel check at all, so a cancelled job
+    /// ran to completion and the embedder never returned to
+    /// `claim_next_job`, stalling the whole embed queue behind discarded
+    /// work.
+    #[tokio::test]
+    async fn embed_should_stop_returns_true_for_cancelled() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (job_id, _) = SemanticDb::create_embed_job(&db, "acl_reconcile")
+            .await
+            .unwrap();
+        // Claimed → running → keep going.
+        let claimed = SemanticDb::claim_next_job(&db, "worker-x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, job_id);
+        assert!(!SemanticDb::should_stop_embed_job(&db, job_id)
+            .await
+            .unwrap());
+
+        // Operator cancels mid-run — the very next per-page poll must stop.
+        SemanticDb::cancel_embed_job(&db, job_id).await.unwrap();
+        assert!(SemanticDb::should_stop_embed_job(&db, job_id)
+            .await
+            .unwrap());
+    }
+
+    /// Issue #148 — a failed-open `acl_reconcile` absorbs every subsequent
+    /// cron enqueue, so ACL data goes stale for as long as nothing resolves
+    /// it. Observed stuck for 9 days on a live instance because the retry
+    /// chain only ran from the worker role.
+    ///
+    /// Pins both halves: the starvation itself, and that resolving the
+    /// blocker is what lets the cron queue work again.
+    #[tokio::test]
+    async fn failed_open_acl_reconcile_starves_the_cron_until_resolved() {
+        let db = temp_db();
+        db.init_semantic_tables().await.unwrap();
+
+        let (first, is_new) = SemanticDb::create_embed_job(&db, "acl_reconcile")
+            .await
+            .unwrap();
+        assert!(is_new);
+        SemanticDb::fail_embed_job(&db, first, "Request failed")
+            .await
+            .unwrap();
+
+        // Every daily cron tick from here collapses onto the dead job.
+        for _ in 0..9 {
+            let (id, is_new) = SemanticDb::create_embed_job(&db, "acl_reconcile")
+                .await
+                .unwrap();
+            assert_eq!(id, first, "cron must coalesce onto the failed-open job");
+            assert!(!is_new, "no new work is queued while it stays failed-open");
+        }
+
+        // The job is discoverable as failed-open, which is what both the
+        // retry chain and the cron's starvation warning key off.
+        let open = SemanticDb::list_failed_open_embed_jobs(&db).await.unwrap();
+        assert!(open.iter().any(|j| j.id == first));
+
+        // Once the reconciler resolves it, the next tick queues real work.
+        SemanticDb::close_embed_job(&db, first, Some("retried"))
+            .await
+            .unwrap();
+        let (next, is_new) = SemanticDb::create_embed_job(&db, "acl_reconcile")
+            .await
+            .unwrap();
+        assert!(is_new, "resolved blocker must stop absorbing enqueues");
+        assert_ne!(next, first);
+    }
+
     #[tokio::test]
     async fn index_should_stop_returns_true_for_cancelled() {
         let db = temp_db();

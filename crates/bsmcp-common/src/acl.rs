@@ -252,15 +252,58 @@ fn now_secs() -> i64 {
 ///
 /// Returns `(processed, failed)`. Best-effort: per-page failures are logged
 /// but don't abort the run.
+/// How often the full ACL reconcile publishes progress, in pages.
+const ACL_PROGRESS_EVERY: usize = 50;
+
+/// Result of a full ACL reconcile pass.
+///
+/// `aborted` is true when the job was cancelled part-way — the caller must
+/// not report a cancelled run as a clean completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AclReconcileOutcome {
+    pub processed: usize,
+    pub failed: usize,
+    pub aborted: bool,
+}
+
 pub async fn reconcile_all_pages(
     client: &BookStackClient,
     db: &Arc<dyn SemanticDb>,
-) -> Result<(usize, usize), String> {
+    job_id: i64,
+) -> Result<AclReconcileOutcome, String> {
     let role_ctx = build_role_context(client).await?;
     let page_ids = db.list_acl_page_ids().await?;
+    let total = page_ids.len() as i64;
+    db.update_job_progress(job_id, 0, total).await?;
     let mut processed = 0usize;
     let mut failed = 0usize;
-    for page_id in page_ids {
+    for (index, page_id) in page_ids.into_iter().enumerate() {
+        // Per-page cancel check, mirroring the embed pipeline's loop.
+        // Without it a cancelled job runs to completion inside this
+        // function, so the embedder never returns to `claim_next_job`
+        // and the whole embed queue stalls behind work whose result is
+        // already discarded (issue #148).
+        if matches!(db.should_stop_embed_job(job_id).await, Ok(true)) {
+            tracing::info!(
+                job_id,
+                page_index = index,
+                processed,
+                failed,
+                "acl_reconcile_cancelled_aborting"
+            );
+            db.update_job_progress(job_id, index as i64, total).await?;
+            return Ok(AclReconcileOutcome {
+                processed,
+                failed,
+                aborted: true,
+            });
+        }
+        // Publish progress as we go rather than only at the end — a
+        // multi-thousand-page reconcile used to sit at 0/0 for its whole
+        // run, which reads as "wedged" on /status.
+        if index > 0 && index % ACL_PROGRESS_EVERY == 0 {
+            db.update_job_progress(job_id, index as i64, total).await?;
+        }
         let meta = match db.get_page_meta(page_id).await {
             Ok(Some(m)) => m,
             Ok(None) => continue,
@@ -285,7 +328,12 @@ pub async fn reconcile_all_pages(
             }
         }
     }
-    Ok((processed, failed))
+    db.update_job_progress(job_id, total, total).await?;
+    Ok(AclReconcileOutcome {
+        processed,
+        failed,
+        aborted: false,
+    })
 }
 
 /// Recompute ACL for a single page. Called by the webhook handler on
