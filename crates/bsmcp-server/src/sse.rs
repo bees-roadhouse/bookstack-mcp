@@ -342,7 +342,7 @@ pub async fn resolve_credentials(
 
 pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
     tracing::debug!(method = "GET", route = "/mcp/sse", "sse_connect_attempt");
-    let (token_id, token_secret) =
+    let (mut token_id, mut token_secret) =
         match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
             Ok(creds) => creds,
             Err(resp) => return resp,
@@ -354,12 +354,14 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
     // and every later GET got a 429 — cosmetic in the client log, but it also
     // meant a wasted `validate()` round-trip against BookStack per reconnect.
     //
-    // Serve an inert stream instead. The spec permits answering this GET with
-    // 405 as well, but rmcp's handling of that has drifted across versions and
-    // a 405 can push a client into legacy-SSE *fallback* — allocating exactly
-    // the session we are declining here. This server pushes no server-initiated
-    // messages, so the stream carries keepalive comments and nothing else, and
-    // it ends when the client goes away.
+    // Serve an inert stream instead. The spec allows answering this GET with
+    // 405 too, and current rmcp maps that onto `ServerDoesNotSupportSse` and
+    // carries on, so 405 is a legitimate — arguably tidier — answer that would
+    // also avoid holding a connection per client. The inert stream is chosen
+    // defensively: `text/event-stream` is the branch every client handles,
+    // whereas correct 405 handling varies by client and version, and this
+    // server has nothing to push either way. See the follow-up issue on
+    // revisiting 405 and capping these streams.
     //
     // The incoming id is deliberately not checked against `streamable_sessions`:
     // that map is empty after a restart while clients still hold ids, and
@@ -367,6 +369,9 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
     // is the real gate; the header is only a transport discriminator.
     if is_streamable_notification_stream(&headers) {
         tracing::debug!("streamable_notification_stream_opened");
+        // No `Session` is constructed on this path, so its `Drop` never runs.
+        token_id.zeroize();
+        token_secret.zeroize();
         return notification_stream_response();
     }
 
@@ -450,8 +455,11 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// Inert `text/event-stream` for a streamable-HTTP client's notification
 /// channel. Allocates no [`Session`] and counts against no cap: the server has
 /// no server→client messages to push, so the stream carries only the keepalive
-/// comments `KeepAlive` injects. `futures::stream::pending()` never yields, so
-/// the response ends when the client disconnects and the keepalive write fails.
+/// comments `KeepAlive` injects. `futures::stream::pending()` never yields; the
+/// response body is dropped when hyper sees the peer close the connection
+/// (measured at ~60ms, on both graceful FIN and RST), so teardown does not wait
+/// on a keepalive write failing. The keepalive is the backstop for half-open
+/// peers behind a proxy, not the primary disconnect detector.
 fn notification_stream_response() -> Response {
     let stream = futures::stream::pending::<Result<Event, Infallible>>();
     let mut resp = Sse::new(stream)

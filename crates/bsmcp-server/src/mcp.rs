@@ -2038,6 +2038,30 @@ fn cached_structure(key: &str, ttl: Duration) -> Option<String> {
     (built_at.elapsed() < ttl).then(|| structure.clone())
 }
 
+/// One rendered sweep. `complete` is false when any `get_shelf` or the
+/// `list_chapters` call failed, meaning the text is missing shelves or
+/// chapters even though it rendered fine.
+struct StructureSweep {
+    text: String,
+    complete: bool,
+}
+
+/// Cache only a complete sweep.
+///
+/// `build_structure_uncached` skips failed `get_shelf` results rather than
+/// aborting, so a partial sweep still renders non-empty. Caching one would
+/// pin a truncated shelf tree for the whole TTL — and BookStack failing
+/// mid-sweep is precisely the saturated-pool condition this cache exists to
+/// relieve, so the blip and the caching would compound. Before caching
+/// existed this self-healed on the next connect; keep that property.
+fn store_sweep(key: &str, sweep: &StructureSweep, ttl: Duration) {
+    if !sweep.complete {
+        tracing::warn!("structure_sweep_incomplete_not_cached");
+        return;
+    }
+    store_structure(key, &sweep.text, ttl);
+}
+
 fn store_structure(key: &str, structure: &str, ttl: Duration) {
     if ttl.is_zero() {
         return;
@@ -2060,12 +2084,12 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
         return Some(hit);
     }
 
-    let structure = build_structure_uncached(client).await?;
-    store_structure(&key, &structure, ttl);
-    Some(structure)
+    let sweep = build_structure_uncached(client).await?;
+    store_sweep(&key, &sweep, ttl);
+    Some(sweep.text)
 }
 
-async fn build_structure_uncached(client: &BookStackClient) -> Option<String> {
+async fn build_structure_uncached(client: &BookStackClient) -> Option<StructureSweep> {
     let shelves = client.list_shelves(500, 0).await.ok()?;
     let shelf_list = shelves["data"].as_array()?;
 
@@ -2075,13 +2099,22 @@ async fn build_structure_uncached(client: &BookStackClient) -> Option<String> {
         .map(|id| client.get_shelf(id))
         .collect();
     let shelf_details = futures::future::join_all(shelf_futures).await;
+    let shelves_failed = shelf_details.iter().filter(|r| r.is_err()).count();
 
-    let chapters = client
-        .list_chapters(500, 0)
-        .await
+    let chapters_result = client.list_chapters(500, 0).await;
+    let chapters_failed = chapters_result.is_err();
+    let chapters = chapters_result
         .ok()
         .and_then(|v| v["data"].as_array().cloned())
         .unwrap_or_default();
+
+    if shelves_failed > 0 || chapters_failed {
+        tracing::warn!(
+            shelves_failed,
+            chapters_failed,
+            "structure_sweep_partial_upstream_errors"
+        );
+    }
 
     let mut chapters_by_book: HashMap<i64, Vec<(i64, String, String)>> = HashMap::new();
     for ch in &chapters {
@@ -2139,7 +2172,10 @@ async fn build_structure_uncached(client: &BookStackClient) -> Option<String> {
     if output.is_empty() {
         None
     } else {
-        Some(output)
+        Some(StructureSweep {
+            text: output,
+            complete: shelves_failed == 0 && !chapters_failed,
+        })
     }
 }
 
@@ -2732,6 +2768,36 @@ mod tests {
         let theirs = structure_cache_key("https://kb.example.com", "leak-theirs");
         store_structure(&mine, "Shelf: Private (ID: 9)\n", ttl);
         assert_eq!(cached_structure(&theirs, ttl), None);
+    }
+
+    #[test]
+    fn a_partial_sweep_is_never_cached() {
+        // BookStack saturating mid-sweep still renders a non-empty (but
+        // truncated) tree. Caching it would pin the wrong shelf list for the
+        // whole TTL, and a saturated pool is exactly when this fires.
+        let ttl = Duration::from_secs(60);
+        let key = structure_cache_key("https://kb.example.com", "partial");
+        let sweep = StructureSweep {
+            text: "Shelf: Ops (ID: 1)\n".to_string(),
+            complete: false,
+        };
+        store_sweep(&key, &sweep, ttl);
+        assert_eq!(cached_structure(&key, ttl), None);
+    }
+
+    #[test]
+    fn a_complete_sweep_is_cached() {
+        let ttl = Duration::from_secs(60);
+        let key = structure_cache_key("https://kb.example.com", "complete");
+        let sweep = StructureSweep {
+            text: "Shelf: Ops (ID: 1)\n".to_string(),
+            complete: true,
+        };
+        store_sweep(&key, &sweep, ttl);
+        assert_eq!(
+            cached_structure(&key, ttl).as_deref(),
+            Some("Shelf: Ops (ID: 1)\n")
+        );
     }
 
     #[test]
