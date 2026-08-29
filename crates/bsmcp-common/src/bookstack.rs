@@ -1586,7 +1586,11 @@ mod tests {
     #[test]
     fn public_url_override_splits_internal_and_external_hosts() {
         let c = client("http://bookstack-app").with_public_url("https://kb.example.com/");
-        assert_eq!(c.base_url(), "http://bookstack-app", "API host must not change");
+        assert_eq!(
+            c.base_url(),
+            "http://bookstack-app",
+            "API host must not change"
+        );
         assert_eq!(c.public_url(), "https://kb.example.com");
     }
 
