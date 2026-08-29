@@ -1541,7 +1541,10 @@ mod tests {
         let older = (FULL_WALK_VERSION - 1).to_string();
         assert!(should_run_full_walk(Some("1755000000"), Some(&older)));
         // Garbage in the version slot must fail open (re-walk), not closed.
-        assert!(should_run_full_walk(Some("1755000000"), Some("not-a-number")));
+        assert!(should_run_full_walk(
+            Some("1755000000"),
+            Some("not-a-number")
+        ));
     }
 
     #[test]

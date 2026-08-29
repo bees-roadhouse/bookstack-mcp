@@ -433,7 +433,11 @@ async fn enqueue_index_jobs_for_webhook(
                 .await?;
             tracing::info!(event = %event, scope = "all", job_id, is_new, "indexworker_full_walk_queued");
         }
-        "book_create" | "book_update" | "book_sort" | "book_create_from_chapter" | "book_delete" => {
+        "book_create"
+        | "book_update"
+        | "book_sort"
+        | "book_create_from_chapter"
+        | "book_delete" => {
             if event == "book_delete" {
                 if let Some(bid) = item_id {
                     state.index_db.soft_delete_indexed_book(bid).await?;
@@ -447,7 +451,9 @@ async fn enqueue_index_jobs_for_webhook(
         }
         // bookshelf_create / book_create were missing until issue #152 — a
         // newly created shelf or book produced no index job at all.
-        "bookshelf_create" | "bookshelf_create_from_book" | "bookshelf_update"
+        "bookshelf_create"
+        | "bookshelf_create_from_book"
+        | "bookshelf_update"
         | "bookshelf_delete" => {
             if event == "bookshelf_delete" {
                 if let Some(sid) = item_id {

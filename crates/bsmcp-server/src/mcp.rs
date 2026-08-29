@@ -140,11 +140,7 @@ async fn execute_tool(
             // index (global); live count from the caller's token (one cheap
             // count=1 API call). The index missing shelves the caller can
             // see is the stale signal.
-            let indexed_shelves = index_db
-                .list_indexed_shelves()
-                .await
-                .map(|s| s.len())
-                .ok();
+            let indexed_shelves = index_db.list_indexed_shelves().await.map(|s| s.len()).ok();
             let live_shelves = client
                 .list_shelves(1, 0)
                 .await
@@ -2988,7 +2984,11 @@ mod tests {
     fn index_coverage_unknown_never_claims_completeness() {
         for (indexed, live) in [(None, Some(17)), (Some(2), None), (None, None)] {
             let p = index_coverage_payload(indexed, live);
-            assert_eq!(p["stale"], json!(null), "{indexed:?}/{live:?} must be unknown, not false");
+            assert_eq!(
+                p["stale"],
+                json!(null),
+                "{indexed:?}/{live:?} must be unknown, not false"
+            );
         }
     }
 
