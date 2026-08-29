@@ -290,6 +290,9 @@ fn upstream_unavailable(hint: &str) -> Response {
     resp
 }
 
+// The Err variant is a ready-to-send HTTP response for the `?` early-return
+// pattern in the handlers; boxing it would push the cost onto every caller.
+#[allow(clippy::result_large_err)]
 pub async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,

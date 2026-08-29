@@ -13,7 +13,8 @@
 //!
 //! Triggers (this phase):
 //!   - On startup: enqueue an `all` job if `index_meta.last_full_walk_at`
-//!     is not yet set.
+//!     is not yet set, or if the stamped `full_walk_version` predates the
+//!     current walk's coverage semantics (issue #152).
 //!
 //! Triggers added in Phase 4c:
 //!   - Webhook: enqueue `page:{id}` jobs on BookStack page events.
@@ -56,6 +57,29 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// briefly during a full walk. Prevents one giant walk from monopolising
 /// the worker task.
 const YIELD_EVERY: usize = 25;
+
+/// Coverage version of the full walk, stamped alongside
+/// `last_full_walk_at`. Bump this when the walk's coverage semantics
+/// change in a way that makes previously-stamped walks incomplete — every
+/// deployment then re-runs one full walk on next worker start (issue #152:
+/// a checkpoint stamped by the v0.12.x walk covered at most the two
+/// configured shelves, and #122's widening to every visible shelf never
+/// invalidated it, leaving the index missing most shelves forever).
+const FULL_WALK_VERSION: u64 = 2;
+
+/// Decide whether a full walk is needed. Pure so it's testable: the walk
+/// itself is gated on BookStackClient, which has no test stub.
+fn should_run_full_walk(last_full_walk_at: Option<&str>, stamped_version: Option<&str>) -> bool {
+    if last_full_walk_at.is_none() {
+        return true;
+    }
+    match stamped_version {
+        // Stamp predates versioning (v0.12.x–v0.13.x): coverage unknown,
+        // and in practice at most two shelves. Re-walk.
+        None => true,
+        Some(v) => v.parse::<u64>().unwrap_or(0) < FULL_WALK_VERSION,
+    }
+}
 
 pub(crate) struct IndexWorker {
     bs_client: BookStackClient,
@@ -262,15 +286,20 @@ impl IndexWorker {
         })
     }
 
-    /// On first start, queue a full walk if it's never been done.
+    /// On start, queue a full walk if it's never been done — or if the
+    /// stamped walk predates the current coverage version (issue #152).
     async fn maybe_enqueue_initial_walk(&self) -> Result<(), String> {
-        if self
-            .index_db
-            .get_index_meta("last_full_walk_at")
-            .await?
-            .is_some()
-        {
+        let last_walk = self.index_db.get_index_meta("last_full_walk_at").await?;
+        let version = self.index_db.get_index_meta("full_walk_version").await?;
+        if !should_run_full_walk(last_walk.as_deref(), version.as_deref()) {
             return Ok(());
+        }
+        if last_walk.is_some() {
+            tracing::info!(
+                stamped_version = version.as_deref().unwrap_or("none"),
+                current_version = FULL_WALK_VERSION,
+                "indexworker_full_walk_version_outdated_rewalking"
+            );
         }
         let (id, is_new) = self
             .index_db
@@ -377,6 +406,7 @@ impl IndexWorker {
         }
         let mut total_pages = 0usize;
         let mut walked_books: HashSet<i64> = HashSet::new();
+        let mut failed_shelves = 0usize;
         for shelf_id in shelves {
             // Per-shelf/book/chapter/page status check. This (and every
             // other should_stop_index_job call in walk_*) is a `WHERE id = ?`
@@ -389,10 +419,40 @@ impl IndexWorker {
             }
             match self.walk_shelf(shelf_id, job_id, &mut walked_books).await {
                 Ok(n) => total_pages += n,
-                Err(e) => tracing::error!(shelf_id, error = %e, "indexworker_walk_shelf_failed"),
+                Err(e) => {
+                    failed_shelves += 1;
+                    tracing::error!(shelf_id, error = %e, "indexworker_walk_shelf_failed");
+                }
             }
         }
-        total_pages += self.walk_orphan_books(job_id, &walked_books).await;
+        // The orphan sweep classifies "every visible book not reached via a
+        // shelf" as unshelved and writes shelf_id = NULL. When a shelf walk
+        // failed, its books were never reached — sweeping them would
+        // overwrite valid book→shelf edges with NULL (issue #152). Only
+        // sweep when shelf coverage is complete.
+        if failed_shelves == 0 {
+            total_pages += self.walk_orphan_books(job_id, &walked_books).await;
+        } else {
+            tracing::warn!(
+                failed_shelves,
+                "indexworker_full_walk_orphan_sweep_skipped_incomplete_coverage"
+            );
+        }
+        // A cancel during the orphan sweep returns without erroring; don't
+        // let it fall through to the stamp below.
+        if matches!(self.index_db.should_stop_index_job(job_id).await, Ok(true)) {
+            tracing::info!(job_id, walk = "all", "indexworker_walk_stopped");
+            return Ok(());
+        }
+        if failed_shelves > 0 {
+            // Don't stamp: an unstamped walk is re-enqueued on next worker
+            // start, and the failed job is retried by the reconciler. A
+            // stamped partial walk is permanent — the exact silent-gap
+            // failure mode of issue #152.
+            return Err(format!(
+                "full walk incomplete: {failed_shelves} shelf walk(s) failed; not stamping so the walk retries"
+            ));
+        }
         self.stamp_full_walk_done().await?;
         tracing::info!(total_pages, "indexworker_full_walk_complete");
         Ok(())
@@ -447,6 +507,9 @@ impl IndexWorker {
         let now = current_unix();
         self.index_db
             .set_index_meta("last_full_walk_at", &now.to_string())
+            .await?;
+        self.index_db
+            .set_index_meta("full_walk_version", &FULL_WALK_VERSION.to_string())
             .await
     }
 
@@ -869,10 +932,12 @@ impl IndexWorker {
         let candidate_shelves: Vec<i64> =
             self.bs_client.list_all_shelves().await.unwrap_or_default();
         let mut shelf_id: Option<i64> = None;
+        let mut probe_errors = 0usize;
         for sid in &candidate_shelves {
             let shelf = match self.bs_client.get_shelf(*sid).await {
                 Ok(v) => v,
                 Err(e) => {
+                    probe_errors += 1;
                     tracing::error!(
                         book_id,
                         shelf_id = sid,
@@ -894,6 +959,27 @@ impl IndexWorker {
             if contains {
                 shelf_id = Some(*sid);
                 break;
+            }
+        }
+
+        // An error-riddled probe finding no shelf is not evidence the book
+        // is unshelved — the shelf that owns it may be the one that failed.
+        // Keep the previously-indexed edge rather than overwriting it with
+        // NULL (issue #152).
+        if shelf_id.is_none() && probe_errors > 0 {
+            shelf_id = self
+                .index_db
+                .get_indexed_book(book_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|b| b.shelf_id);
+            if shelf_id.is_some() {
+                tracing::warn!(
+                    book_id,
+                    probe_errors,
+                    "indexworker_reconcile_book_probe_inconclusive_keeping_indexed_shelf"
+                );
             }
         }
 
@@ -1436,6 +1522,36 @@ fn extract_ouid_from_frontmatter(md: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #152: a fresh database must trigger the walk.
+    #[test]
+    fn full_walk_runs_when_never_stamped() {
+        assert!(should_run_full_walk(None, None));
+    }
+
+    /// Issue #152: a stamp without a version was written by a pre-#122
+    /// walk that covered at most two shelves — it must not be trusted.
+    #[test]
+    fn full_walk_reruns_when_stamp_predates_versioning() {
+        assert!(should_run_full_walk(Some("1755000000"), None));
+    }
+
+    #[test]
+    fn full_walk_reruns_when_stamped_version_is_older() {
+        let older = (FULL_WALK_VERSION - 1).to_string();
+        assert!(should_run_full_walk(Some("1755000000"), Some(&older)));
+        // Garbage in the version slot must fail open (re-walk), not closed.
+        assert!(should_run_full_walk(Some("1755000000"), Some("not-a-number")));
+    }
+
+    #[test]
+    fn full_walk_skipped_when_stamp_is_current() {
+        let current = FULL_WALK_VERSION.to_string();
+        assert!(!should_run_full_walk(Some("1755000000"), Some(&current)));
+        // A future version (rolled-back binary) shouldn't churn either.
+        let newer = (FULL_WALK_VERSION + 1).to_string();
+        assert!(!should_run_full_walk(Some("1755000000"), Some(&newer)));
+    }
 
     #[test]
     fn extract_ouid_present() {

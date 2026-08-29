@@ -2723,7 +2723,7 @@ impl IndexDb for PostgresDb {
                 .map_err(|e| format!("read_directory_tree shelf: {e}"))?;
                 let (name, slug) = match shelf {
                     Some(r) => (r.get::<String, _>("name"), r.get::<String, _>("slug")),
-                    None => return Err(format!("shelf {shelf_id} not found")),
+                    None => return Err(format!("shelf {shelf_id} is not in the structural index — this means unindexed, not nonexistent; verify with get_shelf (live API), and treat the index as stale if it exists")),
                 };
                 let children = if depth_allows_descent(depth) {
                     build_shelf_children(&self.pool, shelf_id, decrement_depth(depth)).await?
@@ -2748,7 +2748,7 @@ impl IndexDb for PostgresDb {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| format!("read_directory_tree book: {e}"))?
-                .ok_or_else(|| format!("book {book_id} not found"))?;
+                .ok_or_else(|| format!("book {book_id} is not in the structural index — this means unindexed, not nonexistent; verify with get_book (live API), and treat the index as stale if it exists"))?;
                 let b = (
                     row.get::<i64, _>("book_id"),
                     row.get::<String, _>("name"),
@@ -2765,7 +2765,7 @@ impl IndexDb for PostgresDb {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| format!("read_directory_tree chapter: {e}"))?
-                .ok_or_else(|| format!("chapter {chapter_id} not found"))?;
+                .ok_or_else(|| format!("chapter {chapter_id} is not in the structural index — this means unindexed, not nonexistent; verify with get_chapter (live API), and treat the index as stale if it exists"))?;
                 let c = (
                     row.get::<i64, _>("chapter_id"),
                     row.get::<String, _>("name"),

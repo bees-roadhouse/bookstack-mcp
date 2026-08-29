@@ -3349,7 +3349,7 @@ fn read_directory_tree_sync(
         }
         DirectoryScope::Shelf(shelf_id) => {
             let (name, slug) = shelf_name_slug(conn, shelf_id)?
-                .ok_or_else(|| format!("shelf {shelf_id} not found"))?;
+                .ok_or_else(|| format!("shelf {shelf_id} is not in the structural index — this means unindexed, not nonexistent; verify with get_shelf (live API), and treat the index as stale if it exists"))?;
             let children = if depth_allows_descent(depth) {
                 list_books_in_shelf(conn, shelf_id)?
                     .into_iter()
@@ -3369,12 +3369,12 @@ fn read_directory_tree_sync(
         }
         DirectoryScope::Book(book_id) => {
             let book =
-                get_book_row(conn, book_id)?.ok_or_else(|| format!("book {book_id} not found"))?;
+                get_book_row(conn, book_id)?.ok_or_else(|| format!("book {book_id} is not in the structural index — this means unindexed, not nonexistent; verify with get_book (live API), and treat the index as stale if it exists"))?;
             Ok(vec![book_node(conn, book, depth)?])
         }
         DirectoryScope::Chapter(chapter_id) => {
             let chap = get_chapter_row(conn, chapter_id)?
-                .ok_or_else(|| format!("chapter {chapter_id} not found"))?;
+                .ok_or_else(|| format!("chapter {chapter_id} is not in the structural index — this means unindexed, not nonexistent; verify with get_chapter (live API), and treat the index as stale if it exists"))?;
             Ok(vec![chapter_node(conn, chap, depth)?])
         }
     }
@@ -4604,10 +4604,21 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn directory_tree_unknown_scope_errors_clearly() {
         let db = temp_db();
-        // No fixture — pure error path.
+        // No fixture — pure error path. Issue #152: the message must say
+        // "not in the index", never "not found" — the book may well exist
+        // in BookStack, and the caller needs to know to fall back to the
+        // live API rather than conclude the content is gone.
         let err = IndexDb::read_directory_tree(&db, DirectoryScope::Book(9999), None)
             .await
             .unwrap_err();
         assert!(err.contains("book 9999"));
+        assert!(
+            err.contains("not in the structural index"),
+            "error must distinguish unindexed from nonexistent: {err}"
+        );
+        assert!(
+            err.contains("get_book"),
+            "error must point at the live-API fallback: {err}"
+        );
     }
 }
