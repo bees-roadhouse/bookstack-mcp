@@ -72,6 +72,9 @@ fn is_streamable_notification_stream(headers: &HeaderMap) -> bool {
 #[derive(Clone)]
 pub struct AppState {
     pub bookstack_url: String,
+    /// Browser-reachable BookStack URL for human-facing links (issue #151).
+    /// Equals `bookstack_url` unless `BSMCP_BOOKSTACK_PUBLIC_URL` is set.
+    pub bookstack_public_url: String,
     pub http_client: Client,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
@@ -147,6 +150,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bookstack_url: String,
+        bookstack_public_url: String,
         db: Arc<dyn DbBackend>,
         index_db: Arc<dyn bsmcp_common::db::IndexDb>,
         known_urls: Vec<String>,
@@ -163,6 +167,7 @@ impl AppState {
             .expect("Failed to build HTTP client");
         Self {
             bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
+            bookstack_public_url: bookstack_public_url.trim_end_matches('/').to_string(),
             http_client,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_codes: Arc::new(RwLock::new(HashMap::new())),
@@ -290,6 +295,9 @@ fn upstream_unavailable(hint: &str) -> Response {
     resp
 }
 
+// The Err variant is a ready-to-send HTTP response for the `?` early-return
+// pattern in the handlers; boxing it would push the cost onto every caller.
+#[allow(clippy::result_large_err)]
 pub async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,
@@ -380,7 +388,8 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
         &token_id,
         &token_secret,
         state.http_client.clone(),
-    );
+    )
+    .with_public_url(&state.bookstack_public_url);
 
     match client.validate().await {
         CredentialCheck::Valid => {}
@@ -621,7 +630,8 @@ pub async fn handle_streamable(
         &token_id,
         &token_secret,
         state.http_client.clone(),
-    );
+    )
+    .with_public_url(&state.bookstack_public_url);
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,

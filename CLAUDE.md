@@ -97,7 +97,8 @@ Both `rerank` and `precision` modes require `BSMCP_RERANK_PROVIDER` configured o
 All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 
 **Server:**
-- `BSMCP_BOOKSTACK_URL` (required)
+- `BSMCP_BOOKSTACK_URL` (required) — where the server dials the BookStack API; may be an internal host
+- `BSMCP_BOOKSTACK_PUBLIC_URL` — browser-reachable BookStack URL for all human-facing links (defaults to `BSMCP_BOOKSTACK_URL`; must be set when the API URL is internal-only, or emitted links are dead)
 - `BSMCP_ENCRYPTION_KEY` (required, 32+ chars)
 - `BSMCP_DB_BACKEND` — `sqlite` (default) or `postgres`
 - `BSMCP_DATABASE_URL` — PostgreSQL connection string (required if postgres)

@@ -39,6 +39,16 @@ async fn main() {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "server_starting");
 
     let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
+    // Browser-reachable BookStack URL for human-facing links (issue #151).
+    // Defaults to BSMCP_BOOKSTACK_URL; deployments that dial the API over an
+    // internal hostname (Docker service name, private IP) must set this to the
+    // host a browser can actually open, or every link the server emits is dead.
+    let bookstack_public_url = env::var("BSMCP_BOOKSTACK_PUBLIC_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| bookstack_url.trim_end_matches('/').to_string());
+    tracing::info!(public_url = %bookstack_public_url, "bookstack_public_url_resolved");
 
     let host = env::var("BSMCP_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("BSMCP_PORT")
@@ -234,6 +244,7 @@ async fn main() {
 
     let state = sse::AppState::new(
         bookstack_url,
+        bookstack_public_url,
         db,
         index_db.clone(),
         known_urls,

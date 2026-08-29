@@ -124,7 +124,8 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BSMCP_BOOKSTACK_URL` | Yes | - | Your BookStack instance URL |
+| `BSMCP_BOOKSTACK_URL` | Yes | - | BookStack URL the server dials the API on. May be an internal host (Docker service name, private IP). |
+| `BSMCP_BOOKSTACK_PUBLIC_URL` | No | `BSMCP_BOOKSTACK_URL` | Browser-reachable BookStack URL, used for every link shown to a human. **Set this whenever `BSMCP_BOOKSTACK_URL` is an internal host** — the failure is silent: everything works, but users get links they can't open. |
 | `BSMCP_ENCRYPTION_KEY` | Yes | - | 32+ char key for AES-256-GCM token encryption |
 | `BSMCP_DB_BACKEND` | No | `sqlite` | Database backend: `sqlite` or `postgres` |
 | `BSMCP_DATABASE_URL` | If postgres | - | PostgreSQL connection string |

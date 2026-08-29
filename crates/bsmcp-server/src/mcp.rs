@@ -270,7 +270,7 @@ async fn execute_tool(
                 .unwrap_or(false);
             let result = client.search(&query, page, count).await?;
             if !rerank {
-                return Ok(format_search_results(&result, client.base_url()));
+                return Ok(format_search_results(&result, client.public_url()));
             }
             // Rerank requires semantic search to be enabled (the embedder
             // is the host for `/rerank`). If the deployment didn't opt in
@@ -326,7 +326,7 @@ async fn execute_tool(
             Ok(format_shelf_success(
                 "Shelf created successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "update_shelf" => {
@@ -339,7 +339,7 @@ async fn execute_tool(
             Ok(format_shelf_success(
                 "Shelf updated successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "delete_shelf" => {
@@ -365,7 +365,7 @@ async fn execute_tool(
             Ok(format_book_success(
                 "Book created successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "update_book" => {
@@ -375,7 +375,7 @@ async fn execute_tool(
             Ok(format_book_success(
                 "Book updated successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "delete_book" => {
@@ -402,7 +402,7 @@ async fn execute_tool(
             Ok(format_chapter_success(
                 "Chapter created successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "update_chapter" => {
@@ -415,7 +415,7 @@ async fn execute_tool(
             Ok(format_chapter_success(
                 "Chapter updated successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "delete_chapter" => {
@@ -461,7 +461,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Page created successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "update_page" => {
@@ -523,7 +523,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Page updated successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "edit_page" => {
@@ -569,7 +569,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Page updated successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "append_to_page" => {
@@ -592,7 +592,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Content appended successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "replace_section" => {
@@ -619,7 +619,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Section replaced successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "insert_after" => {
@@ -663,7 +663,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Content inserted successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "delete_page" => {
@@ -694,7 +694,7 @@ async fn execute_tool(
             Ok(format_page_success(
                 "Page moved successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         "move_chapter" => {
@@ -705,7 +705,7 @@ async fn execute_tool(
             Ok(format_chapter_success(
                 "Chapter moved successfully.",
                 &result,
-                client.base_url(),
+                client.public_url(),
             ))
         }
         // Note: This uses a GET-modify-PUT pattern which has a TOCTOU race if multiple
@@ -1167,14 +1167,15 @@ fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
-/// Join a path/URL fragment from a BookStack API response with the base URL.
-/// If the fragment is already absolute (http:// or https://), return it as-is
-/// to avoid producing malformed URLs like `http://bookstack-apphttps://kb.example.com/...`.
-fn join_base_url(base_url: &str, path: &str) -> String {
+/// Join a path/URL fragment from a BookStack API response with the
+/// browser-reachable public URL. If the fragment is already absolute
+/// (http:// or https://), return it as-is to avoid producing malformed URLs
+/// like `http://bookstack-apphttps://kb.example.com/...`.
+fn join_base_url(public_url: &str, path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
         path.to_string()
     } else {
-        format!("{base_url}{path}")
+        format!("{public_url}{path}")
     }
 }
 
@@ -1482,7 +1483,7 @@ fn trim_semantic_search_payload(payload: &mut Value) {
     );
 }
 
-fn format_search_results(data: &Value, base_url: &str) -> String {
+fn format_search_results(data: &Value, public_url: &str) -> String {
     let results = data.get("data").and_then(|v| v.as_array());
     let total = data.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
 
@@ -1505,7 +1506,7 @@ fn format_search_results(data: &Value, base_url: &str) -> String {
         let url = item
             .get("url")
             .and_then(|v| v.as_str())
-            .map(|u| join_base_url(base_url, u))
+            .map(|u| join_base_url(public_url, u))
             .unwrap_or_default();
         if url.is_empty() {
             lines.push(format!("- [{item_type}] {name} (id: {id})"));
@@ -1640,7 +1641,7 @@ async fn get_page_content(client: &BookStackClient, id: i64) -> Result<(String, 
 }
 
 /// Slim success response for page create/update operations.
-fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
+fn format_page_success(action: &str, result: &Value, public_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
@@ -1654,14 +1655,14 @@ fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     let url = if let Some(rel) = result.get("url").and_then(|v| v.as_str()) {
-        join_base_url(base_url, rel)
+        join_base_url(public_url, rel)
     } else {
         let book_slug = result
             .get("book_slug")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if !book_slug.is_empty() && !slug.is_empty() {
-            format!("{base_url}/books/{book_slug}/page/{slug}")
+            format!("{public_url}/books/{book_slug}/page/{slug}")
         } else {
             String::new()
         }
@@ -1675,7 +1676,7 @@ fn format_page_success(action: &str, result: &Value, base_url: &str) -> String {
 }
 
 /// Slim success response for shelf create/update operations.
-fn format_shelf_success(action: &str, result: &Value, base_url: &str) -> String {
+fn format_shelf_success(action: &str, result: &Value, public_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
@@ -1683,7 +1684,7 @@ fn format_shelf_success(action: &str, result: &Value, base_url: &str) -> String 
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let url = format!("{base_url}/shelves/{slug}");
+    let url = format!("{public_url}/shelves/{slug}");
     let desc_line = if desc.is_empty() {
         String::new()
     } else {
@@ -1693,7 +1694,7 @@ fn format_shelf_success(action: &str, result: &Value, base_url: &str) -> String 
 }
 
 /// Slim success response for book create/update operations.
-fn format_book_success(action: &str, result: &Value, base_url: &str) -> String {
+fn format_book_success(action: &str, result: &Value, public_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
@@ -1701,7 +1702,7 @@ fn format_book_success(action: &str, result: &Value, base_url: &str) -> String {
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let url = format!("{base_url}/books/{slug}");
+    let url = format!("{public_url}/books/{slug}");
     let desc_line = if desc.is_empty() {
         String::new()
     } else {
@@ -1711,7 +1712,7 @@ fn format_book_success(action: &str, result: &Value, base_url: &str) -> String {
 }
 
 /// Slim success response for chapter create/update operations.
-fn format_chapter_success(action: &str, result: &Value, base_url: &str) -> String {
+fn format_chapter_success(action: &str, result: &Value, public_url: &str) -> String {
     let id = result.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = result.get("slug").and_then(|v| v.as_str()).unwrap_or("");
@@ -1725,7 +1726,7 @@ fn format_chapter_success(action: &str, result: &Value, base_url: &str) -> Strin
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let url = if !book_slug.is_empty() && !slug.is_empty() {
-        format!("{base_url}/books/{book_slug}/chapter/{slug}")
+        format!("{public_url}/books/{book_slug}/chapter/{slug}")
     } else {
         String::new()
     };
@@ -1952,21 +1953,21 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
     );
 
     // Include BookStack URL so AI can construct clickable links for users.
-    // Uses BSMCP_BOOKSTACK_URL (the actual BookStack instance), NOT BSMCP_PUBLIC_DOMAIN
-    // (which is the MCP server's own domain for OAuth).
-    if let Ok(url) = env::var("BSMCP_BOOKSTACK_URL") {
-        let public_url = url.trim().trim_end_matches('/').to_string();
-        if !public_url.is_empty() {
-            instructions.push_str(&format!(
-                "BookStack URL: {public_url}\n\
-                 When you create or update a page, present a clickable link to the user so they can \
-                 review it. Page URLs follow the pattern: {public_url}/books/{{book_slug}}/page/{{page_slug}}\n\
-                 The slug is returned in the API response. For other content types:\n\
-                 - Books: {public_url}/books/{{slug}}\n\
-                 - Chapters: {public_url}/books/{{book_slug}}/chapter/{{slug}}\n\
-                 - Shelves: {public_url}/shelves/{{slug}}\n\n"
-            ));
-        }
+    // Uses the client's public_url (BSMCP_BOOKSTACK_PUBLIC_URL, falling back to
+    // BSMCP_BOOKSTACK_URL) — the host a browser can reach, which behind a
+    // reverse proxy differs from the internal API host (issue #151). NOT
+    // BSMCP_PUBLIC_DOMAIN, which is the MCP server's own domain for OAuth.
+    let public_url = client.public_url();
+    if !public_url.is_empty() {
+        instructions.push_str(&format!(
+            "BookStack URL: {public_url}\n\
+             When you create or update a page, present a clickable link to the user so they can \
+             review it. Page URLs follow the pattern: {public_url}/books/{{book_slug}}/page/{{page_slug}}\n\
+             The slug is returned in the API response. For other content types:\n\
+             - Books: {public_url}/books/{{slug}}\n\
+             - Chapters: {public_url}/books/{{book_slug}}/chapter/{{slug}}\n\
+             - Shelves: {public_url}/shelves/{{slug}}\n\n"
+        ));
     }
 
     match build_structure(client).await {

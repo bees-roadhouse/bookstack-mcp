@@ -290,6 +290,10 @@ impl CredentialCheck {
 pub struct BookStackClient {
     client: Client,
     base_url: String,
+    /// Browser-reachable BookStack URL for human-facing links. Defaults to
+    /// `base_url`; deployments that dial the API over an internal network
+    /// (Docker service name, private IP) override it via `with_public_url`.
+    public_url: String,
     token_id: String,
     token_secret: String,
     rate_limiter: RateLimiter,
@@ -304,18 +308,37 @@ impl Drop for BookStackClient {
 
 impl BookStackClient {
     pub fn new(base_url: &str, token_id: &str, token_secret: &str, client: Client) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            public_url: base_url.clone(),
+            base_url,
             token_id: token_id.to_string(),
             token_secret: token_secret.to_string(),
             rate_limiter: rate_limit::shared(),
         }
     }
 
-    /// Get the base URL of the BookStack instance.
+    /// Override the browser-reachable URL used to build human-facing links.
+    /// An empty or whitespace-only value is ignored, keeping the API base URL.
+    pub fn with_public_url(mut self, url: &str) -> Self {
+        let trimmed = url.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            self.public_url = trimmed.to_string();
+        }
+        self
+    }
+
+    /// Get the base URL of the BookStack instance (where the API is dialed).
+    /// Never use this to construct links shown to humans — use `public_url`.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Browser-reachable BookStack URL for constructing user-facing links.
+    /// Equals `base_url` unless overridden via `with_public_url`.
+    pub fn public_url(&self) -> &str {
+        &self.public_url
     }
 
     /// Get the token ID (for use as a cache key, not a secret).
@@ -1543,6 +1566,38 @@ mod tests {
                     CredentialCheck::Unavailable(_)
                 ),
                 "{status} must not be reported as a credential failure"
+            );
+        }
+    }
+
+    fn client(base: &str) -> BookStackClient {
+        BookStackClient::new(base, "tid", "tsecret", reqwest::Client::new())
+    }
+
+    /// Issue #151: user-facing links must come from the browser-reachable
+    /// public URL, not the internal API host the server dials.
+    #[test]
+    fn public_url_defaults_to_base_url() {
+        let c = client("http://bookstack-app/");
+        assert_eq!(c.base_url(), "http://bookstack-app");
+        assert_eq!(c.public_url(), "http://bookstack-app");
+    }
+
+    #[test]
+    fn public_url_override_splits_internal_and_external_hosts() {
+        let c = client("http://bookstack-app").with_public_url("https://kb.example.com/");
+        assert_eq!(c.base_url(), "http://bookstack-app", "API host must not change");
+        assert_eq!(c.public_url(), "https://kb.example.com");
+    }
+
+    #[test]
+    fn empty_public_url_override_keeps_base_url() {
+        for empty in ["", "   ", "/"] {
+            let c = client("http://bookstack-app").with_public_url(empty);
+            assert_eq!(
+                c.public_url(),
+                "http://bookstack-app",
+                "override {empty:?} should be ignored"
             );
         }
     }
