@@ -135,10 +135,22 @@ async fn execute_tool(
                 .await
                 .map_err(|e| format!("directory: {e}"))?;
             let filtered = filter_directory_tree_by_acl(tree, client).await;
+            // Issue #152: report index coverage so a caller can tell a
+            // pruned tree from a complete one. Indexed count comes from the
+            // index (global); live count from the caller's token (one cheap
+            // count=1 API call). The index missing shelves the caller can
+            // see is the stale signal.
+            let indexed_shelves = index_db.list_indexed_shelves().await.map(|s| s.len()).ok();
+            let live_shelves = client
+                .list_shelves(1, 0)
+                .await
+                .ok()
+                .and_then(|v| v.get("total").and_then(|t| t.as_i64()));
             let payload = json!({
                 "scope": directory_scope_payload(scope),
                 "depth": depth,
                 "include": include,
+                "index_coverage": index_coverage_payload(indexed_shelves, live_shelves),
                 "tree": filtered
                     .iter()
                     .map(directory_node_to_json)
@@ -1179,6 +1191,32 @@ fn join_base_url(public_url: &str, path: &str) -> String {
     }
 }
 
+/// Coverage block for the `directory` response (issue #152): indexed shelf
+/// count vs. what the calling token sees live. `stale: true` means the
+/// index is missing shelves the caller can see and the tree cannot be
+/// trusted as complete. Either side being unavailable degrades to nulls —
+/// never to a silent claim of completeness.
+fn index_coverage_payload(indexed_shelves: Option<usize>, live_shelves: Option<i64>) -> Value {
+    let stale = match (indexed_shelves, live_shelves) {
+        (Some(indexed), Some(live)) => Some((indexed as i64) < live),
+        _ => None,
+    };
+    let mut payload = json!({
+        "indexed_shelves": indexed_shelves,
+        "live_shelves": live_shelves,
+        "stale": stale,
+    });
+    if stale == Some(true) {
+        payload["hint"] = Value::String(
+            "The structural index is missing shelves that exist live — this tree is \
+             incomplete and books may be misfiled under Unshelved. Fall back to \
+             list_shelves + get_shelf for a trustworthy picture."
+                .to_string(),
+        );
+    }
+    payload
+}
+
 /// Require a non-empty, meaningful description when creating shelves/books/chapters.
 /// Descriptions are surfaced to AI clients in the server's structure listing on connect,
 /// so missing or placeholder descriptions actively degrade future routing decisions.
@@ -2205,8 +2243,12 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         // Directory tree (issue #69) — one-shot scoped tree from the bookstack_* index.
         tool("directory",
             "Return a scoped, depth-limited tree of BookStack content (shelves → books → chapters → pages). \
-             Reads from the internal structural index — NOT live BookStack — so it's fast (~10ms warm) and consistent with the indexer's view. \
-             Replaces the assemble-it-yourself pattern of calling list_shelves + list_books + list_chapters + list_pages. \
+             Reads from the internal structural index — NOT live BookStack — so it's fast (~10ms warm), but it is a view of the index, \
+             which can lag or miss content. Check the `index_coverage` block in the response: when `stale` is true (or unknown), the tree \
+             is incomplete — do not treat missing entries as nonexistent or `Unshelved` placement as authoritative; fall back to \
+             list_shelves + get_shelf, and never base content-placement decisions on a stale tree. \
+             A scoped lookup erroring with 'not in the structural index' likewise means unindexed, not deleted — verify via the live API. \
+             When coverage is healthy this replaces the assemble-it-yourself pattern of calling list_shelves + list_books + list_chapters + list_pages. \
              Pages are ACL-filtered against the calling token; chapters/books/shelves with no surviving pages are pruned. \
              \n\nScope: omit (or `\"all\"`) for the full tree, or pass `{\"shelf\": ID}` / `{\"book\": ID}` / `{\"chapter\": ID}` to root the walk. \
              Depth: max levels to descend (0 = roots only, omit for unbounded). \
@@ -2921,6 +2963,35 @@ mod tests {
     }
 
     // --- directory tool helpers (issue #69) ---
+
+    #[test]
+    fn index_coverage_stale_when_index_misses_live_shelves() {
+        // The issue-#152 shape: 2 shelves indexed, 17 live.
+        let p = index_coverage_payload(Some(2), Some(17));
+        assert_eq!(p["stale"], json!(true));
+        assert!(p["hint"].as_str().unwrap().contains("list_shelves"));
+    }
+
+    #[test]
+    fn index_coverage_healthy_when_index_covers_live() {
+        for indexed in [17usize, 20] {
+            let p = index_coverage_payload(Some(indexed), Some(17));
+            assert_eq!(p["stale"], json!(false), "indexed={indexed}");
+            assert!(p.get("hint").is_none());
+        }
+    }
+
+    #[test]
+    fn index_coverage_unknown_never_claims_completeness() {
+        for (indexed, live) in [(None, Some(17)), (Some(2), None), (None, None)] {
+            let p = index_coverage_payload(indexed, live);
+            assert_eq!(
+                p["stale"],
+                json!(null),
+                "{indexed:?}/{live:?} must be unknown, not false"
+            );
+        }
+    }
 
     #[test]
     fn parse_directory_scope_defaults_to_all() {
