@@ -223,7 +223,7 @@ cargo clippy
 
 ## Adding a New Tool
 
-1. Add API method to `BookStackClient` in `crates/bsmcp-server/src/bookstack.rs`
+1. Add the method to the `Backend` trait in `crates/bsmcp-common/src/backend.rs`; implement it on `BookStackClient` (`bookstack.rs`) and `LibStackClient` (`libstack.rs` — `not_available(...)` when LibStack has no counterpart)
 2. Add match arm in `execute_tool()` in `crates/bsmcp-server/src/mcp.rs`
 3. Add tool definition in `tool_definitions()` in the same file
 4. Use existing helpers: `arg_str`, `arg_i64`, `arg_i64_required`, `arg_str_default`, `format_json`

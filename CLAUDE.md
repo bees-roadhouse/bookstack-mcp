@@ -17,6 +17,13 @@ crates/
     src/chunking.rs      Markdown chunking (heading-aware, ~500 token chunks)
     src/vector.rs        BLOB↔embedding conversion, cosine similarity
     src/acl.rs           Per-page ACL resolution against BookStack permissions
+    src/backend.rs       Backend trait (the content API the dispatcher, ACL path,
+                         embedder and worker call), BackendKind/BackendConfig
+                         (BSMCP_BACKEND selection), impl for BookStackClient
+    src/bookstack.rs     BookStackClient — the BookStack implementation
+    src/libstack.rs      LibStackClient — LibStack implementation; nested
+                         collections → shelf/book/chapter by depth, UUID → i64
+                         id bridge, error-envelope translation
     src/rate_limit.rs    Token-bucket rate limiter
 
   bsmcp-db-sqlite/       SQLite backend
@@ -69,6 +76,7 @@ crates/
 - Sessions stored in `Arc<RwLock<HashMap<String, Session>>>` with 30s cleanup loop
 - Database operations go through `dyn DbBackend` / `dyn SemanticDb` / `dyn IndexDb` trait objects
 - Server selects backend at startup via `BSMCP_DB_BACKEND` env var
+- Content operations go through `Arc<dyn Backend>` (`bsmcp_common::backend`); `BSMCP_BACKEND=bookstack|libstack` picks `BookStackClient` or `LibStackClient` at startup (`BackendConfig::from_env`), and `AppState::backend_client` mints one per session
 
 **Semantic search flow:**
 
@@ -97,7 +105,9 @@ Both `rerank` and `precision` modes require `BSMCP_RERANK_PROVIDER` configured o
 All prefixed `BSMCP_`. See `.env.example` for full list. Key ones:
 
 **Server:**
-- `BSMCP_BOOKSTACK_URL` (required) — where the server dials the BookStack API; may be an internal host
+- `BSMCP_BACKEND` — `bookstack` (default) or `libstack`
+- `BSMCP_BOOKSTACK_URL` (required on bookstack) — where the server dials the BookStack API; may be an internal host
+- `BSMCP_LIBSTACK_URL` (required on libstack) / `BSMCP_LIBSTACK_PUBLIC_URL` — the same pair for LibStack
 - `BSMCP_BOOKSTACK_PUBLIC_URL` — browser-reachable BookStack URL for all human-facing links (defaults to `BSMCP_BOOKSTACK_URL`; must be set when the API URL is internal-only, or emitted links are dead)
 - `BSMCP_ENCRYPTION_KEY` (required, 32+ chars)
 - `BSMCP_DB_BACKEND` — `sqlite` (default) or `postgres`
@@ -129,7 +139,7 @@ There is no MCP write path for global settings — they must be configured via `
 
 The semantic-search status page accepts either a Bearer token (programmatic) or a settings-session cookie (browser). Unauthenticated requests get a 401 with a link to `/settings`.
 
-## Implemented Tools (59 BookStack + 3 semantic = 62)
+## Implemented Tools (59 BookStack + 3 semantic = 62; +3 collection tools on LibStack)
 
 - **search_content** - Full-text search with BookStack query operators
 - **semantic_search** - Natural language vector search (when semantic enabled)
@@ -161,7 +171,7 @@ The semantic-search status page accepts either a Bearer token (programmatic) or 
 
 ## Adding a New Tool
 
-1. **bookstack.rs** - Add the API method(s) to `BookStackClient`
+1. **backend.rs** - Add the method to the `Backend` trait; implement it on `BookStackClient` (bookstack.rs, delegating to an inherent method) and on `LibStackClient` (libstack.rs — or return `not_available` if LibStack has no counterpart)
 2. **mcp.rs** - Add match arm in `execute_tool()`, add tool def in `tool_definitions()`, update the `tools_list_*` test set
 3. Use existing helpers: `arg_str`, `arg_i64`, `arg_i64_required`, `arg_str_default`, `filter_update_fields`, `format_json`
 

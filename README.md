@@ -13,6 +13,7 @@ An MCP (Model Context Protocol) server that gives Claude full access to a [BookS
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI, Voyage)
 - **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by `semantic_search`'s `rerank: true` flag (refinement on the standard mode) + `mode: "precision"` (cascade), and by `search_content`'s `rerank: true` flag (v0.13.0).
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
+- **LibStack backend (v0.14.0)** — `BSMCP_BACKEND=libstack` points the same 59 tools at a [LibStack](https://github.com/bees-roadhouse/libstack) instance; shelves/books/chapters become a view over nested collections and three `*_collection` tools expose the real tree ([see below](#libstack-backend))
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](#uploading-local-files-images--attachments))
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
@@ -67,6 +68,8 @@ The MCP server handles all client-facing protocol, OAuth, and search. The embedd
 | **Roles** | `list_roles`, `get_role` |
 
 Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack tools.
+
+With `BSMCP_BACKEND=libstack` the same 59 names stay and three more appear — `list_collections`, `get_collection`, `create_collection` — see [LibStack backend](#libstack-backend).
 
 The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface were removed in v0.10.0; v0.11.0 added the optional cross-encoder reranker on the embedder side; v0.13.0 (current) refactors that reranker from a third `semantic_search` mode into a flag on both `semantic_search` and `search_content` (breaking — see the v0.12 → v0.13 migration below). See the migration notes below.
 
@@ -124,8 +127,11 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BSMCP_BOOKSTACK_URL` | Yes | - | BookStack URL the server dials the API on. May be an internal host (Docker service name, private IP). |
+| `BSMCP_BACKEND` | No | `bookstack` | Content backend: `bookstack` or `libstack`. Selects which URL pair below is read and which client every session gets. See [LibStack backend](#libstack-backend). |
+| `BSMCP_BOOKSTACK_URL` | If bookstack | - | BookStack URL the server dials the API on. May be an internal host (Docker service name, private IP). |
 | `BSMCP_BOOKSTACK_PUBLIC_URL` | No | `BSMCP_BOOKSTACK_URL` | Browser-reachable BookStack URL, used for every link shown to a human. **Set this whenever `BSMCP_BOOKSTACK_URL` is an internal host** — the failure is silent: everything works, but users get links they can't open. |
+| `BSMCP_LIBSTACK_URL` | If libstack | - | LibStack URL the server dials `/api` on. May be an internal host. |
+| `BSMCP_LIBSTACK_PUBLIC_URL` | No | `BSMCP_LIBSTACK_URL` | Browser-reachable LibStack URL for every link shown to a human (`/p/{id}`, `/c/{id}`). |
 | `BSMCP_ENCRYPTION_KEY` | Yes | - | 32+ char key for AES-256-GCM token encryption |
 | `BSMCP_DB_BACKEND` | No | `sqlite` | Database backend: `sqlite` or `postgres` |
 | `BSMCP_DATABASE_URL` | If postgres | - | PostgreSQL connection string |
@@ -192,7 +198,7 @@ Read when the embedder is running with `--role=worker` or `--role=both`. The wor
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BSMCP_BOOKSTACK_URL` | Yes | - | Same as server |
+| `BSMCP_BACKEND` / `BSMCP_BOOKSTACK_URL` / `BSMCP_LIBSTACK_URL` | Yes | - | Same as server — the worker and embedder walk whichever backend the server fronts |
 | `BSMCP_ENCRYPTION_KEY` | Yes | - | Must match the server's (the DB layer initializes its encryption context on every connection) |
 | `BSMCP_INDEX_TOKEN_ID` | Yes* | - | Admin BookStack API token ID for the worker. Falls back to `BSMCP_EMBED_TOKEN_ID` if unset, so single-token deployments don't have to duplicate creds. |
 | `BSMCP_INDEX_TOKEN_SECRET` | Yes* | - | Admin BookStack API token secret. Falls back to `BSMCP_EMBED_TOKEN_SECRET`. |
@@ -266,6 +272,51 @@ The cross-encoder reranker is off by default. `semantic_search` (default `mode: 
 
 Per-provider config blocks are documented under [Reranker Providers](#reranker-providers).
 
+### LibStack backend
+
+Phase 1 of the LibStack migration ([design](https://kb.beesroadhouse.com/link/2507), issue #156). `BookStackClient` sits behind a `Backend` trait in `bsmcp-common`, and `LibStackClient` implements the same trait against LibStack's JSON `/api`. The dispatcher, the semantic-search ACL path, the embedder and the reconciliation worker all go through the trait, so every tool name, every connector and the semantic index keep working when the household moves off BookStack.
+
+```
+BSMCP_BACKEND=libstack
+BSMCP_LIBSTACK_URL=http://libstack:8080          # where /api is dialed
+BSMCP_LIBSTACK_PUBLIC_URL=https://libstack.example.com   # links shown to people (optional)
+```
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BSMCP_BACKEND` | No | `bookstack` | `bookstack` (unchanged behaviour) or `libstack`. |
+| `BSMCP_LIBSTACK_URL` | If libstack | - | API host. `BSMCP_BOOKSTACK_URL` is ignored on this backend. |
+| `BSMCP_LIBSTACK_PUBLIC_URL` | No | `BSMCP_LIBSTACK_URL` | Browser-reachable host for the `url` fields and the links in tool output. |
+
+**Credentials.** LibStack issues one bearer token per user (`/api/auth/tokens`). The MCP keeps its id/secret credential path (OAuth form, encrypted token store, `Authorization: Bearer id:secret`): paste the LibStack token as the **Token ID** and leave the secret blank, or send it bare as `Authorization: Bearer <token>` from Claude Code. A pair is sent as `id:secret`. The embedder and worker take theirs from `BSMCP_EMBED_TOKEN_ID` / `BSMCP_INDEX_TOKEN_ID` the same way.
+
+**Ids.** LibStack ids are UUIDs; the tool surface and the index are integer-keyed. Every UUID maps to a stable integer (its top 63 bits) and every response also carries the UUID as `libstack_id`. An integer the process has not seen in a listing is resolved by re-listing collections and pages once; an id that is still unknown fails with a message saying so (list first).
+
+**Mapping.**
+
+| BookStack tool surface | LibStack |
+|---|---|
+| Shelf | Root collection (depth 0) |
+| Book | Depth-1 collection. `create_book` needs `shelf_id` here. |
+| Chapter | Depth-2 collection. Deeper collections are chapters of the same book, named by their path from depth 2 (`Ops / Runbooks / Backups`). |
+| Page | Page. `markdown` is the body, `html` carries LibStack's `rendered_html`, `editor` is always `markdown`; `html` input is refused. |
+| `move_page`, `move_chapter`, `move_book_to_shelf`, `update_shelf.books` | `collection_id` / `parent_id` change. A collection has one parent, so `update_shelf.books` re-parents the listed books and leaves the rest. |
+| Tags | Page tags (`name` / `value`) |
+| Attachments | `/api/pages/{id}/attachments`, bytes at `/blobs/{id}`. `list_attachments` needs `page_id`; link attachments are not available. |
+| Images | Attachments whose MIME type is `image/*`. `list_images` needs `uploaded_to`; `upload_image` stores a blob and returns its `/blobs/{id}` URL. |
+| Comments | `/api/pages/{id}/comments`, markdown bodies. `list_comments` needs `page_id`. |
+| Search | `/api/search` hits mapped onto BookStack's result rows. BookStack operator tokens (`{type:page}`, `[tag=value]`) are stripped; LibStack's own grammar (quoted phrases, `-negation`, `OR`) applies. Fixed 50-hit cap, paged client-side. |
+| Users | `/api/auth/me` only — `list_users` returns the caller, `get_user` works for the caller's id. |
+| Audit log | `/api/activity` |
+| System info | `/api/health` plus the public URL |
+| `list_collections`, `get_collection`, `create_collection` | The real tree: parent, depth, path, children, pages. New on this backend. |
+
+A page that lives directly in a root collection reports that collection as its `book_id`; `get_book` accepts any collection id, and the worker's orphan sweep walks such roots as books so their pages are indexed.
+
+**Not available on LibStack** (each returns `… is not available on LibStack`, never a fake success): `get_content_permissions`, `update_content_permissions`, `list_roles`, `get_role`, `list_recycle_bin`, `restore_recycle_bin_item`, `destroy_recycle_bin_item`, `export_page`, `export_chapter`, `export_book`, `create_attachment` (link attachments). The semantic-search ACL prefilter is off on LibStack (no roles); every candidate page is checked with a live `GET /api/pages/{id}`, which LibStack's row-level security answers.
+
+**Semantic search** works unchanged: the embedder lists and reads pages through the backend, and the worker's delta walk uses `/api/pages` sorted by `updated_at` with a client-side cut (the endpoint has no filter yet). BookStack webhooks have no LibStack counterpart; the periodic delta walk is what keeps the index current.
+
 ## Connecting
 
 The MCP endpoint URL is:
@@ -330,6 +381,13 @@ The token ID and secret come from your BookStack API token (created under **My A
 ## Upgrading
 
 All schema migrations are automatic on startup (CREATE TABLE IF NOT EXISTS, ALTER TABLE for new columns). No manual SQL is needed.
+
+### From v0.13.x to v0.14.0
+
+- **New `BSMCP_BACKEND` selector (issue #156).** Default `bookstack`, behaviour unchanged. `libstack` points the server, embedder and worker at a LibStack instance via `BSMCP_LIBSTACK_URL` / `BSMCP_LIBSTACK_PUBLIC_URL` — see [LibStack backend](#libstack-backend).
+- **`create_book` accepts an optional `shelf_id`** (on BookStack the new book is added to that shelf; on LibStack it is required). **`list_attachments` accepts an optional `page_id`** (`filter[uploaded_to]` on BookStack; required on LibStack). Calls without the new argument behave exactly as before.
+- **`create_comment` / `update_comment`** still send BookStack the rendered `html`; the original `markdown` now travels alongside for backends that store it.
+- Internally `BookStackClient` is behind the `Backend` trait (`bsmcp_common::backend`); every call site that took `&BookStackClient` now takes the trait object. No wire or schema change for BookStack deployments.
 
 > **Heads up.** v0.10.0 stripped the briefing layer + per-user settings; v0.11.0 added the optional cross-encoder reranker; v0.12.x was CI/build only; v0.13.0 (current) is **breaking on two fronts** — folds `bsmcp-worker` into `bsmcp-embedder` (single image, role-selected) AND refactors the reranker surface from a third `semantic_search` mode into a `rerank: bool` flag on both `semantic_search` and `search_content`. Older entries describe functionality that no longer ships and are kept only for upgrade-path archaeology.
 
