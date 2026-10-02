@@ -1062,6 +1062,17 @@ impl BookStackClient {
         self.get("attachments", &[]).await
     }
 
+    /// Attachments of one page (`filter[uploaded_to]`). Added for the
+    /// `Backend` trait's optional page filter; the unfiltered call above is
+    /// what every existing caller still makes.
+    pub async fn list_attachments_for_page(&self, page_id: i64) -> Result<Value, String> {
+        self.get(
+            "attachments",
+            &[("filter[uploaded_to]", &page_id.to_string())],
+        )
+        .await
+    }
+
     pub async fn get_attachment(&self, id: i64) -> Result<Value, String> {
         self.get(&format!("attachments/{id}"), &[]).await
     }

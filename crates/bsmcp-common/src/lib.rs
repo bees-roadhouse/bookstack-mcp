@@ -1,9 +1,11 @@
 pub mod acl;
+pub mod backend;
 pub mod bookstack;
 pub mod chunking;
 pub mod config;
 pub mod db;
 pub mod index;
+pub mod libstack;
 pub mod logging;
 pub mod rate_limit;
 pub mod settings;

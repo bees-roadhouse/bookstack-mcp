@@ -27,7 +27,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::bookstack::{BookStackClient, ContentType};
+use crate::backend::Backend;
+use crate::bookstack::ContentType;
 use crate::db::SemanticDb;
 use crate::types::PageAcl;
 
@@ -46,7 +47,7 @@ pub struct RoleContext {
 
 /// Build the role context by fetching `/api/roles` and inspecting each role's
 /// `permissions` list. Cheap (~10 roles), safe to call once per pipeline run.
-pub async fn build_role_context(client: &BookStackClient) -> Result<RoleContext, String> {
+pub async fn build_role_context(client: &dyn Backend) -> Result<RoleContext, String> {
     let mut all_role_ids = Vec::new();
     let mut view_all_role_ids = Vec::new();
 
@@ -128,7 +129,7 @@ fn has_view_all_permission(role: &Value) -> bool {
 /// chain has overrides — these pages are flagged `default_open=true` so the
 /// query path can short-circuit role checks for them.
 pub async fn resolve_page_acl(
-    client: &BookStackClient,
+    client: &dyn Backend,
     page_id: i64,
     chapter_id: Option<i64>,
     book_id: i64,
@@ -267,7 +268,7 @@ pub struct AclReconcileOutcome {
 }
 
 pub async fn reconcile_all_pages(
-    client: &BookStackClient,
+    client: &dyn Backend,
     db: &Arc<dyn SemanticDb>,
     job_id: i64,
 ) -> Result<AclReconcileOutcome, String> {
@@ -339,7 +340,7 @@ pub async fn reconcile_all_pages(
 /// Recompute ACL for a single page. Called by the webhook handler on
 /// page/chapter/book content_permissions changes.
 pub async fn reconcile_page(
-    client: &BookStackClient,
+    client: &dyn Backend,
     db: &Arc<dyn SemanticDb>,
     page_id: i64,
     role_ctx: &RoleContext,
