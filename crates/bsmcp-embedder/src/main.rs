@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::backend::BackendConfig;
 use bsmcp_common::config::DbBackendType;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 
@@ -314,7 +314,9 @@ async fn run_worker(
     index_db: Arc<dyn IndexDb>,
     semantic_db: Arc<dyn SemanticDb>,
 ) {
-    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
+    // Content backend (issue #156): BookStack by default, LibStack with
+    // `BSMCP_BACKEND=libstack` + `BSMCP_LIBSTACK_URL`.
+    let backend = BackendConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
 
     // BookStack admin token — try BSMCP_INDEX_TOKEN_* first, fall back to
     // BSMCP_EMBED_TOKEN_*. The two-token-name pattern matches what the
@@ -331,12 +333,7 @@ async fn run_worker(
             "BSMCP_INDEX_TOKEN_SECRET (or BSMCP_EMBED_TOKEN_SECRET) is required (role=worker) — admin BookStack API token secret",
         );
 
-    let bs_client = BookStackClient::new(
-        &bookstack_url,
-        &token_id,
-        &token_secret,
-        reqwest::Client::new(),
-    );
+    let bs_client = backend.client(&token_id, &token_secret, reqwest::Client::new());
 
     let delta_interval: u64 = env::var("BSMCP_INDEX_DELTA_INTERVAL_SECONDS")
         .ok()
@@ -873,7 +870,7 @@ async fn job_queue_worker(
         .and_then(|v| v.parse().ok())
         .unwrap_or(pipeline::DEFAULT_CONSECUTIVE_ABORT);
 
-    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
+    let backend = BackendConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
     let embed_token_id =
         env::var("BSMCP_EMBED_TOKEN_ID").expect("BSMCP_EMBED_TOKEN_ID is required (role=embedder)");
     let embed_token_secret = env::var("BSMCP_EMBED_TOKEN_SECRET")
@@ -885,12 +882,7 @@ async fn job_queue_worker(
         .build()
         .expect("Failed to build HTTP client");
 
-    let client = BookStackClient::new(
-        &bookstack_url,
-        &embed_token_id,
-        &embed_token_secret,
-        http_client,
-    );
+    let client = backend.client(&embed_token_id, &embed_token_secret, http_client);
 
     tracing::info!(
         poll_interval_s = poll_interval,
@@ -985,7 +977,7 @@ async fn job_queue_worker(
                 let result = pipeline::run_pipeline(
                     &db,
                     &embedder,
-                    &client,
+                    client.as_ref(),
                     job.id,
                     &job.scope,
                     delay_ms,

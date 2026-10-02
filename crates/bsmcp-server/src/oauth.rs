@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
-use bsmcp_common::bookstack::{BookStackClient, CredentialCheck};
+use bsmcp_common::backend::{BackendConfig, BackendKind};
+use bsmcp_common::bookstack::CredentialCheck;
 use bsmcp_common::config::access_token_ttl;
 
 use crate::sse::AppState;
@@ -149,7 +150,11 @@ fn is_safe_internal_path(s: &str) -> bool {
     s.starts_with('/') && !s.starts_with("//") && !s.contains(':')
 }
 
-fn render_login_form(params: &AuthorizeParams, bookstack_url: &str, error: Option<&str>) -> String {
+fn render_login_form(
+    params: &AuthorizeParams,
+    backend: &BackendConfig,
+    error: Option<&str>,
+) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let title = if instance_name.is_empty() {
         "BookStack MCP".to_string()
@@ -191,7 +196,39 @@ fn render_login_form(params: &AuthorizeParams, bookstack_url: &str, error: Optio
         }
     }
 
-    let bs_url = html_escape(bookstack_url.trim_end_matches('/'));
+    let bs_url = html_escape(backend.public_url.trim_end_matches('/'));
+    // The form is the same for both backends; the words differ. A LibStack
+    // token is one string, pasted as the Token ID with the secret left blank
+    // (see `LibStackClient::bearer_from_pair`).
+    let (subtitle, secret_required, steps) = match backend.kind {
+        BackendKind::BookStack => (
+            "Enter your BookStack API token to connect Claude.",
+            "required",
+            format!(
+                r#"<strong>How to create an API token:</strong>
+    <ol>
+      <li>Click your profile avatar (top-right) and select <a href="{bs_url}/my-account" target="_blank"><strong>My Account</strong></a></li>
+      <li>Click <strong>Access &amp; Security</strong> in the left sidebar</li>
+      <li>Scroll down to <strong>API Tokens</strong> and click <strong>Create Token</strong></li>
+      <li>Give it a name (e.g. &ldquo;Claude&rdquo;) and save</li>
+      <li><strong>Save the Token ID and Token Secret in your password manager</strong> &mdash; BookStack only shows the secret once</li>
+      <li>Paste them into the fields above</li>
+    </ol>"#
+            ),
+        ),
+        BackendKind::LibStack => (
+            "Enter your LibStack API token to connect Claude.",
+            "",
+            format!(
+                r#"<strong>How to create an API token:</strong>
+    <ol>
+      <li>Open <a href="{bs_url}/account" target="_blank"><strong>Account</strong></a> in LibStack and create an API token</li>
+      <li>Paste the token into <strong>Token ID</strong>; leave <strong>Token Secret</strong> blank (a LibStack token is a single string)</li>
+      <li>LibStack shows the token once &mdash; save it in your password manager</li>
+    </ol>"#
+            ),
+        ),
+    };
 
     format!(
         r##"<!DOCTYPE html>
@@ -221,33 +258,27 @@ button:hover {{ background: #3498db; }}
 <body>
 <div class="card">
   <h1>{title}</h1>
-  <p class="subtitle">Enter your BookStack API token to connect Claude.</p>
+  <p class="subtitle">{subtitle}</p>
   {error_html}
   <form method="POST" action="/authorize">
     {hidden_fields}
     <label for="token_id">Token ID</label>
     <input type="text" id="token_id" name="token_id" required autocomplete="off" placeholder="e.g. abc123...">
     <label for="token_secret">Token Secret</label>
-    <input type="password" id="token_secret" name="token_secret" required autocomplete="off" placeholder="e.g. xyz789...">
+    <input type="password" id="token_secret" name="token_secret" {secret_required} autocomplete="off" placeholder="e.g. xyz789...">
     <button type="submit">Connect</button>
   </form>
   <div class="steps">
-    <strong>How to create an API token:</strong>
-    <ol>
-      <li>Click your profile avatar (top-right) and select <a href="{bs_url}/my-account" target="_blank"><strong>My Account</strong></a></li>
-      <li>Click <strong>Access &amp; Security</strong> in the left sidebar</li>
-      <li>Scroll down to <strong>API Tokens</strong> and click <strong>Create Token</strong></li>
-      <li>Give it a name (e.g. &ldquo;Claude&rdquo;) and save</li>
-      <li><strong>Save the Token ID and Token Secret in your password manager</strong> &mdash; BookStack only shows the secret once</li>
-      <li>Paste them into the fields above</li>
-    </ol>
+    {steps}
   </div>
 </div>
 </body>
 </html>"##,
         title = title,
+        subtitle = subtitle,
         error_html = error_html,
-        bs_url = bs_url,
+        secret_required = secret_required,
+        steps = steps,
         hidden_fields = hidden_fields.join("\n    "),
     )
 }
@@ -307,7 +338,7 @@ pub async fn handle_authorize(
             );
         }
     }
-    Html(render_login_form(&params, &state.bookstack_url, None)).into_response()
+    Html(render_login_form(&params, &state.backend, None)).into_response()
 }
 
 pub async fn handle_authorize_submit(
@@ -339,13 +370,8 @@ pub async fn handle_authorize_submit(
         );
     }
 
-    let bs_client = BookStackClient::new(
-        &state.bookstack_url,
-        &form.token_id,
-        &form.token_secret,
-        state.http_client.clone(),
-    );
-    // Don't blame the pasted token when BookStack simply couldn't answer —
+    let bs_client = state.backend_client(&form.token_id, &form.token_secret);
+    // Don't blame the pasted token when the backend simply couldn't answer —
     // the user would rotate a perfectly good API token chasing it (#139).
     let form_error = match bs_client.validate().await {
         CredentialCheck::Valid => None,
@@ -355,7 +381,7 @@ pub async fn handle_authorize_submit(
         }
         CredentialCheck::Unavailable(e) => {
             tracing::warn!(error = %e, "oauth_credential_validation_unavailable");
-            Some("Couldn't reach BookStack to check that token. Try again in a moment.")
+            Some("Couldn't reach the knowledge base to check that token. Try again in a moment.")
         }
     };
     if let Some(msg) = form_error {
@@ -368,7 +394,7 @@ pub async fn handle_authorize_submit(
             code_challenge_method: form.code_challenge_method.clone(),
             return_to: form.return_to.clone(),
         };
-        return Html(render_login_form(&params, &state.bookstack_url, Some(msg))).into_response();
+        return Html(render_login_form(&params, &state.backend, Some(msg))).into_response();
     }
 
     // Browser settings flow: skip the OAuth code dance entirely. Issue a settings
@@ -559,12 +585,7 @@ async fn handle_token_authorization_code(
             );
         }
 
-        let bs_client = BookStackClient::new(
-            &state.bookstack_url,
-            &client_id,
-            &client_secret,
-            state.http_client.clone(),
-        );
+        let bs_client = state.backend_client(&client_id, &client_secret);
         match bs_client.validate().await {
             CredentialCheck::Valid => {}
             CredentialCheck::Rejected(e) => {
@@ -624,12 +645,7 @@ async fn handle_token_refresh(state: AppState, form: TokenForm) -> Response {
     };
 
     // Validate the stored BookStack credentials are still valid
-    let bs_client = BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    );
+    let bs_client = state.backend_client(&token_id, &token_secret);
     match bs_client.validate().await {
         CredentialCheck::Valid => {}
         CredentialCheck::Rejected(e) => {

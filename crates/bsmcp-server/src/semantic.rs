@@ -11,7 +11,7 @@ use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::backend::Backend;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::settings::{hash_token_id, CascadeMultipliers, GlobalSettings};
 use bsmcp_common::types::{AclPrefilter, MarkovBlanket, ScopeFilter};
@@ -323,7 +323,7 @@ impl SemanticState {
         self: &Arc<Self>,
         token_hash: &str,
         page_id: i64,
-        client: BookStackClient,
+        client: Arc<dyn Backend>,
     ) -> bool {
         let key = (token_hash.to_string(), page_id);
         let (fut, is_owner) = {
@@ -386,7 +386,7 @@ impl SemanticState {
     /// Concurrency cap per kick: [`ACL_RECOMPUTE_HTTP_CONCURRENCY`].
     pub(crate) async fn kick_background_acl_recompute(
         self: &Arc<Self>,
-        client: &BookStackClient,
+        client: &Arc<dyn Backend>,
         uncomputed_page_ids: Vec<i64>,
     ) {
         if uncomputed_page_ids.is_empty() {
@@ -461,8 +461,13 @@ impl SemanticState {
                     let client = client_for_stream.clone();
                     let role_ctx = role_ctx_for_stream.clone();
                     async move {
-                        if let Err(e) =
-                            bsmcp_common::acl::reconcile_page(&client, &me.db, pid, &role_ctx).await
+                        if let Err(e) = bsmcp_common::acl::reconcile_page(
+                            client.as_ref(),
+                            &me.db,
+                            pid,
+                            &role_ctx,
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 target: "acl_filter",
@@ -497,7 +502,7 @@ impl SemanticState {
     /// the context doesn't change between callers.
     async fn role_context(
         &self,
-        client: &BookStackClient,
+        client: &Arc<dyn Backend>,
     ) -> Option<bsmcp_common::acl::RoleContext> {
         {
             let read = self.role_ctx_cache.read().await;
@@ -507,7 +512,7 @@ impl SemanticState {
                 }
             }
         }
-        match bsmcp_common::acl::build_role_context(client).await {
+        match bsmcp_common::acl::build_role_context(client.as_ref()).await {
             Ok(ctx) => {
                 let mut write = self.role_ctx_cache.write().await;
                 *write = Some(CachedRoleContext {
@@ -533,7 +538,7 @@ impl SemanticState {
     /// case the prefilter is bypassed — every page falls through to HTTP.
     async fn resolve_caller_role_ids(
         &self,
-        client: &BookStackClient,
+        client: &Arc<dyn Backend>,
         token_hash: &str,
     ) -> Option<Vec<i64>> {
         {
@@ -796,7 +801,7 @@ impl SemanticState {
     async fn filter_by_permission(
         self: &Arc<Self>,
         page_ids: &[i64],
-        client: &BookStackClient,
+        client: &Arc<dyn Backend>,
     ) -> Vec<i64> {
         let token_hash = hash_token_id(client.token_id());
         let now = Instant::now();
@@ -1060,7 +1065,7 @@ impl SemanticState {
         threshold: f32,
         hybrid: bool,
         verbose: bool,
-        client: &BookStackClient,
+        client: &Arc<dyn Backend>,
         scope: Option<&ScopeFilter>,
         mode: SearchMode,
         rerank: bool,
@@ -1792,7 +1797,7 @@ impl SemanticState {
         limit: usize,
         threshold: f32,
         verbose: bool,
-        client: &BookStackClient,
+        client: &Arc<dyn Backend>,
         scope: Option<&ScopeFilter>,
         start: Instant,
     ) -> Result<Value, String> {
@@ -2857,6 +2862,7 @@ mod acl_fanout_tests {
     //! prefilter, reactive recompute, and coalesced HTTP fallback.
 
     use super::*;
+    use bsmcp_common::bookstack::BookStackClient;
     use bsmcp_db_sqlite::SqliteDb;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -3030,7 +3036,12 @@ mod acl_fanout_tests {
     async fn filter_by_permission_caches_hits() {
         let (base, counter) = mock_bookstack(vec![1, 2]).await;
         let state = make_state("counters", "http://unused".to_string()).await;
-        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
 
         let ids = vec![1i64, 2, 3];
         let r1 = state.filter_by_permission(&ids, &client).await;
@@ -3178,7 +3189,12 @@ mod acl_fanout_tests {
             "http://unused".to_string(),
             "test-webhook-secret-16chars".to_string(),
         ));
-        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
 
         let accessible = state.filter_by_permission(&[1, 2, 3, 4, 5], &client).await;
         let mut sorted = accessible;
@@ -3229,12 +3245,12 @@ mod acl_fanout_tests {
         // Use a BookStack base that returns 404 on list_roles so role-context
         // build fails; the spawned task short-circuits and releases the slots.
         // We don't care about the failure — we care about the dedup logic.
-        let client = BookStackClient::new(
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
             "http://127.0.0.1:1",
             "tid",
             "tsecret",
             reqwest::Client::new(),
-        );
+        ));
 
         // Block the inflight cleanup by pre-stuffing the set: simulate a
         // long-running first kick by manually holding the 3 page IDs as
@@ -3283,12 +3299,12 @@ mod acl_fanout_tests {
             "http://unused".to_string(),
             "test-webhook-secret-16chars".to_string(),
         ));
-        let client = BookStackClient::new(
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
             "http://127.0.0.1:1",
             "tid",
             "tsecret",
             reqwest::Client::new(),
-        );
+        ));
 
         // Stuff the in-flight set up to the cap.
         {
@@ -3355,7 +3371,12 @@ mod acl_fanout_tests {
         let base = format!("http://{addr}");
 
         let state = make_state("coalesce", "http://unused".to_string()).await;
-        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
 
         let s1 = state.clone();
         let c1 = client.clone();
@@ -3407,7 +3428,12 @@ mod acl_fanout_tests {
         });
         let base = format!("http://{addr}");
         let state = make_state("timeout", "http://unused".to_string()).await;
-        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
         let token_hash = hash_token_id(client.token_id());
 
         let started = Instant::now();
@@ -3448,7 +3474,12 @@ mod acl_fanout_tests {
                 "http://unused".to_string(),
                 "test-webhook-secret-16chars".to_string(),
             ));
-            let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+            let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+                &base,
+                "tid",
+                "tsecret",
+                reqwest::Client::new(),
+            ));
             let r = state.filter_by_permission(&[10i64, 11, 12], &client).await;
             let mut sorted = r;
             sorted.sort();
@@ -3474,7 +3505,12 @@ mod acl_fanout_tests {
                 "http://unused".to_string(),
                 "test-webhook-secret-16chars".to_string(),
             ));
-            let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+            let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+                &base,
+                "tid",
+                "tsecret",
+                reqwest::Client::new(),
+            ));
             let r = state.filter_by_permission(&[10i64, 11, 12], &client).await;
             let mut sorted = r;
             sorted.sort();

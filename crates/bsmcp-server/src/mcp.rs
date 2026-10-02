@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 use pulldown_cmark::{html, Options, Parser};
 
 use crate::semantic::{trim_match, SearchMode, SemanticState};
-use bsmcp_common::bookstack::{self, BookStackClient, ContentType, ExportFormat};
+use bsmcp_common::backend::{Backend, BackendKind};
+use bsmcp_common::bookstack::{self, ContentType, ExportFormat};
 use bsmcp_common::db::IndexDb;
 use bsmcp_common::index::{DirectoryNode, DirectoryNodeKind, DirectoryScope};
 use bsmcp_common::time::TimezoneConfig;
@@ -18,7 +19,7 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 
 pub async fn handle_request(
     request: &Value,
-    client: &BookStackClient,
+    client: &Arc<dyn Backend>,
     semantic: Option<&Arc<SemanticState>>,
     index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
@@ -42,7 +43,7 @@ pub async fn handle_request(
 
     match method {
         "initialize" => {
-            let instructions = build_instructions(client, semantic.is_some()).await;
+            let instructions = build_instructions(client.as_ref(), semantic.is_some()).await;
             Some(json_rpc_result(
                 id,
                 json!({
@@ -59,7 +60,7 @@ pub async fn handle_request(
         "notifications/initialized" => None,
         "tools/list" => Some(json_rpc_result(
             id,
-            json!({ "tools": tool_definitions(semantic.is_some()) }),
+            json!({ "tools": tool_definitions(semantic.is_some(), client.kind()) }),
         )),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
@@ -110,7 +111,7 @@ fn json_rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
 async fn execute_tool(
     name: &str,
     args: &Value,
-    client: &BookStackClient,
+    client: &Arc<dyn Backend>,
     semantic: Option<&Arc<SemanticState>>,
     index_db: &dyn IndexDb,
     staging: &crate::staging::StagingStore,
@@ -373,7 +374,10 @@ async fn execute_tool(
         "create_book" => {
             let name = arg_str(args, "name")?;
             let desc = require_description(args, "book")?;
-            let result = client.create_book(&name, &desc).await?;
+            // `shelf_id` is optional on BookStack and required on LibStack
+            // (a book is a collection inside a shelf). See `Backend::create_book`.
+            let shelf_id = arg_i64_opt(args, "shelf_id");
+            let result = client.create_book(&name, &desc, shelf_id).await?;
             Ok(format_book_success(
                 "Book created successfully.",
                 &result,
@@ -554,7 +558,7 @@ async fn execute_tool(
                 .unwrap_or(false);
 
             // Fetch page in its native format
-            let (editor, native_content) = get_page_content(client, id).await?;
+            let (editor, native_content) = get_page_content(client.as_ref(), id).await?;
 
             // Validate old_text exists in native content
             let count = native_content.matches(old_text).count();
@@ -590,7 +594,7 @@ async fn execute_tool(
                 .get("markdown")
                 .and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
-            let (editor, existing) = get_page_content(client, id).await?;
+            let (editor, existing) = get_page_content(client.as_ref(), id).await?;
 
             let data = if editor == "markdown" {
                 let updated = format!("{}\n\n{}", existing.trim_end(), content);
@@ -617,7 +621,7 @@ async fn execute_tool(
                 .get("markdown")
                 .and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
-            let (editor, existing) = get_page_content(client, id).await?;
+            let (editor, existing) = get_page_content(client.as_ref(), id).await?;
 
             let data = if editor == "markdown" {
                 let updated = replace_section_markdown(&existing, heading, content, id)?;
@@ -644,7 +648,7 @@ async fn execute_tool(
                 .get("markdown")
                 .and_then(|v| v.as_str())
                 .ok_or("markdown is required")?;
-            let (editor, existing) = get_page_content(client, id).await?;
+            let (editor, existing) = get_page_content(client.as_ref(), id).await?;
 
             // Find the anchor — match by line content (trimmed)
             let lines: Vec<&str> = existing.lines().collect();
@@ -779,7 +783,15 @@ async fn execute_tool(
         }
 
         // Attachments
-        "list_attachments" => format_json(&client.list_attachments().await?),
+        "list_attachments" => {
+            // Optional page filter; LibStack stores attachments per page and
+            // requires it, BookStack lists everything without it.
+            format_json(
+                &client
+                    .list_attachments(arg_i64_opt(args, "page_id"))
+                    .await?,
+            )
+        }
         "get_attachment" => {
             let id = arg_i64_required(args, "attachment_id")?;
             format_json(&client.get_attachment(id).await?)
@@ -877,7 +889,10 @@ async fn execute_tool(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
+                // Both forms travel: BookStack takes the html (and drops the
+                // markdown key), LibStack stores the markdown.
                 data["html"] = json!(markdown_to_html(md));
+                data["markdown"] = json!(md);
             } else if let Some(v) = args
                 .get("html")
                 .and_then(|v| v.as_str())
@@ -899,6 +914,7 @@ async fn execute_tool(
                 .filter(|s| !s.is_empty())
             {
                 data["html"] = json!(markdown_to_html(md));
+                data["markdown"] = json!(md);
             } else if let Some(v) = args
                 .get("html")
                 .and_then(|v| v.as_str())
@@ -1029,7 +1045,7 @@ async fn execute_tool(
                 let alt_text = result.get("name").and_then(|v| v.as_str()).unwrap_or(&name);
                 let img_markdown = format!("![{}]({})", alt_text, display_url);
 
-                let (editor, existing) = get_page_content(client, uploaded_to).await?;
+                let (editor, existing) = get_page_content(client.as_ref(), uploaded_to).await?;
                 let data = if editor == "markdown" {
                     let updated = format!("{}\n\n{}", existing.trim_end(), img_markdown);
                     json!({ "markdown": updated })
@@ -1109,6 +1125,20 @@ async fn execute_tool(
         "get_role" => {
             let id = arg_i64_required(args, "role_id")?;
             format_json(&client.get_role(id).await?)
+        }
+
+        // Collections (issue #156) — the real LibStack tree behind the
+        // shelf/book/chapter view. BookStack answers "not available".
+        "list_collections" => format_json(&client.list_collections().await?),
+        "get_collection" => {
+            let id = arg_i64_required(args, "collection_id")?;
+            format_json(&client.get_collection(id).await?)
+        }
+        "create_collection" => {
+            let name = arg_str(args, "name")?;
+            let desc = require_description(args, "collection")?;
+            let parent_id = arg_i64_opt(args, "parent_id");
+            format_json(&client.create_collection(parent_id, &name, &desc).await?)
         }
 
         _ => Err(format!("Unknown tool: {name}")),
@@ -1398,7 +1428,7 @@ fn directory_node_to_json(node: &DirectoryNode) -> Value {
 /// asked us not to walk them, not because the content is hidden.
 async fn filter_directory_tree_by_acl(
     tree: Vec<DirectoryNode>,
-    client: &BookStackClient,
+    client: &Arc<dyn Backend>,
 ) -> Vec<DirectoryNode> {
     let mut page_ids: Vec<i64> = Vec::new();
     collect_page_ids(&tree, &mut page_ids);
@@ -1656,7 +1686,7 @@ fn markdown_to_html(md: &str) -> String {
 /// Fetch page and return (editor_type, native_content).
 /// For markdown pages: returns ("markdown", markdown_source).
 /// For WYSIWYG pages: returns ("wysiwyg", html_content).
-async fn get_page_content(client: &BookStackClient, id: i64) -> Result<(String, String), String> {
+async fn get_page_content(client: &dyn Backend, id: i64) -> Result<(String, String), String> {
     let page = client.get_page(id).await?;
     let editor = page.get("editor").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -1722,7 +1752,10 @@ fn format_shelf_success(action: &str, result: &Value, public_url: &str) -> Strin
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let url = format!("{public_url}/shelves/{slug}");
+    let url = match result.get("url").and_then(|v| v.as_str()) {
+        Some(rel) => join_base_url(public_url, rel),
+        None => format!("{public_url}/shelves/{slug}"),
+    };
     let desc_line = if desc.is_empty() {
         String::new()
     } else {
@@ -1740,7 +1773,10 @@ fn format_book_success(action: &str, result: &Value, public_url: &str) -> String
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let url = format!("{public_url}/books/{slug}");
+    let url = match result.get("url").and_then(|v| v.as_str()) {
+        Some(rel) => join_base_url(public_url, rel),
+        None => format!("{public_url}/books/{slug}"),
+    };
     let desc_line = if desc.is_empty() {
         String::new()
     } else {
@@ -1763,7 +1799,9 @@ fn format_chapter_success(action: &str, result: &Value, public_url: &str) -> Str
         .get("book_slug")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let url = if !book_slug.is_empty() && !slug.is_empty() {
+    let url = if let Some(rel) = result.get("url").and_then(|v| v.as_str()) {
+        join_base_url(public_url, rel)
+    } else if !book_slug.is_empty() && !slug.is_empty() {
         format!("{public_url}/books/{book_slug}/chapter/{slug}")
     } else {
         String::new()
@@ -1908,7 +1946,7 @@ fn replace_section_html(
 
 // --- Dynamic instructions (sent on initialize) ---
 
-async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) -> String {
+async fn build_instructions(client: &dyn Backend, semantic_enabled: bool) -> String {
     let instance_name = env::var("BSMCP_INSTANCE_NAME").unwrap_or_default();
     let instance_desc = env::var("BSMCP_INSTANCE_DESC").unwrap_or_default();
 
@@ -1922,10 +1960,21 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
         instructions.push_str("\n\n");
     }
 
-    instructions.push_str(
-        "BookStack knowledge management server. Content is organized as: \
-         Shelves > Books > Chapters > Pages. ",
-    );
+    match client.kind() {
+        BackendKind::BookStack => instructions.push_str(
+            "BookStack knowledge management server. Content is organized as: \
+             Shelves > Books > Chapters > Pages. ",
+        ),
+        BackendKind::LibStack => instructions.push_str(
+            "LibStack knowledge management server, presented through the BookStack tool set. \
+             Content is nested collections of pages; through these tools a root collection is a \
+             Shelf, a collection inside it is a Book, and any deeper collection is a Chapter of \
+             that book (named by its path, e.g. 'Ops / Runbooks'). list_collections, \
+             get_collection and create_collection show and extend the real tree. Pages are \
+             markdown only: pass `markdown`, never `html`. Content permissions, roles, the \
+             recycle bin and exports are not available here and say so. ",
+        ),
+    }
 
     if semantic_enabled {
         instructions.push_str(
@@ -1997,15 +2046,24 @@ async fn build_instructions(client: &BookStackClient, semantic_enabled: bool) ->
     // BSMCP_PUBLIC_DOMAIN, which is the MCP server's own domain for OAuth.
     let public_url = client.public_url();
     if !public_url.is_empty() {
-        instructions.push_str(&format!(
-            "BookStack URL: {public_url}\n\
-             When you create or update a page, present a clickable link to the user so they can \
-             review it. Page URLs follow the pattern: {public_url}/books/{{book_slug}}/page/{{page_slug}}\n\
-             The slug is returned in the API response. For other content types:\n\
-             - Books: {public_url}/books/{{slug}}\n\
-             - Chapters: {public_url}/books/{{book_slug}}/chapter/{{slug}}\n\
-             - Shelves: {public_url}/shelves/{{slug}}\n\n"
-        ));
+        match client.kind() {
+            BackendKind::BookStack => instructions.push_str(&format!(
+                "BookStack URL: {public_url}\n\
+                 When you create or update a page, present a clickable link to the user so they can \
+                 review it. Page URLs follow the pattern: {public_url}/books/{{book_slug}}/page/{{page_slug}}\n\
+                 The slug is returned in the API response. For other content types:\n\
+                 - Books: {public_url}/books/{{slug}}\n\
+                 - Chapters: {public_url}/books/{{book_slug}}/chapter/{{slug}}\n\
+                 - Shelves: {public_url}/shelves/{{slug}}\n\n"
+            )),
+            BackendKind::LibStack => instructions.push_str(&format!(
+                "LibStack URL: {public_url}\n\
+                 When you create or update a page, present a clickable link to the user so they can \
+                 review it. Every response carries a `url` field: pages are {public_url}/p/{{libstack_id}} \
+                 and shelves, books and chapters (all collections) are {public_url}/c/{{libstack_id}}. \
+                 Numeric ids are what the tools take; `libstack_id` is the UUID LibStack itself uses.\n\n"
+            )),
+        }
     }
 
     match build_structure(client).await {
@@ -2114,7 +2172,7 @@ fn store_structure(key: &str, structure: &str, ttl: Duration) {
     guard.insert(key.to_string(), (Instant::now(), structure.to_string()));
 }
 
-async fn build_structure(client: &BookStackClient) -> Option<String> {
+async fn build_structure(client: &dyn Backend) -> Option<String> {
     let ttl = structure_cache_ttl();
     let key = structure_cache_key(client.base_url(), client.token_id());
 
@@ -2128,7 +2186,7 @@ async fn build_structure(client: &BookStackClient) -> Option<String> {
     Some(sweep.text)
 }
 
-async fn build_structure_uncached(client: &BookStackClient) -> Option<StructureSweep> {
+async fn build_structure_uncached(client: &dyn Backend) -> Option<StructureSweep> {
     let shelves = client.list_shelves(500, 0).await.ok()?;
     let shelf_list = shelves["data"].as_array()?;
 
@@ -2220,7 +2278,7 @@ async fn build_structure_uncached(client: &BookStackClient) -> Option<StructureS
 
 // --- Tool definitions ---
 
-pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
+pub fn tool_definitions(semantic_enabled: bool, backend: BackendKind) -> Vec<Value> {
     let mut tools = vec![
         tool("search_content",
             "Search across all BookStack content (pages, chapters, books, shelves). Supports operators: {type:page}, [tag_name=value], {in_name:term}, {created_by:me}, exact match with quotes. \
@@ -2299,7 +2357,18 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("list_books", "List all books.", paginated_schema()),
         tool("get_book", "Get a book by ID, including its chapters and pages.",
             id_schema("book_id")),
-        tool("create_book", "Create a new book.", name_desc_schema()),
+        tool("create_book", "Create a new book. `shelf_id` places it on a shelf (optional on BookStack, required on LibStack where a book is a collection inside a shelf).", json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Name" },
+                "description": {
+                    "type": "string",
+                    "description": "REQUIRED. 1-2 sentences on what this book is for. No placeholders."
+                },
+                "shelf_id": { "type": "integer", "description": "Shelf to place the book on. Optional on BookStack; required on LibStack." }
+            },
+            "required": ["name", "description"]
+        })),
         tool("update_book", "Update a book.",
             update_schema("book_id", &["name", "description"])),
         tool("delete_book", "Delete a book and all its chapters/pages.",
@@ -2429,8 +2498,11 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         })),
 
         // Attachments
-        tool("list_attachments", "List all attachments.", json!({
-            "type": "object", "properties": {}
+        tool("list_attachments", "List attachments, optionally for one page. On LibStack page_id is required (attachments are stored per page).", json!({
+            "type": "object",
+            "properties": {
+                "page_id": { "type": "integer", "description": "Only attachments uploaded to this page. Required on LibStack." }
+            }
         })),
         tool("get_attachment", "Get an attachment by ID, including its content or download link.",
             id_schema("attachment_id")),
@@ -2608,6 +2680,31 @@ pub fn tool_definitions(semantic_enabled: bool) -> Vec<Value> {
         tool("get_role", "Get a role by ID, including its permissions.",
             id_schema("role_id")),
     ];
+
+    if backend == BackendKind::LibStack {
+        // The real tree (issue #156). Shelves/books/chapters are a depth
+        // view over it; these three tools show and extend it directly.
+        tools.push(tool("list_collections",
+            "List every collection in the active LibStack org with its parent, depth, full path and how it appears through the shelf/book/chapter tools (`appears_as`).",
+            json!({ "type": "object", "properties": {} })));
+        tools.push(tool("get_collection",
+            "Get one LibStack collection by numeric id: parent, depth, path, child collections and the pages directly inside it.",
+            id_schema("collection_id")));
+        tools.push(tool("create_collection",
+            "Create a LibStack collection at any depth. Omit parent_id for a root collection (a shelf); pass a parent to nest it (a book under a shelf, a chapter under a book, or deeper).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Collection name" },
+                    "description": {
+                        "type": "string",
+                        "description": "REQUIRED. 1-2 sentences on what this collection is for. No placeholders."
+                    },
+                    "parent_id": { "type": "integer", "description": "Parent collection id. Omit for a root collection." }
+                },
+                "required": ["name", "description"]
+            })));
+    }
 
     if semantic_enabled {
         tools.push(tool("semantic_search",
@@ -2858,7 +2955,7 @@ mod tests {
     /// briefing-era surface leaked back in.
     #[test]
     fn tools_list_count_is_63_with_semantic() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, BackendKind::BookStack);
         assert_eq!(
             tools.len(),
             63,
@@ -2868,15 +2965,45 @@ mod tests {
 
     #[test]
     fn tools_list_count_is_60_without_semantic() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, BackendKind::BookStack);
         assert_eq!(tools.len(), 60, "expected 59 CRUD + 1 directory = 60 tools");
+    }
+
+    /// Issue #156: LibStack keeps every BookStack tool name and adds the
+    /// three collection tools — nothing else.
+    #[test]
+    fn libstack_tools_list_is_the_bookstack_set_plus_three_collection_tools() {
+        let bs: HashSet<String> = tool_definitions(true, BackendKind::BookStack)
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        let ls: HashSet<String> = tool_definitions(true, BackendKind::LibStack)
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            ls.len(),
+            66,
+            "59 CRUD + 1 directory + 3 semantic + 3 collection"
+        );
+        let mut extra: Vec<&String> = ls.difference(&bs).collect();
+        extra.sort();
+        assert_eq!(
+            extra,
+            vec!["create_collection", "get_collection", "list_collections"]
+        );
+        assert!(
+            bs.difference(&ls).next().is_none(),
+            "no BookStack tool may vanish on LibStack"
+        );
+        assert_eq!(tool_definitions(false, BackendKind::LibStack).len(), 63);
     }
 
     /// Locks the precise tool name set so a briefing/session/dismiss-style
     /// addition trips this assertion before it ships.
     #[test]
     fn tools_list_names_match_expected_set() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, BackendKind::BookStack);
         let names: HashSet<String> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
@@ -3352,7 +3479,7 @@ mod tests {
     /// the scope params. Locks that they're advertised correctly.
     #[test]
     fn semantic_search_schema_advertises_scope_params() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, BackendKind::BookStack);
         let sem = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("semantic_search"))
@@ -3406,7 +3533,7 @@ mod tests {
     /// flag. Same shape as on `semantic_search` (boolean, default false).
     #[test]
     fn search_content_schema_advertises_rerank_flag() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, BackendKind::BookStack);
         let sc = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("search_content"))
@@ -3461,3 +3588,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_libstack_tests.rs"]
+mod libstack_tests;

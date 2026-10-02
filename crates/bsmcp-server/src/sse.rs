@@ -16,7 +16,8 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use zeroize::Zeroize;
 
-use bsmcp_common::bookstack::{BookStackClient, CredentialCheck};
+use bsmcp_common::backend::{Backend, BackendConfig, BackendKind};
+use bsmcp_common::bookstack::CredentialCheck;
 use bsmcp_common::db::DbBackend;
 use bsmcp_common::time::TimezoneConfig;
 
@@ -71,10 +72,10 @@ fn is_streamable_notification_stream(headers: &HeaderMap) -> bool {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub bookstack_url: String,
-    /// Browser-reachable BookStack URL for human-facing links (issue #151).
-    /// Equals `bookstack_url` unless `BSMCP_BOOKSTACK_PUBLIC_URL` is set.
-    pub bookstack_public_url: String,
+    /// Which content system this server fronts (`BSMCP_BACKEND`), where its
+    /// API is dialed, and the browser-reachable URL for human-facing links
+    /// (issue #151). Per-session clients come from `backend_client`.
+    pub backend: BackendConfig,
     pub http_client: Client,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub auth_codes: Arc<RwLock<HashMap<String, AuthCode>>>,
@@ -132,7 +133,7 @@ impl RateLimit {
 
 struct Session {
     tx: mpsc::Sender<Result<Event, Infallible>>,
-    client: BookStackClient,
+    client: Arc<dyn Backend>,
     token_id: String,
     token_secret: String,
     created_at: Instant,
@@ -149,8 +150,7 @@ impl Drop for Session {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        bookstack_url: String,
-        bookstack_public_url: String,
+        backend: BackendConfig,
         db: Arc<dyn DbBackend>,
         index_db: Arc<dyn bsmcp_common::db::IndexDb>,
         known_urls: Vec<String>,
@@ -166,8 +166,7 @@ impl AppState {
             .build()
             .expect("Failed to build HTTP client");
         Self {
-            bookstack_url: bookstack_url.trim_end_matches('/').to_string(),
-            bookstack_public_url: bookstack_public_url.trim_end_matches('/').to_string(),
+            backend,
             http_client,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_codes: Arc::new(RwLock::new(HashMap::new())),
@@ -186,6 +185,13 @@ impl AppState {
             index_db,
             timezone,
         }
+    }
+
+    /// A per-session client for the configured backend, carrying this
+    /// session's credentials.
+    pub fn backend_client(&self, token_id: &str, token_secret: &str) -> Arc<dyn Backend> {
+        self.backend
+            .client(token_id, token_secret, self.http_client.clone())
     }
 
     pub fn spawn_cleanup(&self) {
@@ -302,6 +308,7 @@ pub async fn resolve_credentials(
     headers: &HeaderMap,
     db: &dyn DbBackend,
     known_urls: &[String],
+    backend: BackendKind,
 ) -> Result<(String, String), Response> {
     let auth = headers
         .get("authorization")
@@ -327,7 +334,17 @@ pub async fn resolve_credentials(
             tracing::debug!(scheme = "oauth", "auth_token_resolved");
             return Ok((token_id, token_secret));
         }
-        Ok(None) => {}
+        Ok(None) => {
+            // A LibStack token is one string with no `:` — it looks like an
+            // unknown OAuth token here. Hand it to LibStack as the id half
+            // (`LibStackClient::bearer_from_pair` sends it bare); LibStack
+            // itself accepts or rejects it, exactly as BookStack does for
+            // the legacy `id:secret` form above.
+            if backend == BackendKind::LibStack {
+                tracing::debug!(scheme = "libstack-bearer", "auth_token_resolved");
+                return Ok((token.to_string(), String::new()));
+            }
+        }
         Err(e) => {
             // Same trap as #139, one layer down: a DB blip says nothing
             // about the token. Falling through to the 401 below would tell
@@ -350,11 +367,17 @@ pub async fn resolve_credentials(
 
 pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
     tracing::debug!(method = "GET", route = "/mcp/sse", "sse_connect_attempt");
-    let (mut token_id, mut token_secret) =
-        match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-            Ok(creds) => creds,
-            Err(resp) => return resp,
-        };
+    let (mut token_id, mut token_secret) = match resolve_credentials(
+        &headers,
+        state.db.as_ref(),
+        &state.known_urls,
+        state.backend.kind,
+    )
+    .await
+    {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
 
     // Issue #138: a streamable-HTTP client's notification GET is not a legacy
     // handshake. Allocating a `Session` for it burned a slot in the per-token
@@ -383,13 +406,7 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
         return notification_stream_response();
     }
 
-    let client = BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    )
-    .with_public_url(&state.bookstack_public_url);
+    let client = state.backend_client(&token_id, &token_secret);
 
     match client.validate().await {
         CredentialCheck::Valid => {}
@@ -493,11 +510,17 @@ pub async fn handle_message(
         route = "/mcp/messages/",
         "sse_message_request"
     );
-    let (token_id, token_secret) =
-        match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-            Ok(creds) => creds,
-            Err(resp) => return resp,
-        };
+    let (token_id, token_secret) = match resolve_credentials(
+        &headers,
+        state.db.as_ref(),
+        &state.known_urls,
+        state.backend.kind,
+    )
+    .await
+    {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
 
     let session_id = match params.get("sessionId") {
         Some(id) => id,
@@ -597,11 +620,17 @@ pub async fn handle_streamable(
     body: String,
 ) -> Response {
     tracing::debug!(method = "POST", route = "/mcp/sse", "streamable_request");
-    let (token_id, token_secret) =
-        match resolve_credentials(&headers, state.db.as_ref(), &state.known_urls).await {
-            Ok(creds) => creds,
-            Err(resp) => return resp,
-        };
+    let (token_id, token_secret) = match resolve_credentials(
+        &headers,
+        state.db.as_ref(),
+        &state.known_urls,
+        state.backend.kind,
+    )
+    .await
+    {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
 
     {
         let rate_limits = state.streamable_rate_limits.read().await;
@@ -625,13 +654,7 @@ pub async fn handle_streamable(
         }
     }
 
-    let client = BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    )
-    .with_public_url(&state.bookstack_public_url);
+    let client = state.backend_client(&token_id, &token_secret);
 
     let request: Value = match serde_json::from_str(&body) {
         Ok(v) => v,

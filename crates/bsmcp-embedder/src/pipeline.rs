@@ -10,7 +10,7 @@ use fastembed::{
 };
 
 use bsmcp_common::acl::{build_role_context, reconcile_all_pages, resolve_page_acl, RoleContext};
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::backend::Backend;
 use bsmcp_common::chunking;
 use bsmcp_common::db::SemanticDb;
 use bsmcp_common::types::{ChunkInsert, PageMeta};
@@ -264,7 +264,7 @@ fn load_custom_model(downloaded: &DownloadedModel) -> Result<TextEmbedding, Stri
 }
 
 /// Build a book_id → shelf_name lookup by fetching all shelves from BookStack.
-async fn build_shelf_lookup(client: &BookStackClient) -> HashMap<i64, String> {
+async fn build_shelf_lookup(client: &dyn Backend) -> HashMap<i64, String> {
     let mut lookup: HashMap<i64, String> = HashMap::new();
     let mut offset = 0i64;
     loop {
@@ -343,7 +343,7 @@ pub const DEFAULT_CONSECUTIVE_ABORT: usize = 10;
 pub async fn run_pipeline(
     db: &Arc<dyn SemanticDb>,
     embedder: &Arc<dyn Embedder>,
-    client: &BookStackClient,
+    client: &dyn Backend,
     job_id: i64,
     scope: &str,
     delay_ms: u64,
@@ -574,7 +574,7 @@ struct PageOutcome {
 async fn embed_single_page(
     db: &Arc<dyn SemanticDb>,
     embedder: &Arc<dyn Embedder>,
-    client: &BookStackClient,
+    client: &dyn Backend,
     page_id: i64,
     force: bool,
     shelf_lookup: &HashMap<i64, String>,

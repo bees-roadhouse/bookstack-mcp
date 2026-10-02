@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use bsmcp_common::bookstack::BookStackClient;
+use bsmcp_common::backend::Backend;
 use bsmcp_common::db::{IndexDb, SemanticDb};
 use bsmcp_common::index::*;
 
@@ -82,12 +82,12 @@ fn should_run_full_walk(last_full_walk_at: Option<&str>, stamped_version: Option
 }
 
 pub(crate) struct IndexWorker {
-    bs_client: BookStackClient,
+    bs_client: Arc<dyn Backend>,
     index_db: Arc<dyn IndexDb>,
 }
 
 impl IndexWorker {
-    pub(crate) fn new(bs_client: BookStackClient, index_db: Arc<dyn IndexDb>) -> Self {
+    pub(crate) fn new(bs_client: Arc<dyn Backend>, index_db: Arc<dyn IndexDb>) -> Self {
         Self {
             bs_client,
             index_db,

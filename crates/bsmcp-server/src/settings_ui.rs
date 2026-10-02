@@ -171,12 +171,7 @@ pub async fn handle_settings_post(
     let token_id_hash = hash_token_id(&token_id);
 
     // Globals: only persist when the calling token is admin.
-    let bs_client = bsmcp_common::bookstack::BookStackClient::new(
-        &state.bookstack_url,
-        &token_id,
-        &token_secret,
-        state.http_client.clone(),
-    );
+    let bs_client = state.backend_client(&token_id, &token_secret);
     let is_admin = bs_client.is_admin().await.unwrap_or(false);
     if is_admin {
         let mut globals = state.db.get_global_settings().await.unwrap_or_default();

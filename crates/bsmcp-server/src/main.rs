@@ -18,6 +18,7 @@ use axum::{routing::get, Router};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use bsmcp_common::backend::BackendConfig;
 use bsmcp_common::config::DbBackendType;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
 use bsmcp_common::time::TimezoneConfig;
@@ -38,17 +39,19 @@ async fn main() {
     bsmcp_common::logging::init("bsmcp-server");
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "server_starting");
 
-    let bookstack_url = env::var("BSMCP_BOOKSTACK_URL").expect("BSMCP_BOOKSTACK_URL is required");
-    // Browser-reachable BookStack URL for human-facing links (issue #151).
-    // Defaults to BSMCP_BOOKSTACK_URL; deployments that dial the API over an
-    // internal hostname (Docker service name, private IP) must set this to the
-    // host a browser can actually open, or every link the server emits is dead.
-    let bookstack_public_url = env::var("BSMCP_BOOKSTACK_PUBLIC_URL")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| bookstack_url.trim_end_matches('/').to_string());
-    tracing::info!(public_url = %bookstack_public_url, "bookstack_public_url_resolved");
+    // Content backend (issue #156): `BSMCP_BACKEND=bookstack|libstack`, the
+    // API URL for that backend, and the browser-reachable URL for human-facing
+    // links (issue #151). Deployments that dial the API over an internal
+    // hostname (Docker service name, private IP) must set the public URL to
+    // the host a browser can actually open, or every link the server emits
+    // is dead.
+    let backend = BackendConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    tracing::info!(
+        backend = backend.kind.as_str(),
+        api_url = %backend.api_url,
+        public_url = %backend.public_url,
+        "backend_resolved"
+    );
 
     let host = env::var("BSMCP_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("BSMCP_PORT")
@@ -243,8 +246,7 @@ async fn main() {
     tracing::info!(max_sessions_per_token, "session_cap_resolved");
 
     let state = sse::AppState::new(
-        bookstack_url,
-        bookstack_public_url,
+        backend,
         db,
         index_db.clone(),
         known_urls,
@@ -730,9 +732,14 @@ async fn handle_cancel_embed_job(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls)
-        .await
-        .is_ok();
+    let bearer_ok = sse::resolve_credentials(
+        &headers,
+        state.db.as_ref(),
+        &state.known_urls,
+        state.backend.kind,
+    )
+    .await
+    .is_ok();
     let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
     if !bearer_ok && !cookie_ok {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -757,9 +764,14 @@ async fn handle_cancel_index_job(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls)
-        .await
-        .is_ok();
+    let bearer_ok = sse::resolve_credentials(
+        &headers,
+        state.db.as_ref(),
+        &state.known_urls,
+        state.backend.kind,
+    )
+    .await
+    .is_ok();
     let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
     if !bearer_ok && !cookie_ok {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -783,9 +795,14 @@ async fn handle_status(
     // Auth-gate: accept either a Bearer token (programmatic) or a valid
     // settings session cookie (browser). Reject otherwise so the embedding
     // status page isn't world-readable.
-    let bearer_ok = sse::resolve_credentials(&headers, state.db.as_ref(), &state.known_urls)
-        .await
-        .is_ok();
+    let bearer_ok = sse::resolve_credentials(
+        &headers,
+        state.db.as_ref(),
+        &state.known_urls,
+        state.backend.kind,
+    )
+    .await
+    .is_ok();
     let cookie_ok = settings_ui::has_valid_session(&headers, &state.settings_sessions).await;
     if !bearer_ok && !cookie_ok {
         return (
